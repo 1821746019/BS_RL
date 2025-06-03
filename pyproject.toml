@@ -1,0 +1,54 @@
+
+
+[tool.uv]
+find-links = [
+    "https://storage.googleapis.com/jax-releases/libtpu_releases.html",
+]
+prerelease = "allow"
+
+
+[tool.setuptools]
+packages = ["BS_RL"] # 只包含主包"cleanrl_utils"
+
+
+# 定义torch的CPU源
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu" },
+]
+
+# 定义CPU索引
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[project]
+name = "BS_RL"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+
+dependencies = [
+    'jax[tpu]',
+    "flax",
+    "optax",
+    "stable_baselines3",
+    "torch",
+    "envpool",
+    "wandb",
+    "tyro",
+    "numpy<2",
+    "tensorboard",
+]
+# 可选依赖 - 只需要CPU版本
+[project.optional-dependencies]
+cpu = [
+    "torch>=2.0.0",
+    # 如果需要其他torch相关包，也在这里添加
+    # "torchvision",
+    # "torchaudio", 
+]
+
+
+
