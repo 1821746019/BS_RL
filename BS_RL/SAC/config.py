@@ -46,7 +46,7 @@ class AlgoConfig:
 
 @dataclass
 class WandbConfig:
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     project_name: str = "cleanrl-jax-sac-discrete"
     """the wandb's project name"""

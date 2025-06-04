@@ -6,7 +6,7 @@ from flax.training.train_state import TrainState
 import optax
 from functools import partial
 
-from config import AlgoConfig
+from .config import AlgoConfig
 # Networks will be passed as arguments to SACAgent init
 
 class CriticTrainState(TrainState):

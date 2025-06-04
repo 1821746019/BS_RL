@@ -1,6 +1,6 @@
 import flax.linen as nn
 import jax.numpy as jnp
-from utils import kaiming_normal_initializer, constant_initializer
+from .utils import kaiming_normal_initializer, constant_initializer
 
 # Common CNN Encoder for Atari
 class AtariEncoder(nn.Module):

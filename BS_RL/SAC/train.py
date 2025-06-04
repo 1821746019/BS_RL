@@ -11,10 +11,10 @@ import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter # Using PyTorch's SummaryWriter
 
-from config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig
-from utils import make_env
-from networks import ActorCNN, CriticCNN, ActorMLP, CriticMLP # Import network choices
-from agent import SACAgent
+from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig
+from .utils import make_env
+from .networks import ActorCNN, CriticCNN, ActorMLP, CriticMLP # Import network choices
+from .agent import SACAgent
 
 def train(args: Args):
     run_name = f"{args.env.env_id}__{args.train.exp_name}__{args.env.seed}__{int(time.time())}"

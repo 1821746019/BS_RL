@@ -1,6 +1,6 @@
 import tyro
-from config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig
-from train import train
+from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig
+from .train import train
 import os
 
 if __name__ == "__main__":
@@ -14,7 +14,7 @@ if __name__ == "__main__":
             env_id="BeamRiderNoFrameskip-v4",
             capture_video=False, # Set to True to record videos
             seed=1,
-            num_envs=1 # As in original sac_atari.py
+            num_envs=96 # As in original sac_atari.py
         ),
         algo=AlgoConfig(
             total_timesteps=int(1e6*200), #训练200M次，原本是5_000_000

@@ -1,6 +1,6 @@
 import tyro
-from config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig
-from train import train
+from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig
+from .train import train
 import os
 
 if __name__ == "__main__":
