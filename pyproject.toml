@@ -34,12 +34,11 @@ dependencies = [
     "flax",
     "optax",
     "stable_baselines3",
-    "torch",
+    "torch",#SB3依赖，不得不装
     "envpool",
-    "wandb",
+    "wandb<0.19",
     "tyro",
     "numpy<2",
-    "tensorboard",
 ]
 # 可选依赖 - 只需要CPU版本
 [project.optional-dependencies]

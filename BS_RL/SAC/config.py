@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 @dataclass
 class EnvConfig:
@@ -57,13 +57,29 @@ class WandbConfig:
 class TrainConfig:
     exp_name: str = os.path.basename(__file__)[: -len(".py")] # Adjusted in train.py
     """the name of this experiment"""
-    torch_deterministic: bool = True # For SB3 buffer, not JAX directly
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
-    save_model: bool = False
-    """whether to save model into the `runs/{run_name}` folder"""
+    save_model: bool = False # This will be implicitly True if checkpointing is frequent
+    """whether to save model into the `runs/{run_name}` folder (deprecated by save_dir and ckpt logic)"""
     # JAX specific
     jax_platform_name: Optional[str] = "tpu" # "cpu", "gpu", "tpu". None means JAX default.
     """The platform to run JAX on"""
+
+    # parameters for save directories, resume, checkpointing, and evaluation
+    save_dir: Optional[str] = None
+    """Base directory to save all outputs (logs, checkpoints). If None, defaults to runs/{run_name}."""
+    resume: bool = False
+    """Whether to resume training from the latest checkpoint in save_dir/ckpts/."""
+    
+    ckpt_save_frequency: Union[float, int] = 0.01
+    """Frequency to save a checkpoint. If > 1, it's absolute steps. If (0, 1], it's fraction of total_timesteps."""
+    ckpt_save_frequency_abs_steps: Optional[int] = None # Will be populated by Args.__post_init__
+    """Absolute step frequency for saving checkpoints, resolved from ckpt_save_frequency."""
+
+    eval_episodes: int = 16
+    """Number of episodes to run for evaluation during checkpointing."""
+    eval_greedy_actions: bool = True
+    """Whether to use greedy actions during evaluation."""
+    eval_capture_video: bool = True
+    """Whether to capture video during evaluation (for the first eval environment)."""
 
 @dataclass
 class Args:
@@ -71,3 +87,38 @@ class Args:
     env: EnvConfig = field(default_factory=EnvConfig)
     algo: AlgoConfig = field(default_factory=AlgoConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+
+    def __post_init__(self):
+        # Resolve ckpt_save_frequency
+        if self.train.ckpt_save_frequency is not None:
+            if 0 < self.train.ckpt_save_frequency <= 1.0:
+                if self.algo.total_timesteps > 0:
+                    self.train.ckpt_save_frequency_abs_steps = int(self.train.ckpt_save_frequency * self.algo.total_timesteps)
+                else: # Should not happen if total_timesteps is properly set
+                    self.train.ckpt_save_frequency_abs_steps = None # Or raise error
+            elif self.train.ckpt_save_frequency > 1.0:
+                self.train.ckpt_save_frequency_abs_steps = int(self.train.ckpt_save_frequency)
+            else: # 0 or negative, effectively disabling scheduled ckpting based on this param
+                self.train.ckpt_save_frequency_abs_steps = None
+        
+        # Ensure a very large number if None, to effectively disable if not set through percentage or direct steps
+        if self.train.ckpt_save_frequency_abs_steps is None or self.train.ckpt_save_frequency_abs_steps <= 0:
+             # If user wants to disable, they can set frequency to total_timesteps + 1 or similar large number
+             # Setting to a very large number if not specified or invalid.
+             # Or, could default to something like algo.total_timesteps to save only at the end if save_model was True.
+             # For now, let's assume if it's None or <=0, it means no periodic checkpointing.
+             # The save_model flag can be used for a final save, or we make ckpting more explicit.
+             # User wants periodic ckpt, so if frequency isn't positive, it's an issue or means no ckpt.
+             # Let's make it so if abs_steps is not positive, no ckpting happens via this mechanism.
+             if self.train.ckpt_save_frequency_abs_steps is not None and self.train.ckpt_save_frequency_abs_steps <= 0:
+                 print(f"Warning: ckpt_save_frequency resolved to {self.train.ckpt_save_frequency_abs_steps}, disabling periodic checkpointing.")
+                 self.train.ckpt_save_frequency_abs_steps = self.algo.total_timesteps + 1 # Effectively disable
+
+        # Deprecate save_model if periodic checkpointing is active
+        if self.train.save_model and self.train.ckpt_save_frequency_abs_steps is not None and self.train.ckpt_save_frequency_abs_steps <= self.algo.total_timesteps:
+            print("Warning: `train.save_model` is True, but periodic checkpointing is active. Only periodic checkpoints will be saved. The final model will be one of these periodic checkpoints.")
+            # self.train.save_model = False # Optionally force it False
+            
+        # If save_dir is not set, construct the default one here or in train.py.
+        # For now, train.py will handle the default path construction if save_dir is None.
+        pass

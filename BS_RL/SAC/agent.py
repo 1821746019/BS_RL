@@ -82,12 +82,15 @@ class SACAgent:
             self.log_alpha_state = None # To satisfy type hints or checks
             self.target_entropy = 0.0 # Placeholder
 
-    @partial(jax.jit, static_argnums=(0,))
-    def select_action(self, actor_params: flax.core.FrozenDict, obs: jnp.ndarray, key: jax.random.PRNGKey):
+    @partial(jax.jit, static_argnums=(0, 4))
+    def select_action(self, actor_params: flax.core.FrozenDict, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
         logits = self.actor_model.apply({'params': actor_params}, obs)
         # Gumbel-softmax trick for sampling is not strictly needed for SAC discrete action selection
         # Categorical sampling is fine
-        actions = jax.random.categorical(key, logits, axis=-1)
+        if deterministic:
+            actions = jnp.argmax(logits, axis=-1)
+        else:
+            actions = jax.random.categorical(key, logits, axis=-1)
         return actions
 
     @partial(jax.jit, static_argnums=(0,))
