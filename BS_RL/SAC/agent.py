@@ -5,6 +5,7 @@ import flax.linen as nn
 from flax.training.train_state import TrainState
 import optax
 from functools import partial
+from typing import Union
 
 from .config import AlgoConfig
 # Networks will be passed as arguments to SACAgent init
@@ -98,14 +99,14 @@ class SACAgent:
                        actor_state: TrainState,
                        qf1_state: CriticTrainState,
                        qf2_state: CriticTrainState,
-                       log_alpha_params_or_value: jnp.ndarray, # Can be log_alpha_state.params or fixed alpha
+                       log_alpha_input: Union[flax.core.FrozenDict, jnp.ndarray], # .params if autotune, else fixed value
                        data: dict,
                        key_next_actions: jax.random.PRNGKey): # Not used for discrete SAC target Q
 
-        if self.algo_config.autotune:
-            current_alpha = jnp.exp(log_alpha_params_or_value['log_alpha'])
-        else:
-            current_alpha = log_alpha_params_or_value # This is just self.current_alpha (fixed value)
+        if self.algo_config.autotune: # log_alpha_input is log_alpha_state.params
+            current_alpha = jnp.exp(log_alpha_input['log_alpha'])
+        else: # log_alpha_input is the fixed alpha value
+            current_alpha = log_alpha_input
 
         # Get next action probabilities and log probabilities from current policy
         next_logits = self.actor_model.apply({'params': actor_state.params}, data['next_observations'])
@@ -135,6 +136,9 @@ class SACAgent:
             return loss, qf1_taken_action.mean()
 
         (qf1_loss_val, qf1_values_mean), qf1_grads = jax.value_and_grad(qf1_loss_fn, has_aux=True)(qf1_state.params)
+        qf1_grads = jax.lax.pmean(qf1_grads, axis_name='batch')
+        qf1_loss_val = jax.lax.pmean(qf1_loss_val, axis_name='batch')
+        qf1_values_mean = jax.lax.pmean(qf1_values_mean, axis_name='batch')
         qf1_state_new = qf1_state.apply_gradients(grads=qf1_grads)
         
         # --- QF2 Loss ---
@@ -145,9 +149,15 @@ class SACAgent:
             return loss, qf2_taken_action.mean()
 
         (qf2_loss_val, qf2_values_mean), qf2_grads = jax.value_and_grad(qf2_loss_fn, has_aux=True)(qf2_state.params)
+        qf2_grads = jax.lax.pmean(qf2_grads, axis_name='batch')
+        qf2_loss_val = jax.lax.pmean(qf2_loss_val, axis_name='batch')
+        qf2_values_mean = jax.lax.pmean(qf2_values_mean, axis_name='batch')
         qf2_state_new = qf2_state.apply_gradients(grads=qf2_grads)
 
         critic_loss = (qf1_loss_val + qf2_loss_val) / 2.0
+        # critic_loss is already an average of averages, pmean not strictly needed if components are.
+        # However, to be safe if one component was scalar and other not:
+        critic_loss = jax.lax.pmean(critic_loss, axis_name='batch')
         
         return qf1_state_new, qf2_state_new, critic_loss, \
                {'qf1_loss': qf1_loss_val, 'qf2_loss': qf2_loss_val,
@@ -159,13 +169,14 @@ class SACAgent:
                                 actor_state: TrainState,
                                 qf1_state: CriticTrainState, # Pass online Q-network states
                                 qf2_state: CriticTrainState,
-                                log_alpha_state_or_value: TrainState, # Can be log_alpha_state or fixed alpha
+                                log_alpha_input: Union[TrainState, jnp.ndarray], # TrainState if autotune, else fixed value
                                 data: dict):
         
-        if self.algo_config.autotune:
-            current_alpha = jnp.exp(log_alpha_state_or_value.params['log_alpha'])
-        else:
-            current_alpha = log_alpha_state_or_value # This is self.current_alpha (fixed value)
+        # Determine effective alpha for actor loss calculation
+        if self.algo_config.autotune: # log_alpha_input is TrainState
+            actor_effective_alpha = jnp.exp(log_alpha_input.params['log_alpha'])
+        else: # log_alpha_input is the fixed alpha value
+            actor_effective_alpha = log_alpha_input
 
         # --- Actor Loss ---
         def actor_loss_fn(actor_params):
@@ -180,50 +191,51 @@ class SACAgent:
             min_qf_values = jax.lax.stop_gradient(min_qf_values)
 
             # Expected value for actor loss: sum_a [ P(a|s) * (alpha * log P(a|s) - Q(s,a)) ]
-            actor_loss_components = action_probs * (current_alpha * action_log_probs - min_qf_values)
+            actor_loss_components = action_probs * (actor_effective_alpha * action_log_probs - min_qf_values)
             loss = jnp.sum(actor_loss_components, axis=1).mean()
             
             entropy = -jnp.sum(action_probs * action_log_probs, axis=1).mean()
             return loss, entropy
 
         (actor_loss_val, entropy_val), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
+        actor_grads = jax.lax.pmean(actor_grads, axis_name='batch')
+        actor_loss_val = jax.lax.pmean(actor_loss_val, axis_name='batch')
+        entropy_val = jax.lax.pmean(entropy_val, axis_name='batch')
         actor_state_new = actor_state.apply_gradients(grads=actor_grads)
 
         # --- Alpha Loss (if autotuning) ---
-        alpha_loss_val = 0.0
-        log_alpha_state_new = log_alpha_state_or_value # Default to old state if not autotuning
+        alpha_loss_val = 0.0 # Default if not autotuning
+        log_alpha_state_to_return = log_alpha_input # Pass through if not updated
+        current_alpha_to_return = actor_effective_alpha # Pass through if not updated
 
-        if self.algo_config.autotune:
-            def alpha_loss_fn(log_alpha_params_dict):
-                # Use log_probs from the *current* policy (before this actor update, or recompute)
-                # The original CleanRL PyTorch uses log_pi from data.observations (current batch)
-                # and actor.get_action(data.observations) which uses current actor params
-                # So, we need log_probs from the newly updated actor_state_new if we want to match that
-                # However, standard is to use log_probs from before actor update, or detach them.
-                # Let's use the log_probs from the actor_loss_fn calculation (derived from actor_state.params, i.e. old actor)
-                # This is equivalent to detaching log_pi for alpha loss.
-                
-                # Recalculate with old actor params (or pass log_probs as arg)
-                logits_old_actor = self.actor_model.apply({'params': actor_state.params}, data['observations'])
+        if self.algo_config.autotune: # log_alpha_input is TrainState
+            def alpha_loss_fn(log_alpha_params_dict): # log_alpha_params_dict is log_alpha_input.params
+                # ... (rest of alpha loss logic from original, using detached_log_probs)
+                logits_old_actor = self.actor_model.apply({'params': actor_state.params}, data['observations']) # old actor
                 action_log_probs_old_actor = nn.log_softmax(logits_old_actor, axis=-1)
                 action_probs_old_actor = nn.softmax(logits_old_actor, axis=-1)
 
                 detached_log_probs = jax.lax.stop_gradient(action_log_probs_old_actor)
                 detached_probs = jax.lax.stop_gradient(action_probs_old_actor)
-
-                # Alpha loss: sum_a [ P(a|s) * (-alpha * (log P(a|s) + target_entropy)) ]
-                # Note: log_alpha_params_dict is {'log_alpha': scalar_value}
+                
                 alpha_loss_components = detached_probs * \
                                         (-jnp.exp(log_alpha_params_dict['log_alpha']) * (detached_log_probs + self.target_entropy))
                 loss = jnp.sum(alpha_loss_components, axis=1).mean()
                 return loss
 
-            alpha_loss_val, alpha_grads = jax.value_and_grad(alpha_loss_fn)(log_alpha_state_or_value.params)
-            log_alpha_state_new = log_alpha_state_or_value.apply_gradients(grads=alpha_grads)
-            self.current_alpha = jnp.exp(log_alpha_state_new.params['log_alpha']) # Update current_alpha for next iter
+            # log_alpha_input here is the TrainState instance
+            alpha_loss_val_scalar, alpha_grads_dict = jax.value_and_grad(alpha_loss_fn)(log_alpha_input.params)
+            alpha_grads_dict = jax.lax.pmean(alpha_grads_dict, axis_name='batch')
+            alpha_loss_val = jax.lax.pmean(alpha_loss_val_scalar, axis_name='batch')
+            
+            log_alpha_state_updated = log_alpha_input.apply_gradients(grads=alpha_grads_dict)
+            log_alpha_state_to_return = log_alpha_state_updated
+            current_alpha_to_return = jnp.exp(log_alpha_state_updated.params['log_alpha'])
         
-        return actor_state_new, log_alpha_state_new, actor_loss_val, \
-               {'actor_loss': actor_loss_val, 'alpha_loss': alpha_loss_val, 'alpha': self.current_alpha, 'entropy': entropy_val}
+        actor_metrics = {'actor_loss': actor_loss_val, 'alpha_loss': alpha_loss_val, 
+                         'alpha': current_alpha_to_return, 'entropy': entropy_val}
+        
+        return actor_state_new, log_alpha_state_to_return, current_alpha_to_return, actor_loss_val, actor_metrics
 
     @partial(jax.jit, static_argnums=(0,))
     def update_target_networks(self, qf1_state: CriticTrainState, qf2_state: CriticTrainState):
@@ -241,24 +253,30 @@ class SACAgent:
                    actor_state: TrainState,
                    qf1_state: CriticTrainState,
                    qf2_state: CriticTrainState,
-                   log_alpha_state_or_value: TrainState, # TrainState if autotune, else fixed float value
+                   log_alpha_input: Union[TrainState, flax.core.FrozenDict, jnp.ndarray], # TrainState or .params if autotune, else fixed float value
                    data: dict, # observations, actions, next_observations, rewards, dones
                    key_next_actions: jax.random.PRNGKey # Not used for discrete
                    ):
 
-        # Update Critics
+        # Determine the argument for _update_critic's alpha parameter
+        # If autotuning, _update_critic expects log_alpha_state.params
+        # If not autotuning, _update_critic expects the fixed alpha value
+        alpha_arg_for_critic = log_alpha_input.params if self.algo_config.autotune and hasattr(log_alpha_input, 'params') else log_alpha_input
+        
         qf1_state, qf2_state, critic_loss, critic_metrics = self._update_critic(
             actor_state, qf1_state, qf2_state, 
-            log_alpha_state_or_value.params if self.algo_config.autotune else self.current_alpha, 
+            alpha_arg_for_critic, 
             data, key_next_actions
         )
         
-        # Update Actor and Alpha
-        actor_state, log_alpha_state_or_value, actor_loss, actor_alpha_metrics = self._update_actor_and_alpha(
+        # _update_actor_and_alpha takes the full log_alpha_input (TrainState or fixed value)
+        actor_state, returned_log_alpha_state, returned_current_alpha, actor_loss, actor_alpha_metrics = self._update_actor_and_alpha(
             actor_state, qf1_state, qf2_state, 
-            log_alpha_state_or_value, # Pass the state if autotune, else fixed value
+            log_alpha_input, 
             data
         )
         
         all_metrics = {**critic_metrics, **actor_alpha_metrics, 'critic_loss_combined': critic_loss}
-        return actor_state, qf1_state, qf2_state, log_alpha_state_or_value, all_metrics
+        # The returned_log_alpha_state is the updated TrainState or the passed-through fixed value.
+        # The returned_current_alpha is the new jnp.exp(log_alpha) or the passed-through fixed value.
+        return actor_state, qf1_state, qf2_state, returned_log_alpha_state, returned_current_alpha, all_metrics

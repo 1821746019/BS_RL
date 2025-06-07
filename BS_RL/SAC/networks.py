@@ -1,6 +1,5 @@
 import flax.linen as nn
 import jax.numpy as jnp
-from .utils import kaiming_normal_initializer, constant_initializer
 
 # Common CNN Encoder for Atari
 class AtariEncoder(nn.Module):
@@ -13,13 +12,13 @@ class AtariEncoder(nn.Module):
         
         x = nn.Conv(features=32, kernel_size=(8, 8), strides=(4, 4), padding="VALID",
                     kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         x = nn.Conv(features=64, kernel_size=(4, 4), strides=(2, 2), padding="VALID",
                     kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         x = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1), padding="VALID",
                     kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         x = x.reshape((x.shape[0], -1))  # Flatten
         return x
 
@@ -33,7 +32,7 @@ class ActorCNN(nn.Module):
         encoded_x = AtariEncoder(name="encoder")(x)
         
         x = nn.Dense(features=512, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(encoded_x)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         logits = nn.Dense(features=self.action_dim, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
         return logits
 
@@ -47,7 +46,7 @@ class CriticCNN(nn.Module):
         encoded_x = AtariEncoder(name="encoder")(x)
         
         x = nn.Dense(features=512, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(encoded_x)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         q_values = nn.Dense(features=self.action_dim, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
         return q_values
 
@@ -58,9 +57,9 @@ class ActorMLP(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray):
         x = nn.Dense(features=64, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         x = nn.Dense(features=64, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         logits = nn.Dense(features=self.action_dim, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
         return logits
 
@@ -70,8 +69,8 @@ class CriticMLP(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray):
         x = nn.Dense(features=64, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         x = nn.Dense(features=64, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         q_values = nn.Dense(features=self.action_dim, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
         return q_values

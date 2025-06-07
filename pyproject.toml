@@ -39,6 +39,7 @@ dependencies = [
     "wandb<0.19",
     "tyro",
     "numpy<2",
+    "pygame<2.4",
 ]
 # 可选依赖 - 只需要CPU版本
 [project.optional-dependencies]
