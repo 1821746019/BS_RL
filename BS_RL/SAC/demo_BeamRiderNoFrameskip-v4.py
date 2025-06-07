@@ -14,7 +14,7 @@ if __name__ == "__main__":
         env=EnvConfig(
             env_id="BeamRiderNoFrameskip-v4",
             seed=1,
-            num_envs=96 # As in original sac_atari.py
+            env_num=96 # As in original sac_atari.py
         ),
         algo=AlgoConfig(
             total_timesteps=int(1e6*200), #训练200M次，原本是5_000_000

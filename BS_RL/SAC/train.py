@@ -315,7 +315,7 @@ class Trainer:
         obs, _ = self.envs.reset(seed=self.args.env.seed + self.initial_global_step)
         
         # Buffers for smoothed episodic statistics
-        ep_stats_buffer_size = self.args.env.env_num
+        ep_stats_buffer_size = 64#self.args.env.env_num
         returns_buffer = collections.deque(maxlen=ep_stats_buffer_size)
         lengths_buffer = collections.deque(maxlen=ep_stats_buffer_size)
 
@@ -410,13 +410,10 @@ class Trainer:
 
     def _log_training_metrics(self, metrics_sharded, current_step, start_time):
         metrics = flax.jax_utils.unreplicate(metrics_sharded)
-        elapsed_time = time.time() - start_time
-        steps_this_run = current_step - self.initial_global_step
-        sps = int(steps_this_run / elapsed_time) if elapsed_time > 0 else 0
-        wandb_metrics = {f"losses/{k}": v for k, v in metrics.items()}
+        sps = int(current_step / (time.time() - start_time)) if (time.time() - start_time) > 0 else 0
+        wandb_metrics = {f"metrics/{k}": v for k, v in metrics.items()}
         wandb_metrics.update({
             "charts/SPS": sps,
-            "losses/alpha_current_val": jax.device_get(self.current_alpha[0])
         })
         wandb.log(wandb_metrics, step=current_step)
         print(f"SPS: {sps}")
