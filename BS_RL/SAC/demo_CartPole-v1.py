@@ -4,24 +4,29 @@ from .train import train
 import os
 
 if __name__ == "__main__":
-    batch_size = 64
+    batch_size = 512
+    env_id = "CartPole-v1"
+    env_num = 16
+    eval_env_num = 16
     args = Args(
         train=TrainConfig(
-            exp_name="sac_discrete_jax_cartpole",
+            exp_name=env_id,
             save_model=True,
-            ckpt_save_frequency=None
+            ckpt_save_frequency=0.01,
+            resume=True,
+            save_dir=f"runs/{env_id}",
         ),
         eval=EvalConfig(
             eval_frequency=0.01,
             eval_episodes=16,
             greedy_actions=True,
             capture_video=True,
-            env_num=1,
+            env_num=eval_env_num,
         ),
         env=EnvConfig(
-            env_id="CartPole-v1",
+            env_id=env_id,
             seed=1,
-            env_num=1, # SAC typically uses 1 env for off-policy learning
+            env_num=env_num, # SAC typically uses 1 env for off-policy learning
         ),
         algo=AlgoConfig(
             total_timesteps=int(1e6), # CartPole learns faster

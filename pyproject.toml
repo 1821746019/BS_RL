@@ -34,12 +34,13 @@ dependencies = [
     "flax",
     "optax",
     "stable_baselines3",
-    "torch",#SB3依赖，不得不装
-    "envpool",
+    "torch",#SB3依赖，必须显式安装，否则会装GPU版
+    # "envpool",
     "wandb<0.19",
     "tyro",
     "numpy<2",
-    "pygame<2.4",
+    "pygame",
+    "gymnasium[atari,accept-rom-license,other]",
 ]
 # 可选依赖 - 只需要CPU版本
 [project.optional-dependencies]

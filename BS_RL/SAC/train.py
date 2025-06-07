@@ -1,10 +1,13 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
+warnings.filterwarnings("ignore", category=UserWarning, module="absl")
 import os
 import random
 import time
 from dataclasses import asdict
 from pathlib import Path
 import shutil
-
+import pickle
 import collections
 import gymnasium as gym
 import jax
@@ -33,6 +36,8 @@ class Trainer:
         self.ckpt_dir = None
         self.initial_global_step = 0
         self.key = None
+        self.key_actions_base = None
+        self.key_update_base = None
         self.envs = None
         self.eval_envs = None
         self.agent = None
@@ -80,15 +85,17 @@ class Trainer:
     def _handle_resume_and_directory_setup(self):
         restored_ckpt_path = None
         if self.args.train.resume:
-            latest_ckpt_path_str = checkpoints.latest_checkpoint(os.path.abspath(self.ckpt_dir))
+            # The ckpt_dir here should be the parent directory containing all checkpoint folders.
+            latest_ckpt_path_str = checkpoints.latest_checkpoint(os.path.abspath(self.ckpt_dir), prefix="ckpt_step")
             if latest_ckpt_path_str:
                 print(f"Found latest checkpoint: {latest_ckpt_path_str}")
                 try:
-                    self.initial_global_step = int(Path(latest_ckpt_path_str).stem.split("_")[-1])
+                    # The step is parsed from the directory name itself.
+                    self.initial_global_step = int(Path(latest_ckpt_path_str).name.split("_")[-1])
                     print(f"Resuming from global_step {self.initial_global_step}")
                     restored_ckpt_path = latest_ckpt_path_str
                 except (ValueError, IndexError):
-                    print(f"Could not parse step from checkpoint filename: {latest_ckpt_path_str}. Starting fresh.")
+                    print(f"Could not parse step from checkpoint directory name: {latest_ckpt_path_str}. Starting fresh.")
             else:
                 print(f"Warning: Resume requested, but no checkpoints found in {self.ckpt_dir}. Starting fresh.")
 
@@ -128,10 +135,31 @@ class Trainer:
         wandb.config.update(flat_args_dict)
 
     def _setup_seeds_and_keys(self):
-        random.seed(self.args.env.seed)
-        np.random.seed(self.args.env.seed)
-        base_key_seed = self.args.env.seed if not self.restored_ckpt_path else self.args.env.seed + self.initial_global_step
-        self.key = jax.random.PRNGKey(base_key_seed)
+        prng_restored = False
+        if self.restored_ckpt_path:
+            prng_path = os.path.join(self.restored_ckpt_path, "prng_states.pkl")
+            if os.path.exists(prng_path):
+                try:
+                    print(f"Loading PRNG states from {prng_path}...")
+                    with open(prng_path, 'rb') as f:
+                        prng_states = pickle.load(f)
+                    random.setstate(prng_states['random_state'])
+                    np.random.set_state(prng_states['np_random_state'])
+                    self.key = prng_states['key']
+                    self.key_actions_base = prng_states['key_actions_base']
+                    self.key_update_base = prng_states['key_update_base']
+                    print("PRNG states successfully restored.")
+                    prng_restored = True
+                except Exception as e:
+                    print(f"Could not load PRNG states due to {e}. Re-initializing.")
+        
+        if not prng_restored:
+            print("Initializing new PRNG states.")
+            random.seed(self.args.env.seed)
+            np.random.seed(self.args.env.seed)
+            base_key = jax.random.PRNGKey(self.args.env.seed)
+            self.key, key_for_loop = jax.random.split(base_key)
+            self.key_actions_base, self.key_update_base = jax.random.split(key_for_loop)
 
     def _setup_environments(self):
         vec_env_cls = gym.vector.AsyncVectorEnv if self.args.env.async_vector_env else gym.vector.SyncVectorEnv
@@ -189,19 +217,50 @@ class Trainer:
         
         if self.restored_ckpt_path:
             try:
-                target_restore_dict = {'actor_state': actor_state_single, 'qf1_state': qf1_state_single, 'qf2_state': qf2_state_single}
+                # Define the structure for restoration using placeholder values from the initial states.
+                # This structure must match what was saved in _save_checkpoint.
+                restore_target = {
+                    'actor_params': actor_state_single.params,
+                    'actor_opt_state': actor_state_single.opt_state,
+                    'qf1_params': qf1_state_single.params,
+                    'qf1_opt_state': qf1_state_single.opt_state,
+                    'qf1_target_params': qf1_state_single.target_params,
+                    'qf2_params': qf2_state_single.params,
+                    'qf2_opt_state': qf2_state_single.opt_state,
+                    'qf2_target_params': qf2_state_single.target_params,
+                }
                 if self.args.algo.autotune:
-                    target_restore_dict['log_alpha_state'] = log_alpha_state_single
-                
-                loaded_states = checkpoints.restore_checkpoint(
-                    ckpt_dir=os.path.abspath(self.ckpt_dir), target=target_restore_dict, step=self.initial_global_step, prefix="ckpt_step_"
+                    restore_target['log_alpha_params'] = log_alpha_state_single.params
+                    restore_target['log_alpha_opt_state'] = log_alpha_state_single.opt_state
+
+                # Restore the raw arrays and optimizer states.
+                # latest_checkpoint provides the full path to the specific checkpoint directory.
+                loaded_contents = checkpoints.restore_checkpoint(
+                    ckpt_dir=self.restored_ckpt_path,
+                    target=restore_target
                 )
-                actor_state_single = loaded_states['actor_state']
-                qf1_state_single = loaded_states['qf1_state']
-                qf2_state_single = loaded_states['qf2_state']
-                if self.args.algo.autotune and 'log_alpha_state' in loaded_states:
-                    log_alpha_state_single = loaded_states['log_alpha_state']
-                print(f"Agent states successfully restored from step {self.initial_global_step}.")
+                
+                # Manually update the TrainState objects with the loaded contents.
+                actor_state_single = actor_state_single.replace(
+                    params=loaded_contents['actor_params'],
+                    opt_state=loaded_contents['actor_opt_state']
+                )
+                qf1_state_single = qf1_state_single.replace(
+                    params=loaded_contents['qf1_params'],
+                    opt_state=loaded_contents['qf1_opt_state'],
+                    target_params=loaded_contents['qf1_target_params']
+                )
+                qf2_state_single = qf2_state_single.replace(
+                    params=loaded_contents['qf2_params'],
+                    opt_state=loaded_contents['qf2_opt_state'],
+                    target_params=loaded_contents['qf2_target_params']
+                )
+                if self.args.algo.autotune and 'log_alpha_params' in loaded_contents:
+                    log_alpha_state_single = log_alpha_state_single.replace(
+                        params=loaded_contents['log_alpha_params'],
+                        opt_state=loaded_contents['log_alpha_opt_state']
+                    )
+                print(f"Agent states, including optimizer states, successfully restored from step {self.initial_global_step}.")
             except Exception as e:
                 print(f"Error restoring agent states: {e}. Starting with fresh states.")
                 self.initial_global_step = 0
@@ -210,7 +269,9 @@ class Trainer:
         self.qf1_state_single = qf1_state_single
         self.qf2_state_single = qf2_state_single
         self.log_alpha_state_single = log_alpha_state_single
-        self.current_alpha_single = jnp.exp(log_alpha_state_single.params['log_alpha']) if self.args.algo.autotune else jnp.array(self.args.algo.alpha)
+        self.current_alpha_single = jnp.exp(log_alpha_state_single.params['log_alpha']) if self.args.algo.autotune and log_alpha_state_single else jnp.array(self.args.algo.alpha)
+
+        self.restored_ckpt_path = self.restored_ckpt_path
 
     def _replicate_states(self):
         self.actor_state = flax.jax_utils.replicate(self.actor_state_single)
@@ -223,14 +284,31 @@ class Trainer:
         self.current_alpha = flax.jax_utils.replicate(self.current_alpha_single)
 
     def _setup_replay_buffer(self):
-        self.rb = ReplayBuffer(
-            self.args.algo.buffer_size,
-            self.envs.single_observation_space,
-            self.envs.single_action_space,
-            device="cpu",
-            handle_timeout_termination=False,
-            n_envs=self.args.env.env_num
-        )
+        loaded_rb = False
+        if self.restored_ckpt_path:
+            rb_path = os.path.join(self.restored_ckpt_path, "replay_buffer.pkl")
+            if os.path.exists(rb_path):
+                try:
+                    print(f"Loading replay buffer from {rb_path}...")
+                    with open(rb_path, 'rb') as f:
+                        self.rb:ReplayBuffer = pickle.load(f)
+                    print(f"Replay buffer loaded. Current size: {self.rb.size()}, full: {self.rb.full}")
+                    assert self.rb.buffer_size == max(self.args.algo.buffer_size//self.args.env.env_num, 1) # 和SB3的ReplayBuffer的内部逻辑保持一致
+                    assert self.rb.n_envs == self.args.env.env_num
+                    loaded_rb = True
+                except Exception as e:
+                    print(f"Could not load replay buffer due to {e}. A new one will be created.")
+
+        if not loaded_rb:
+            print("Creating new replay buffer.")
+            self.rb = ReplayBuffer(
+                self.args.algo.buffer_size,
+                self.envs.single_observation_space,
+                self.envs.single_action_space,
+                device="cpu",
+                handle_timeout_termination=False,
+                n_envs=self.args.env.env_num
+            )
 
     def train(self):
         start_time = time.time()
@@ -241,12 +319,11 @@ class Trainer:
         returns_buffer = collections.deque(maxlen=ep_stats_buffer_size)
         lengths_buffer = collections.deque(maxlen=ep_stats_buffer_size)
 
-        key_actions_base, key_update_base = jax.random.split(self.key)
         start_iteration = self.initial_global_step // self.args.env.env_num
 
         for loop_iter in range(start_iteration, self.args.algo.total_timesteps // self.args.env.env_num):
             current_step = loop_iter * self.args.env.env_num
-            key_actions_base, key_actions_step = jax.random.split(key_actions_base)
+            self.key_actions_base, key_actions_step = jax.random.split(self.key_actions_base)
             
             obs, infos = self._environment_step(obs, key_actions_step, current_step)
             
@@ -254,7 +331,7 @@ class Trainer:
 
             if current_step > self.args.algo.learning_starts:
                 if current_step % self.args.algo.update_frequency == 0:
-                    key_update_base, key_update_step = jax.random.split(key_update_base)
+                    self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
                     self._agent_update(key_update_step, current_step, start_time)
 
                 if current_step % self.args.algo.target_network_frequency == 0:
@@ -333,7 +410,9 @@ class Trainer:
 
     def _log_training_metrics(self, metrics_sharded, current_step, start_time):
         metrics = flax.jax_utils.unreplicate(metrics_sharded)
-        sps = int(current_step / (time.time() - start_time)) if (time.time() - start_time) > 0 else 0
+        elapsed_time = time.time() - start_time
+        steps_this_run = current_step - self.initial_global_step
+        sps = int(steps_this_run / elapsed_time) if elapsed_time > 0 else 0
         wandb_metrics = {f"losses/{k}": v for k, v in metrics.items()}
         wandb_metrics.update({
             "charts/SPS": sps,
@@ -370,43 +449,68 @@ class Trainer:
                 wandb.log({f"eval/{k}": v for k, v in eval_metrics.items()}, step=current_step)
 
     def _save_checkpoint(self, current_step, next_step, is_final=False):
+        step_for_ckpt: int
         if is_final:
-            step_to_save = (self.args.algo.total_timesteps // self.args.env.env_num) * self.args.env.env_num
-            print(f"--- Saving final model at step {step_to_save} ---")
+            step_for_ckpt = current_step
+            print(f"--- Saving final model at step {step_for_ckpt} ---")
         else:
             ckpt_freq = self.args.train.ckpt_save_frequency_abs_steps
             if not ckpt_freq or next_step < ckpt_freq or (current_step // ckpt_freq) >= (next_step // ckpt_freq):
                 return
-            step_to_save = (next_step // ckpt_freq) * ckpt_freq
-            print(f"--- Checkpoint Triggered at step {current_step} (effective ckpt step: {step_to_save}) ---")
+            step_for_ckpt = current_step
+            print(f"--- Saving checkpoint at step {step_for_ckpt} ---")
 
         try:
             save_target = {
-                'actor_state': flax.jax_utils.unreplicate(self.actor_state),
-                'qf1_state': flax.jax_utils.unreplicate(self.qf1_state),
-                'qf2_state': flax.jax_utils.unreplicate(self.qf2_state),
+                'actor_params': flax.jax_utils.unreplicate(self.actor_state.params),
+                'actor_opt_state': flax.jax_utils.unreplicate(self.actor_state.opt_state),
+                'qf1_params': flax.jax_utils.unreplicate(self.qf1_state.params),
+                'qf1_opt_state': flax.jax_utils.unreplicate(self.qf1_state.opt_state),
+                'qf1_target_params': flax.jax_utils.unreplicate(self.qf1_state.target_params),
+                'qf2_params': flax.jax_utils.unreplicate(self.qf2_state.params),
+                'qf2_opt_state': flax.jax_utils.unreplicate(self.qf2_state.opt_state),
+                'qf2_target_params': flax.jax_utils.unreplicate(self.qf2_state.target_params),
             }
             if self.args.algo.autotune and self.log_alpha_state:
-                save_target['log_alpha_state'] = flax.jax_utils.unreplicate(self.log_alpha_state)
+                save_target['log_alpha_params'] = flax.jax_utils.unreplicate(self.log_alpha_state.params)
+                save_target['log_alpha_opt_state'] = flax.jax_utils.unreplicate(self.log_alpha_state.opt_state)
 
             checkpoints.save_checkpoint(
-                ckpt_dir=os.path.abspath(self.ckpt_dir), target=save_target, step=step_to_save,
+                ckpt_dir=os.path.abspath(self.ckpt_dir), target=save_target, step=step_for_ckpt,
                 prefix="ckpt_step_", keep=50, overwrite=True
             )
-            saved_path = checkpoints.latest_checkpoint(os.path.abspath(self.ckpt_dir))
-            print(f"Checkpoint saved to {saved_path}")
-            if self.args.wandb.track and wandb.run and saved_path:
-                artifact = wandb.Artifact(f"model_ckpt_{self.wandb_run_name}", type="model")
-                artifact.add_file(str(saved_path))
-                aliases = [f"step_{step_to_save}"]
-                if is_final:
-                    aliases.append("final")
-                wandb.log_artifact(artifact, aliases=aliases)
+            saved_path = checkpoints.latest_checkpoint(os.path.abspath(self.ckpt_dir), prefix="ckpt_step")
+            
+            if saved_path:
+                print(f"Checkpoint saved to {saved_path}")
+                with open(os.path.join(saved_path, "replay_buffer.pkl"), 'wb') as f:
+                    pickle.dump(self.rb, f)
+
+                prng_states = {
+                    'random_state': random.getstate(),
+                    'np_random_state': np.random.get_state(),
+                    'key': self.key,
+                    'key_actions_base': self.key_actions_base,
+                    'key_update_base': self.key_update_base,
+                }
+                with open(os.path.join(saved_path, "prng_states.pkl"), 'wb') as f:
+                    pickle.dump(prng_states, f)
+
+                if self.args.wandb.track and wandb.run:
+                    artifact = wandb.Artifact(f"model_ckpt_{self.wandb_run_name}", type="model")
+                    artifact.add_dir(str(saved_path))
+                    aliases = [f"step_{step_for_ckpt}"]
+                    if is_final:
+                        aliases.append("final")
+                    wandb.log_artifact(artifact, aliases=aliases)
+            else:
+                print(f"Warning: Checkpoint for step {step_for_ckpt} could not be found after saving.")
         except Exception as e:
-            print(f"Error saving checkpoint at step {step_to_save}: {e}")
+            print(f"Error saving checkpoint at step {step_for_ckpt}: {e}")
             
     def _save_final_model(self):
-        self._save_checkpoint(self.args.algo.total_timesteps, self.args.algo.total_timesteps, is_final=True)
+        final_step = (self.args.algo.total_timesteps // self.args.env.env_num) * self.args.env.env_num
+        self._save_checkpoint(final_step, final_step + 1, is_final=True)
 
     def cleanup(self):
         if self.eval_envs:
