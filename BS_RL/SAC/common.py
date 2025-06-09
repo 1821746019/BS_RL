@@ -10,6 +10,7 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
         env = wrappers.EpisodeTruncationWrapper(env)
         env = wrappers.DetailedRewardWrapper(env,config)
         env = wrappers.NormalizationWrapper(env)
+        env = wrappers.EpisodeStats(env)
         env = FlattenObservation(env)
         return env
 
@@ -23,9 +24,9 @@ def eval_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader,
         env = wrappers.EpisodeTruncationWrapper(env)
         env = wrappers.DetailedRewardWrapper(env, config)
         env = wrappers.NormalizationWrapper(env)
-        env = FlattenObservation(env)
         env = wrappers.EpisodeStats(env)
         env = wrappers.EpisodeRender(env)
+        env = FlattenObservation(env)
         return env
 
     return thunk

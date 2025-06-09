@@ -103,11 +103,22 @@ class TransformerConfig:
     ffn_dim_multiplier: int = 4
     dropout_rate: float = 0.1
 @dataclass
+class ConvNextConfig:
+    """Configuration for a ConvNeXt encoder block."""
+    num_layers: int
+    embed_dim: int
+    ffn_dim_multiplier: int = 4
+    drop_path_rate: float = 0.1
+    depthwise_kernel_size: int = 7
+@dataclass
 class NetworkConfig:
     shape_1m: Tuple[int, int]
     shape_5m: Tuple[int, int]
+    encoder_type: str = "convnext" # "transformer" or "convnext"
     transformer_layers_1m:TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=2, embed_dim=512, num_heads=8))
     transformer_layers_5m:TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=2, embed_dim=256, num_heads=4))
+    convnext_layers_1m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=2, embed_dim=512))
+    convnext_layers_5m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=2, embed_dim=256))
     resMLP_layers_rest:List[int] = field(default_factory=lambda: [64, 32, ])
     resMLP_layers_final:List[int] = field(default_factory=lambda: [512, 256, 128])
     activation:str = "gelu"

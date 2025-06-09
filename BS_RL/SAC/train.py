@@ -341,8 +341,7 @@ class Trainer:
         obs, _ = self.envs.reset(seed=self.args.env.seed + self.initial_global_step)
         
         ep_stats_buffer_size = 64
-        returns_buffer = collections.deque(maxlen=ep_stats_buffer_size)
-        lengths_buffer = collections.deque(maxlen=ep_stats_buffer_size)
+        episode_stats_buffer = collections.deque(maxlen=ep_stats_buffer_size)
         pbar_postfix = collections.OrderedDict()
 
         total_iterations = self.args.algo.total_timesteps // self.args.env.env_num
@@ -354,7 +353,7 @@ class Trainer:
                 
                 obs, infos = self._environment_step(obs, current_step)
                 
-                self._log_episode_stats(infos, current_step, returns_buffer, lengths_buffer, pbar_postfix)
+                self._log_episode_stats(infos, current_step, episode_stats_buffer, pbar_postfix)
 
                 if current_step > self.args.algo.learning_starts:
                     if current_step % self.args.algo.update_frequency == 0:
@@ -399,29 +398,41 @@ class Trainer:
         self.rb.add(obs, real_next_obs, actions, rewards.astype(np.float32), terminations.astype(np.float32), infos)
         return next_obs, infos
 
-    def _log_episode_stats(self, infos, current_step, returns_buffer, lengths_buffer, pbar_postfix: dict):
+    def _log_episode_stats(self, infos, current_step, episode_stats_buffer: collections.deque, pbar_postfix: dict):
         if "final_info" not in infos:
             return
             
         for i, info_item in enumerate(infos["final_info"]):
             if info_item and "episode" in info_item:
-                returns_buffer.append(info_item['episode']['r'][0])
-                lengths_buffer.append(info_item['episode']['l'][0])
+                episode_stats = info_item['episode']
+                episode_stats_buffer.append(episode_stats)
                 if self.args.wandb.track and i == 0:
-                    wandb.log({"charts/episodic_return_env0": info_item['episode']['r'][0], 
-                               "charts/episodic_length_env0": info_item['episode']['l'][0]}, step=current_step)
+                    log_dict = {f"charts/episodic_{k}_env0": v for k, v in episode_stats.items()}
+                    wandb.log(log_dict, step=current_step)
 
-        if returns_buffer:
-            returns_list = list(returns_buffer)
-            mean_ret = np.mean(returns_list)
-            pbar_postfix["ret_mean"] = f"{mean_ret:.2f}"
+        if episode_stats_buffer:
+            aggregated_stats = collections.defaultdict(list)
+            for stats in episode_stats_buffer:
+                for key, value in stats.items():
+                    try:
+                        aggregated_stats[key].append(float(value))
+                    except (ValueError, TypeError):
+                        pass
+
+            if 'r' in aggregated_stats:
+                mean_ret = np.mean(aggregated_stats['r'])
+                pbar_postfix["ret_mean"] = f"{mean_ret:.2f}"
+
             if self.args.wandb.track:
-                wandb.log({
-                    "charts/episodic_return_mean_buffered": mean_ret,
-                    "charts/episodic_return_std_buffered": np.std(returns_list) if len(returns_list) > 1 else 0.0
-                }, step=current_step)
-        if lengths_buffer and self.args.wandb.track:
-            wandb.log({"charts/episodic_length_mean_buffered": np.mean(list(lengths_buffer))}, step=current_step)
+                log_data = {}
+                for key, values in aggregated_stats.items():
+                    if not values:
+                        continue
+                    log_data[f"charts/episodic_{key}_mean_buffered"] = np.mean(values)
+                    if len(values) > 1:
+                        log_data[f"charts/episodic_{key}_std_buffered"] = np.std(values)
+                if log_data:
+                    wandb.log(log_data, step=current_step)
 
     def _agent_update(self, current_step):
         self.key_update_base, key_update_step = jax.random.split(self.key_update_base)

@@ -2,7 +2,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from typing import List, Callable
-from .config import NetworkConfig, TransformerConfig
+from .config import NetworkConfig, TransformerConfig, ConvNextConfig
 
 def get_activation(name: str) -> Callable:
     if name == "relu":
@@ -13,6 +13,49 @@ def get_activation(name: str) -> Callable:
         return nn.silu
     else:
         raise ValueError(f"Unknown activation: {name}")
+
+class DropPath(nn.Module):
+    drop_prob: float
+
+    @nn.compact
+    def __call__(self, x, deterministic: bool):
+        if self.drop_prob == 0.0 or deterministic:
+            return x
+        
+        keep_prob = 1.0 - self.drop_prob
+        rng = self.make_rng('dropout')
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = jax.random.bernoulli(rng, p=keep_prob, shape=shape)
+        
+        return (x / keep_prob) * random_tensor
+
+class ConvNeXtBlock(nn.Module):
+    config: ConvNextConfig
+    activation: Callable
+
+    @nn.compact
+    def __call__(self, x, deterministic: bool):
+        residual = x
+        
+        x = nn.Conv(
+            features=self.config.embed_dim,
+            kernel_size=(self.config.depthwise_kernel_size,),
+            strides=(1,),
+            padding='SAME',
+            feature_group_count=self.config.embed_dim
+        )(x)
+        x = nn.LayerNorm(epsilon=1e-6)(x)
+        
+        mlp_dim = self.config.embed_dim * self.config.ffn_dim_multiplier
+        x = nn.Dense(features=mlp_dim)(x)
+        x = self.activation(x)
+        x = nn.Dense(features=self.config.embed_dim)(x)
+        
+        if self.config.drop_path_rate > 0.0:
+            x = DropPath(drop_prob=self.config.drop_path_rate)(x, deterministic=deterministic)
+            
+        x = residual + x
+        return x
 
 class ResMLP(nn.Module):
     hidden_dims: List[int]
@@ -75,24 +118,50 @@ class TradingNetwork(nn.Module):
         x_5m = x[:, dim_1m:dim_1m+dim_5m].reshape((-1, *self.network_config.shape_5m))
         x_rest = x[:, dim_1m+dim_5m:]
 
-        # Project to embed_dim before transformer blocks
-        x_1m = nn.Dense(self.network_config.transformer_layers_1m.embed_dim)(x_1m)
-        x_5m = nn.Dense(self.network_config.transformer_layers_5m.embed_dim)(x_5m)
-        
-        # Process 1m data
-        for _ in range(self.network_config.transformer_layers_1m.num_layers):
-            x_1m = TransformerEncoderBlock(
-                config=self.network_config.transformer_layers_1m,
-                activation=activation_fn
-            )(x_1m, deterministic=deterministic)
-        x_1m = x_1m.reshape((x_1m.shape[0], -1)) # Flatten
+        if self.network_config.encoder_type == 'transformer':
+            x_1m_config = self.network_config.transformer_layers_1m
+            x_5m_config = self.network_config.transformer_layers_5m
+        elif self.network_config.encoder_type == 'convnext':
+            x_1m_config = self.network_config.convnext_layers_1m
+            x_5m_config = self.network_config.convnext_layers_5m
+        else:
+            raise ValueError(f"Unknown encoder type: {self.network_config.encoder_type}")
 
-        # Process 5m data
-        for _ in range(self.network_config.transformer_layers_5m.num_layers):
-            x_5m = TransformerEncoderBlock(
-                config=self.network_config.transformer_layers_5m,
-                activation=activation_fn
-            )(x_5m, deterministic=deterministic)
+        # Project to embed_dim before encoders
+        x_1m = nn.Dense(x_1m_config.embed_dim)(x_1m)
+        x_5m = nn.Dense(x_5m_config.embed_dim)(x_5m)
+        
+        if self.network_config.encoder_type == 'transformer':
+            # Process 1m data
+            for _ in range(x_1m_config.num_layers):
+                x_1m = TransformerEncoderBlock(
+                    config=x_1m_config,
+                    activation=activation_fn
+                )(x_1m, deterministic=deterministic)
+
+            # Process 5m data
+            for _ in range(x_5m_config.num_layers):
+                x_5m = TransformerEncoderBlock(
+                    config=x_5m_config,
+                    activation=activation_fn
+                )(x_5m, deterministic=deterministic)
+            
+        elif self.network_config.encoder_type == 'convnext':
+             # Process 1m data
+            for _ in range(x_1m_config.num_layers):
+                x_1m = ConvNeXtBlock(
+                    config=x_1m_config,
+                    activation=activation_fn
+                )(x_1m, deterministic=deterministic)
+
+            # Process 5m data
+            for _ in range(x_5m_config.num_layers):
+                x_5m = ConvNeXtBlock(
+                    config=x_5m_config,
+                    activation=activation_fn
+                )(x_5m, deterministic=deterministic)
+
+        x_1m = x_1m.reshape((x_1m.shape[0], -1)) # Flatten
         x_5m = x_5m.reshape((x_5m.shape[0], -1)) # Flatten
 
         # Process rest of data

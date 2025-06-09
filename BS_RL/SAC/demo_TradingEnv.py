@@ -35,6 +35,7 @@ if __name__ == "__main__":
         network=NetworkConfig(
             shape_1m=(trading_env_config.window_size_1m, trading_env_config.kline_dim_1m),
             shape_5m=(trading_env_config.window_size_5m, trading_env_config.kline_dim_5m),
+            # encoder_type 默认为 "convnext". 若要使用 transformer, 设置: encoder_type="transformer"
         ),
         algo=AlgoConfig(
             total_timesteps=int(200e6), # 200M步
