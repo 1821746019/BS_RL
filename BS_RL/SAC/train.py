@@ -2,6 +2,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
 warnings.filterwarnings("ignore", category=UserWarning, module="absl")
 import os
+import copy
 import random
 import time
 from dataclasses import asdict
@@ -15,21 +16,26 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
-from flax.training import checkpoints # checkpoints只接受绝对路径
+from flax.training import checkpoints
 import flax.jax_utils
+from tqdm.auto import tqdm
 
 from .config import Args
-from .common import make_env
-from .networks import ActorCNN, CriticCNN, ActorMLP, CriticMLP
+from .common import train_env_maker
+from .networks import TradingActor, TradingCritic
 from .agent import SACAgent
-from .eval import evaluate_agent
+from .eval import Evaluator
+from TradingEnv import DataLoader
 import wandb
+
+def count_params(params):
+    return sum(x.size for x in jax.tree_util.tree_leaves(params))
+
 class Trainer:
     def __init__(self, args: Args):
         self.args = args
         self.num_devices = jax.local_device_count()
 
-        # To be initialized in setup
         self.run_name_suffix = None
         self.wandb_run_name = None
         self.base_output_dir = None
@@ -39,7 +45,6 @@ class Trainer:
         self.key_actions_base = None
         self.key_update_base = None
         self.envs = None
-        self.eval_envs = None
         self.agent = None
         self.rb = None
         self.actor_state = None
@@ -49,6 +54,8 @@ class Trainer:
         self.current_alpha = None
         self.p_update_all = None
         self.p_update_target_networks = None
+        self.data_loader = None
+        self.evaluator = None
 
     def setup(self):
         self._setup_paths_and_run_name()
@@ -56,23 +63,24 @@ class Trainer:
         self._handle_resume_and_directory_setup()
         self._setup_wandb()
         self._setup_seeds_and_keys()
+        self._setup_data_loader()
         self._setup_environments()
         self._setup_agent()
         self._setup_replay_buffer()
+        self._setup_evaluator()
 
     def _setup_paths_and_run_name(self):
+        run_name_suffix = f"{self.args.train.exp_name}__{self.args.env.seed}__{int(time.time())}"
         if self.args.train.save_dir:
             self.base_output_dir = Path(self.args.train.save_dir)
-            run_name_suffix = f"{self.args.env.env_id}__{self.args.train.exp_name}__{self.args.env.seed}__{int(time.time())}"
             self.wandb_run_name = f"{self.base_output_dir.name}__{run_name_suffix}" if self.base_output_dir.name else run_name_suffix
         else:
-            run_name_suffix = f"{self.args.env.env_id}__{self.args.train.exp_name}__{self.args.env.seed}__{int(time.time())}"
             self.base_output_dir = Path(f"runs/{run_name_suffix}")
             self.wandb_run_name = run_name_suffix
         
         self.run_name_suffix = run_name_suffix
         self.ckpt_dir = self.base_output_dir / "ckpts"
-        print(f"Run name suffix: {self.run_name_suffix}")
+        print(f"Run name: {self.run_name_suffix}")
         print(f"Checkpoint directory: {self.ckpt_dir}")
 
     def _setup_jax_devices(self):
@@ -161,49 +169,54 @@ class Trainer:
             self.key, key_for_loop = jax.random.split(base_key)
             self.key_actions_base, self.key_update_base = jax.random.split(key_for_loop)
 
+    def _setup_data_loader(self):
+        print("Initializing DataLoader...")
+        self.data_loader = DataLoader(self.args.env.trading_env_config)
+        # 拷贝一份，避免修改原始的trading_env_config
+        config_eval = copy.deepcopy(self.args.env.trading_env_config)
+        config_eval.data_path = "/root/project/processed_data/test_dataset/"
+        self.data_loader_eval = DataLoader(config_eval)
+        print("DataLoader initialized.")
+
     def _setup_environments(self):
+        print("Creating training environments...")
         vec_env_cls = gym.vector.AsyncVectorEnv if self.args.env.async_vector_env else gym.vector.SyncVectorEnv
         self.envs = vec_env_cls(
-            [make_env(self.args.env.env_id, self.args.env.seed + i, i, False, self.run_name_suffix, self.args.env.env_num) for i in range(self.args.env.env_num)]
+            [train_env_maker(
+                seed=self.args.env.seed + i,
+                config=self.args.env.trading_env_config,
+                data_loader=self.data_loader
+            ) for i in range(self.args.env.env_num)]
         )
         assert isinstance(self.envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported by this SAC version"
-
-        if self.args.eval.cache_env and not self.args.eval.capture_video and self.args.eval.eval_episodes > 0:
-            print("Caching evaluation environment.")
-            eval_vec_env_cls = gym.vector.AsyncVectorEnv if self.args.eval.async_vector_env else gym.vector.SyncVectorEnv
-            self.eval_envs = eval_vec_env_cls([
-                make_env(
-                    self.args.env.env_id,
-                    self.args.eval.seed + i,
-                    i,
-                    capture_video=False,
-                    run_name=f"{self.run_name_suffix}_eval_cached",
-                    num_envs=self.args.eval.env_num
-                ) for i in range(self.args.eval.env_num)
-            ])
 
     def _setup_agent(self):
         obs_shape = self.envs.single_observation_space.shape
         action_dim = self.envs.single_action_space.n
 
-        if "NoFrameskip" in self.args.env.env_id:
-            actor_model_cls, critic_model_cls = ActorCNN, CriticCNN
-        elif "CartPole-v1" == self.args.env.env_id:
-            actor_model_cls, critic_model_cls = ActorMLP, CriticMLP
-        else:
-            raise ValueError(f"Unsupported environment ID for network selection: {self.args.env.env_id}")
+        actor_model_cls, critic_model_cls = TradingActor, TradingCritic
         
         key_agent, self.key = jax.random.split(self.key)
         self.agent = SACAgent(
             action_dim=action_dim,
             observation_space_shape=obs_shape,
             key=key_agent,
+            network_config=self.args.network,
             algo_config=self.args.algo,
             actor_model_cls=actor_model_cls,
             critic_model_cls=critic_model_cls
         )
         
         self._initialize_or_restore_agent_states()
+
+        actor_p_count = count_params(self.actor_state_single.params) / 1e6
+        critic_p_count = count_params(self.qf1_state_single.params) / 1e6
+        print(f"Actor params: {actor_p_count:.2f}M")
+        print(f"Critic params: {critic_p_count:.2f}M (x2 networks)")
+        if self.args.wandb.track:
+            wandb.summary['actor_params_m'] = actor_p_count
+            wandb.summary['critic_params_m'] = critic_p_count
+
         self._replicate_states()
 
         self.p_update_all = jax.pmap(self.agent.update_all, axis_name='batch')
@@ -310,47 +323,70 @@ class Trainer:
                 n_envs=self.args.env.env_num
             )
 
+    def _setup_evaluator(self):
+        if self.args.eval.eval_episodes <= 0:
+            return
+        print("Setting up evaluator...")
+
+        self.evaluator = Evaluator(
+            agent=self.agent,
+            env_config=self.args.env,
+            eval_config=self.args.eval,
+            data_loader=self.data_loader_eval,
+            run_name_suffix=self.run_name_suffix
+        )
+
     def train(self):
         start_time = time.time()
         obs, _ = self.envs.reset(seed=self.args.env.seed + self.initial_global_step)
         
-        # Buffers for smoothed episodic statistics
-        ep_stats_buffer_size = 64#self.args.env.env_num
+        ep_stats_buffer_size = 64
         returns_buffer = collections.deque(maxlen=ep_stats_buffer_size)
         lengths_buffer = collections.deque(maxlen=ep_stats_buffer_size)
+        pbar_postfix = collections.OrderedDict()
 
+        total_iterations = self.args.algo.total_timesteps // self.args.env.env_num
         start_iteration = self.initial_global_step // self.args.env.env_num
+        
+        with tqdm(initial=start_iteration, total=total_iterations, desc="Training") as pbar:
+            for loop_iter in range(start_iteration, total_iterations):
+                current_step = loop_iter * self.args.env.env_num
+                
+                obs, infos = self._environment_step(obs, current_step)
+                
+                self._log_episode_stats(infos, current_step, returns_buffer, lengths_buffer, pbar_postfix)
 
-        for loop_iter in range(start_iteration, self.args.algo.total_timesteps // self.args.env.env_num):
-            current_step = loop_iter * self.args.env.env_num
-            self.key_actions_base, key_actions_step = jax.random.split(self.key_actions_base)
-            
-            obs, infos = self._environment_step(obs, key_actions_step, current_step)
-            
-            self._log_episode_stats(infos, current_step, returns_buffer, lengths_buffer)
+                if current_step > self.args.algo.learning_starts:
+                    if current_step % self.args.algo.update_frequency == 0:
+                        metrics = self._agent_update(current_step)
+                        if metrics:
+                            sps = int((current_step - self.initial_global_step) / (time.time() - start_time + 1e-9))
+                            pbar_postfix["SPS"] = sps
+                            metrics["charts/SPS"] = sps
+                            if self.args.wandb.track:
+                                wandb.log(metrics, step=current_step)
 
-            if current_step > self.args.algo.learning_starts:
-                if current_step % self.args.algo.update_frequency == 0:
-                    self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
-                    self._agent_update(key_update_step, current_step, start_time)
+                    if current_step % self.args.algo.target_network_frequency == 0:
+                        self._update_target_networks()
+                
+                next_step = (loop_iter + 1) * self.args.env.env_num
+                self._run_evaluation(current_step, next_step)
+                self._save_checkpoint(current_step, next_step)
 
-                if current_step % self.args.algo.target_network_frequency == 0:
-                    self._update_target_networks()
-            
-            next_step = (loop_iter + 1) * self.args.env.env_num
-            self._run_evaluation(current_step, next_step)
-            self._save_checkpoint(current_step, next_step)
+                pbar.set_postfix(pbar_postfix)
+                pbar.update(1)
         
         self._save_final_model()
         self.cleanup()
 
-    def _environment_step(self, obs, key_actions, current_step):
+    def _environment_step(self, obs, current_step):
+        self.key_actions_base, key_actions_step = jax.random.split(self.key_actions_base)
         if current_step < self.args.algo.learning_starts:
             actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)])
         else:
             jax_obs = jnp.asarray(obs)
             unreplicated_actor_params = flax.jax_utils.unreplicate(self.actor_state.params)
-            actions_jax = self.agent.select_action(unreplicated_actor_params, jax_obs, key_actions, deterministic=False)
+            actions_jax = self.agent.select_action(unreplicated_actor_params, jax_obs, key_actions_step, deterministic=False)
             actions = np.array(jax.device_get(actions_jax))
 
         next_obs, rewards, terminations, truncations, infos = self.envs.step(actions)
@@ -363,31 +399,32 @@ class Trainer:
         self.rb.add(obs, real_next_obs, actions, rewards.astype(np.float32), terminations.astype(np.float32), infos)
         return next_obs, infos
 
-    def _log_episode_stats(self, infos, current_step, returns_buffer, lengths_buffer):
-        if "final_info" not in infos or not self.args.wandb.track:
+    def _log_episode_stats(self, infos, current_step, returns_buffer, lengths_buffer, pbar_postfix: dict):
+        if "final_info" not in infos:
             return
             
         for i, info_item in enumerate(infos["final_info"]):
             if info_item and "episode" in info_item:
                 returns_buffer.append(info_item['episode']['r'][0])
                 lengths_buffer.append(info_item['episode']['l'][0])
-                if i == 0:
+                if self.args.wandb.track and i == 0:
                     wandb.log({"charts/episodic_return_env0": info_item['episode']['r'][0], 
                                "charts/episodic_length_env0": info_item['episode']['l'][0]}, step=current_step)
 
         if returns_buffer:
             returns_list = list(returns_buffer)
-            mean_ret, min_ret, max_ret = np.mean(returns_list), np.min(returns_list), np.max(returns_list)
-            std_ret = np.std(returns_list) if len(returns_list) > 1 else 0.0
-            wandb.log({
-                "charts/episodic_return_mean_buffered": mean_ret,
-                "charts/episodic_return_std_buffered": std_ret
-            }, step=current_step)
-            print(f"step={current_step}, buffered_return_mean={mean_ret:.2f}, buffered_return_std={std_ret:.2f} (from {len(returns_list)} ep.)")
-        if lengths_buffer:
+            mean_ret = np.mean(returns_list)
+            pbar_postfix["ret_mean"] = f"{mean_ret:.2f}"
+            if self.args.wandb.track:
+                wandb.log({
+                    "charts/episodic_return_mean_buffered": mean_ret,
+                    "charts/episodic_return_std_buffered": np.std(returns_list) if len(returns_list) > 1 else 0.0
+                }, step=current_step)
+        if lengths_buffer and self.args.wandb.track:
             wandb.log({"charts/episodic_length_mean_buffered": np.mean(list(lengths_buffer))}, step=current_step)
 
-    def _agent_update(self, key_update, current_step, start_time):
+    def _agent_update(self, current_step):
+        self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
         data = self.rb.sample(self.args.algo.batch_size)
         data_numpy = {
             'observations': data.observations.numpy(), 'actions': data.actions.numpy().astype(np.int32),
@@ -395,55 +432,41 @@ class Trainer:
             'dones': data.dones.numpy().flatten()
         }
         sharded_data = {k: v.reshape(self.num_devices, self.batch_size_per_device, *v.shape[1:]) for k, v in data_numpy.items()}
-        sharded_key = jax.random.split(key_update, self.num_devices)
+        sharded_key = jax.random.split(key_update_step, self.num_devices)
         
         log_alpha_arg = self.log_alpha_state if self.args.algo.autotune else self.current_alpha
 
-        self.actor_state, self.qf1_state, self.qf2_state, returned_log_alpha, self.current_alpha, metrics = self.p_update_all(
+        self.actor_state, self.qf1_state, self.qf2_state, returned_log_alpha, self.current_alpha, metrics_sharded = self.p_update_all(
             self.actor_state, self.qf1_state, self.qf2_state, log_alpha_arg, sharded_data, sharded_key
         )
         if self.args.algo.autotune:
             self.log_alpha_state = returned_log_alpha
-            
-        if current_step % (self.args.algo.update_frequency * 25) == 0 and self.args.wandb.track:
-            self._log_training_metrics(metrics, current_step, start_time)
+        
+        if current_step % (self.args.algo.update_frequency * 100) == 0:
+            metrics = flax.jax_utils.unreplicate(metrics_sharded)
+            return {f"train/{k}": v for k, v in metrics.items()}
+        return None
 
-    def _log_training_metrics(self, metrics_sharded, current_step, start_time):
-        metrics = flax.jax_utils.unreplicate(metrics_sharded)
-        sps = int(current_step / (time.time() - start_time)) if (time.time() - start_time) > 0 else 0
-        wandb_metrics = {f"metrics/{k}": v for k, v in metrics.items()}
-        wandb_metrics.update({
-            "charts/SPS": sps,
-        })
-        wandb.log(wandb_metrics, step=current_step)
-        print(f"SPS: {sps}")
-    
     def _update_target_networks(self):
         self.qf1_state, self.qf2_state = self.p_update_target_networks(self.qf1_state, self.qf2_state)
 
     def _run_evaluation(self, current_step, next_step):
+        if not self.evaluator: return
         eval_freq = self.args.eval.eval_frequency_abs_steps
-        if self.args.eval.eval_episodes <= 0 or not eval_freq or next_step < eval_freq:
+        if not eval_freq or next_step < eval_freq or (current_step // eval_freq) < (next_step // eval_freq):
             return
         
-        if (current_step // eval_freq) < (next_step // eval_freq):
-            eval_trigger_step = (next_step // eval_freq) * eval_freq
-            print(f"--- Evaluation Triggered at step {current_step} (effective eval step: {eval_trigger_step}) ---")
-            
-            eval_metrics = evaluate_agent(
-                agent_eval=self.agent,
-                actor_params_eval=flax.jax_utils.unreplicate(self.actor_state.params),
-                env_config=self.args.env,
-                eval_config=self.args.eval,
-                num_episodes=self.args.eval.eval_episodes,
-                greedy_actions=self.args.eval.greedy_actions,
-                run_name_suffix_eval=self.run_name_suffix,
-                current_train_step=current_step,
-                eval_envs=self.eval_envs
-            )
-            print(f"Evaluation at step {current_step}: {eval_metrics}")
-            if self.args.wandb.track:
-                wandb.log({f"eval/{k}": v for k, v in eval_metrics.items()}, step=current_step)
+        eval_trigger_step = (next_step // eval_freq) * eval_freq
+        tqdm.write(f"--- Evaluation Triggered at step {current_step} (effective eval step: {eval_trigger_step}) ---")
+        
+        eval_metrics = self.evaluator.evaluate(
+            actor_params_eval=flax.jax_utils.unreplicate(self.actor_state.params),
+            current_train_step=current_step
+        )
+        
+        tqdm.write(f"Evaluation at step {current_step}: {eval_metrics}")
+        if self.args.wandb.track:
+            wandb.log({f"eval/{k}": v for k, v in eval_metrics.items()}, step=current_step)
 
     def _save_checkpoint(self, current_step, next_step, is_final=False):
         step_for_ckpt: int
@@ -510,22 +533,16 @@ class Trainer:
         self._save_checkpoint(final_step, final_step + 1, is_final=True)
 
     def cleanup(self):
-        if self.eval_envs:
-            self.eval_envs.close()
         self.envs.close()
+        if self.evaluator:
+            self.evaluator.close()
         if self.args.wandb.track and wandb.run:
             wandb.finish()
 
 
 def train(args: Args):
-    # JAX platform selection
     if args.train.jax_platform_name:
-        try:
-            print(f"Attempting to set JAX platform to: {args.train.jax_platform_name}")
-            jax.config.update('jax_platform_name', args.train.jax_platform_name)
-            print(f"JAX platform successfully set to: {jax.devices()[0].platform.upper() if jax.devices() else 'Unknown'}")
-        except Exception as e:
-            print(f"Could not set JAX platform name: {e}")
+        jax.config.update('jax_platform_name', args.train.jax_platform_name)
     
     trainer = Trainer(args)
     trainer.setup()

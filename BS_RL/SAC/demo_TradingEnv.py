@@ -1,13 +1,16 @@
 import tyro
-from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig
+from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
 from .train import train
 import os
+from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_size
 
 if __name__ == "__main__":
-    batch_size = 512
-    env_id = "CartPole-v1"
-    env_num = 16
+    batch_size = 5120
+    env_id = "TradingEnv"
+    env_num = 96
     eval_env_num = 16
+    trading_env_config = TradingEnvConfig(data_path="/root/project/processed_data/")
+
     args = Args(
         train=TrainConfig(
             exp_name=env_id,
@@ -20,16 +23,21 @@ if __name__ == "__main__":
             eval_frequency=0.01,
             eval_episodes=16,
             greedy_actions=True,
-            capture_video=True,
             env_num=eval_env_num,
+            async_vector_env=True, # 利用CPU多核
         ),
         env=EnvConfig(
-            env_id=env_id,
+            trading_env_config=trading_env_config,
             seed=1,
             env_num=env_num, # SAC typically uses 1 env for off-policy learning
+            async_vector_env=True, # 利用CPU多核
+        ),
+        network=NetworkConfig(
+            shape_1m=(trading_env_config.window_size_1m, trading_env_config.kline_dim_1m),
+            shape_5m=(trading_env_config.window_size_5m, trading_env_config.kline_dim_5m),
         ),
         algo=AlgoConfig(
-            total_timesteps=int(1e6), # CartPole learns faster
+            total_timesteps=int(200e6), # 200M步
             buffer_size=int(1e5),
             learning_starts=int(1e3),
             batch_size=batch_size,
@@ -46,13 +54,9 @@ if __name__ == "__main__":
             adam_eps=1e-4
         ),
         wandb=WandbConfig(
-            project_name="SAC-Discrete",
+            project_name="SAC-Discrete_TradingEnv",
             entity=None # Your WandB entity
         )
     )
-    print("--- NOTE FOR CartPole-v1 ---")
-    print("This demo uses MLP networks defined in networks.py.")
-    print("Hyperparameters have been adjusted for CartPole-v1.")
-    print("-----------------------------")
     
     train(args)

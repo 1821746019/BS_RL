@@ -7,8 +7,7 @@ import optax
 from functools import partial
 from typing import Union
 
-from .config import AlgoConfig
-# Networks will be passed as arguments to SACAgent init
+from .config import AlgoConfig, NetworkConfig
 
 class CriticTrainState(TrainState):
     target_params: flax.core.FrozenDict
@@ -16,50 +15,44 @@ class CriticTrainState(TrainState):
 class SACAgent:
     def __init__(self,
                  action_dim: int,
-                 observation_space_shape, # For network init
+                 observation_space_shape,
                  key: jax.random.PRNGKey,
+                 network_config: NetworkConfig,
                  algo_config: AlgoConfig,
-                 actor_model_cls, # e.g. ActorCNN or ActorMLP
-                 critic_model_cls # e.g. CriticCNN or CriticMLP
+                 actor_model_cls,
+                 critic_model_cls
                  ):
 
         self.algo_config = algo_config
         self.action_dim = action_dim
+        self.network_config = network_config
         
-        # PRNG keys
         key_actor, key_qf1, key_qf2, key_log_alpha = jax.random.split(key, 4)
-        self.key_buffer = key # For action selection randomness
+        self.key_buffer = key
 
-        # Dummy input for network initialization
-        # For CNNs, obs_shape is (C, H, W), add batch dim
-        # For MLPs, obs_shape is (Features,), add batch dim
-        if len(observation_space_shape) == 3: # Image obs
+        if len(observation_space_shape) == 3:
             dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
-        else: # Vector obs
+        else:
             dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
 
-
-        # Actor
-        self.actor_model = actor_model_cls(action_dim=action_dim)
-        actor_params = self.actor_model.init(key_actor, dummy_obs)['params']
+        self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
+        actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, dummy_obs, deterministic=True)['params']
         self.actor_state = TrainState.create(
             apply_fn=self.actor_model.apply,
             params=actor_params,
             tx=optax.adamw(learning_rate=algo_config.policy_lr, eps=algo_config.adam_eps)
         )
 
-        # Critic 1
-        self.critic_model = critic_model_cls(action_dim=action_dim) # Q-network
-        qf1_params = self.critic_model.init(key_qf1, dummy_obs)['params']
+        self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
+        qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, dummy_obs, deterministic=True)['params']
         self.qf1_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf1_params,
-            target_params=qf1_params, # Initialize target params same as online params
+            target_params=qf1_params,
             tx=optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps)
         )
 
-        # Critic 2
-        qf2_params = self.critic_model.init(key_qf2, dummy_obs)['params'] # Re-init for different weights
+        qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, dummy_obs, deterministic=True)['params']
         self.qf2_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf2_params,
@@ -67,31 +60,32 @@ class SACAgent:
             tx=optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps)
         )
 
-        # Alpha (Entropy Temperature)
         if algo_config.autotune:
             self.target_entropy = -algo_config.target_entropy_scale * jnp.log(1.0 / action_dim)
-            # log_alpha is a scalar, TrainState expects params to be a pytree (like a dict)
             log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
             self.log_alpha_state = TrainState.create(
-                apply_fn=None, # Not applying a network model here
+                apply_fn=None,
                 params=log_alpha_params,
-                tx=optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps) # Same LR as Q
+                tx=optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps)
             )
             self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
         else:
             self.current_alpha = jnp.array(algo_config.alpha, dtype=jnp.float32)
-            self.log_alpha_state = None # To satisfy type hints or checks
-            self.target_entropy = 0.0 # Placeholder
+            self.log_alpha_state = None
+            self.target_entropy = 0.0
 
     @partial(jax.jit, static_argnums=(0, 4))
     def select_action(self, actor_params: flax.core.FrozenDict, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
-        logits = self.actor_model.apply({'params': actor_params}, obs)
-        # Gumbel-softmax trick for sampling is not strictly needed for SAC discrete action selection
-        # Categorical sampling is fine
+        key_dropout, key_sample = jax.random.split(key)
+        logits = self.actor_model.apply(
+            {'params': actor_params}, obs,
+            deterministic=deterministic,
+            rngs={'dropout': key_dropout}
+        )
         if deterministic:
             actions = jnp.argmax(logits, axis=-1)
         else:
-            actions = jax.random.categorical(key, logits, axis=-1)
+            actions = jax.random.categorical(key_sample, logits, axis=-1)
         return actions
 
     @partial(jax.jit, static_argnums=(0,))
@@ -99,55 +93,62 @@ class SACAgent:
                        actor_state: TrainState,
                        qf1_state: CriticTrainState,
                        qf2_state: CriticTrainState,
-                       log_alpha_input: Union[flax.core.FrozenDict, jnp.ndarray], # .params if autotune, else fixed value
+                       log_alpha_input: Union[flax.core.FrozenDict, jnp.ndarray],
                        data: dict,
-                       key_next_actions: jax.random.PRNGKey): # Not used for discrete SAC target Q
+                       key: jax.random.PRNGKey):
 
-        if self.algo_config.autotune: # log_alpha_input is log_alpha_state.params
+        if self.algo_config.autotune:
             current_alpha = jnp.exp(log_alpha_input['log_alpha'])
-        else: # log_alpha_input is the fixed alpha value
+        else:
             current_alpha = log_alpha_input
 
-        # Get next action probabilities and log probabilities from current policy
-        next_logits = self.actor_model.apply({'params': actor_state.params}, data['next_observations'])
+        key_next_logits, key_q_target = jax.random.split(key)
+        next_logits = self.actor_model.apply(
+            {'params': actor_state.params}, data['next_observations'],
+            deterministic=False, # Use dropout for stochasticity in target
+            rngs={'dropout': key_next_logits}
+        )
         next_action_probs = nn.softmax(next_logits, axis=-1)
         next_action_log_probs = nn.log_softmax(next_logits, axis=-1)
 
-        # Target Q-values from target Q-networks
-        qf1_next_target_values = self.critic_model.apply({'params': qf1_state.target_params}, data['next_observations'])
-        qf2_next_target_values = self.critic_model.apply({'params': qf2_state.target_params}, data['next_observations'])
+        qf1_next_target_values = self.critic_model.apply(
+            {'params': qf1_state.target_params}, data['next_observations'],
+            deterministic=True, rngs={'dropout': key_q_target}
+        )
+        qf2_next_target_values = self.critic_model.apply(
+            {'params': qf2_state.target_params}, data['next_observations'],
+            deterministic=True, rngs={'dropout': key_q_target}
+        )
         min_qf_next_target = jnp.minimum(qf1_next_target_values, qf2_next_target_values)
         
-        # Expected value for next state: sum_a' [ P(a'|s') * (Q_target(s',a') - alpha * log P(a'|s')) ]
         next_q_value_components = next_action_probs * (min_qf_next_target - current_alpha * next_action_log_probs)
         next_q_value = jnp.sum(next_q_value_components, axis=1)
         
-        # TD target
         target_q_values = data['rewards'] + (1.0 - data['dones']) * self.algo_config.gamma * next_q_value
-        target_q_values = jax.lax.stop_gradient(target_q_values) # Important!
+        target_q_values = jax.lax.stop_gradient(target_q_values)
 
-        # --- QF1 Loss ---
         def qf1_loss_fn(params):
-            # Get Q-values for ALL actions from current Q-network
-            qf1_all_actions = self.critic_model.apply({'params': params}, data['observations'])
-            # Gather Q-values for the specific actions taken (from replay buffer)
+            qf1_all_actions = self.critic_model.apply(
+                {'params': params}, data['observations'],
+                deterministic=True, rngs={'dropout': key}
+            )
             qf1_taken_action = jnp.take_along_axis(qf1_all_actions, data['actions'], axis=1).squeeze(-1)
             loss = ((qf1_taken_action - target_q_values) ** 2).mean()
             return loss, qf1_taken_action.mean()
-
         (qf1_loss_val, qf1_values_mean), qf1_grads = jax.value_and_grad(qf1_loss_fn, has_aux=True)(qf1_state.params)
         qf1_grads = jax.lax.pmean(qf1_grads, axis_name='batch')
         qf1_loss_val = jax.lax.pmean(qf1_loss_val, axis_name='batch')
         qf1_values_mean = jax.lax.pmean(qf1_values_mean, axis_name='batch')
         qf1_state_new = qf1_state.apply_gradients(grads=qf1_grads)
         
-        # --- QF2 Loss ---
         def qf2_loss_fn(params):
-            qf2_all_actions = self.critic_model.apply({'params': params}, data['observations'])
+            qf2_all_actions = self.critic_model.apply(
+                {'params': params}, data['observations'],
+                deterministic=True, rngs={'dropout': key}
+            )
             qf2_taken_action = jnp.take_along_axis(qf2_all_actions, data['actions'], axis=1).squeeze(-1)
             loss = ((qf2_taken_action - target_q_values) ** 2).mean()
             return loss, qf2_taken_action.mean()
-
         (qf2_loss_val, qf2_values_mean), qf2_grads = jax.value_and_grad(qf2_loss_fn, has_aux=True)(qf2_state.params)
         qf2_grads = jax.lax.pmean(qf2_grads, axis_name='batch')
         qf2_loss_val = jax.lax.pmean(qf2_loss_val, axis_name='batch')
@@ -155,42 +156,47 @@ class SACAgent:
         qf2_state_new = qf2_state.apply_gradients(grads=qf2_grads)
 
         critic_loss = (qf1_loss_val + qf2_loss_val) / 2.0
-        # critic_loss is already an average of averages, pmean not strictly needed if components are.
-        # However, to be safe if one component was scalar and other not:
         critic_loss = jax.lax.pmean(critic_loss, axis_name='batch')
         
         return qf1_state_new, qf2_state_new, critic_loss, \
                {'qf1_loss': qf1_loss_val, 'qf2_loss': qf2_loss_val,
                 'qf1_values': qf1_values_mean, 'qf2_values': qf2_values_mean}
 
-
     @partial(jax.jit, static_argnums=(0,))
     def _update_actor_and_alpha(self,
                                 actor_state: TrainState,
-                                qf1_state: CriticTrainState, # Pass online Q-network states
+                                qf1_state: CriticTrainState,
                                 qf2_state: CriticTrainState,
-                                log_alpha_input: Union[TrainState, jnp.ndarray], # TrainState if autotune, else fixed value
-                                data: dict):
+                                log_alpha_input: Union[TrainState, jnp.ndarray],
+                                data: dict,
+                                key: jax.random.PRNGKey):
         
-        # Determine effective alpha for actor loss calculation
-        if self.algo_config.autotune: # log_alpha_input is TrainState
+        key_actor, key_alpha = jax.random.split(key)
+        
+        if self.algo_config.autotune:
             actor_effective_alpha = jnp.exp(log_alpha_input.params['log_alpha'])
-        else: # log_alpha_input is the fixed alpha value
+        else:
             actor_effective_alpha = log_alpha_input
 
-        # --- Actor Loss ---
         def actor_loss_fn(actor_params):
-            logits = self.actor_model.apply({'params': actor_params}, data['observations'])
+            logits = self.actor_model.apply(
+                {'params': actor_params}, data['observations'],
+                deterministic=False, rngs={'dropout': key_actor}
+            )
             action_probs = nn.softmax(logits, axis=-1)
             action_log_probs = nn.log_softmax(logits, axis=-1)
 
-            # Q-values from online Q-networks (detached for actor loss)
-            qf1_all_actions = self.critic_model.apply({'params': qf1_state.params}, data['observations'])
-            qf2_all_actions = self.critic_model.apply({'params': qf2_state.params}, data['observations'])
+            qf1_all_actions = self.critic_model.apply(
+                {'params': qf1_state.params}, data['observations'],
+                deterministic=True, rngs={'dropout': key_actor}
+            )
+            qf2_all_actions = self.critic_model.apply(
+                {'params': qf2_state.params}, data['observations'],
+                deterministic=True, rngs={'dropout': key_actor}
+            )
             min_qf_values = jnp.minimum(qf1_all_actions, qf2_all_actions)
             min_qf_values = jax.lax.stop_gradient(min_qf_values)
 
-            # Expected value for actor loss: sum_a [ P(a|s) * (alpha * log P(a|s) - Q(s,a)) ]
             actor_loss_components = action_probs * (actor_effective_alpha * action_log_probs - min_qf_values)
             loss = jnp.sum(actor_loss_components, axis=1).mean()
             
@@ -203,19 +209,21 @@ class SACAgent:
         entropy_val = jax.lax.pmean(entropy_val, axis_name='batch')
         actor_state_new = actor_state.apply_gradients(grads=actor_grads)
 
-        # --- Alpha Loss (if autotuning) ---
-        alpha_loss_val = 0.0 # Default if not autotuning
-        log_alpha_state_to_return = log_alpha_input # Pass through if not updated
-        current_alpha_to_return = actor_effective_alpha # Pass through if not updated
+        alpha_loss_val = 0.0
+        log_alpha_state_to_return = log_alpha_input
+        current_alpha_to_return = actor_effective_alpha
 
-        if self.algo_config.autotune: # log_alpha_input is TrainState
-            def alpha_loss_fn(log_alpha_params_dict): # log_alpha_params_dict is log_alpha_input.params
-                # ... (rest of alpha loss logic from original, using detached_log_probs)
-                logits_old_actor = self.actor_model.apply({'params': actor_state.params}, data['observations']) # old actor
+        if self.algo_config.autotune:
+            def alpha_loss_fn(log_alpha_params_dict):
+                logits_old_actor = self.actor_model.apply(
+                    {'params': actor_state.params}, data['observations'],
+                    deterministic=True, rngs={'dropout': key_alpha}
+                )
                 action_log_probs_old_actor = nn.log_softmax(logits_old_actor, axis=-1)
-                action_probs_old_actor = nn.softmax(logits_old_actor, axis=-1)
-
                 detached_log_probs = jax.lax.stop_gradient(action_log_probs_old_actor)
+                
+                # We are using action probabilities for the expectation.
+                action_probs_old_actor = nn.softmax(logits_old_actor, axis=-1)
                 detached_probs = jax.lax.stop_gradient(action_probs_old_actor)
                 
                 alpha_loss_components = detached_probs * \
@@ -223,7 +231,6 @@ class SACAgent:
                 loss = jnp.sum(alpha_loss_components, axis=1).mean()
                 return loss
 
-            # log_alpha_input here is the TrainState instance
             alpha_loss_val_scalar, alpha_grads_dict = jax.value_and_grad(alpha_loss_fn)(log_alpha_input.params)
             alpha_grads_dict = jax.lax.pmean(alpha_grads_dict, axis_name='batch')
             alpha_loss_val = jax.lax.pmean(alpha_loss_val_scalar, axis_name='batch')
@@ -253,30 +260,27 @@ class SACAgent:
                    actor_state: TrainState,
                    qf1_state: CriticTrainState,
                    qf2_state: CriticTrainState,
-                   log_alpha_input: Union[TrainState, flax.core.FrozenDict, jnp.ndarray], # TrainState or .params if autotune, else fixed float value
-                   data: dict, # observations, actions, next_observations, rewards, dones
-                   key_next_actions: jax.random.PRNGKey # Not used for discrete
+                   log_alpha_input: Union[TrainState, flax.core.FrozenDict, jnp.ndarray],
+                   data: dict,
+                   key: jax.random.PRNGKey
                    ):
 
-        # Determine the argument for _update_critic's alpha parameter
-        # If autotuning, _update_critic expects log_alpha_state.params
-        # If not autotuning, _update_critic expects the fixed alpha value
+        key_critic, key_actor = jax.random.split(key)
+
         alpha_arg_for_critic = log_alpha_input.params if self.algo_config.autotune and hasattr(log_alpha_input, 'params') else log_alpha_input
         
         qf1_state, qf2_state, critic_loss, critic_metrics = self._update_critic(
             actor_state, qf1_state, qf2_state, 
             alpha_arg_for_critic, 
-            data, key_next_actions
+            data, key_critic
         )
         
-        # _update_actor_and_alpha takes the full log_alpha_input (TrainState or fixed value)
         actor_state, returned_log_alpha_state, returned_current_alpha, actor_loss, actor_alpha_metrics = self._update_actor_and_alpha(
             actor_state, qf1_state, qf2_state, 
             log_alpha_input, 
-            data
+            data,
+            key_actor
         )
         
         all_metrics = {**critic_metrics, **actor_alpha_metrics, 'critic_loss_combined': critic_loss}
-        # The returned_log_alpha_state is the updated TrainState or the passed-through fixed value.
-        # The returned_current_alpha is the new jnp.exp(log_alpha) or the passed-through fixed value.
         return actor_state, qf1_state, qf2_state, returned_log_alpha_state, returned_current_alpha, all_metrics

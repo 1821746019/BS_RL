@@ -1,76 +1,132 @@
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
+from typing import List, Callable
+from .config import NetworkConfig, TransformerConfig
 
-# Common CNN Encoder for Atari
-class AtariEncoder(nn.Module):
+def get_activation(name: str) -> Callable:
+    if name == "relu":
+        return nn.relu
+    elif name == "gelu":
+        return nn.gelu
+    elif name == "silu":
+        return nn.silu
+    else:
+        raise ValueError(f"Unknown activation: {name}")
+
+class ResMLP(nn.Module):
+    hidden_dims: List[int]
+    activation: Callable
+
     @nn.compact
-    def __call__(self, x: jnp.ndarray):
-        # Input x is (Batch, C, H, W) from FrameStack
-        # Transpose to (Batch, H, W, C) for Flax Conv
-        x = jnp.transpose(x, (0, 2, 3, 1))
-        x = x / 255.0  # Normalize
-        
-        x = nn.Conv(features=32, kernel_size=(8, 8), strides=(4, 4), padding="VALID",
-                    kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.gelu(x)
-        x = nn.Conv(features=64, kernel_size=(4, 4), strides=(2, 2), padding="VALID",
-                    kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.gelu(x)
-        x = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1), padding="VALID",
-                    kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.gelu(x)
-        x = x.reshape((x.shape[0], -1))  # Flatten
+    def __call__(self, x):
+        for i, dim in enumerate(self.hidden_dims):
+            y = nn.Dense(dim)(x)
+            y = self.activation(y)
+            y = nn.LayerNorm()(y)
+            x = x + y if x.shape[-1] == y.shape[-1] else y
         return x
 
-# Actor Network for Atari (CNN based)
-class ActorCNN(nn.Module):
+class SelfAttention(nn.Module):
+    config: TransformerConfig
+    
+    @nn.compact
+    def __call__(self, x, deterministic: bool):
+        attention_layer = nn.MultiHeadDotProductAttention(
+            num_heads=self.config.num_heads,
+            kernel_init=nn.initializers.xavier_uniform(),
+            bias_init=nn.initializers.zeros,
+            dropout_rate=self.config.dropout_rate,
+        )
+        x_norm = nn.LayerNorm()(x)
+        x_attn = attention_layer(x_norm, x_norm, deterministic=deterministic)
+        x = x + x_attn
+        return x
+
+class TransformerEncoderBlock(nn.Module):
+    config: TransformerConfig
+    activation: Callable
+
+    @nn.compact
+    def __call__(self, x, deterministic: bool):
+        x = SelfAttention(config=self.config)(x, deterministic=deterministic)
+        
+        mlp_dim = self.config.embed_dim * self.config.ffn_dim_multiplier
+        y = nn.LayerNorm()(x)
+        y = nn.Dense(mlp_dim)(y)
+        y = self.activation(y)
+        y = nn.Dense(self.config.embed_dim)(y)
+        
+        x = x + y
+        return x
+
+class TradingNetwork(nn.Module):
+    network_config: NetworkConfig
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, deterministic: bool):
+        activation_fn = get_activation(self.network_config.activation)
+        
+        # Split and reshape
+        dim_1m = self.network_config.shape_1m[0] * self.network_config.shape_1m[1]
+        dim_5m = self.network_config.shape_5m[0] * self.network_config.shape_5m[1]
+        
+        x_1m = x[:, :dim_1m].reshape((-1, *self.network_config.shape_1m))
+        x_5m = x[:, dim_1m:dim_1m+dim_5m].reshape((-1, *self.network_config.shape_5m))
+        x_rest = x[:, dim_1m+dim_5m:]
+
+        # Project to embed_dim before transformer blocks
+        x_1m = nn.Dense(self.network_config.transformer_layers_1m.embed_dim)(x_1m)
+        x_5m = nn.Dense(self.network_config.transformer_layers_5m.embed_dim)(x_5m)
+        
+        # Process 1m data
+        for _ in range(self.network_config.transformer_layers_1m.num_layers):
+            x_1m = TransformerEncoderBlock(
+                config=self.network_config.transformer_layers_1m,
+                activation=activation_fn
+            )(x_1m, deterministic=deterministic)
+        x_1m = x_1m.reshape((x_1m.shape[0], -1)) # Flatten
+
+        # Process 5m data
+        for _ in range(self.network_config.transformer_layers_5m.num_layers):
+            x_5m = TransformerEncoderBlock(
+                config=self.network_config.transformer_layers_5m,
+                activation=activation_fn
+            )(x_5m, deterministic=deterministic)
+        x_5m = x_5m.reshape((x_5m.shape[0], -1)) # Flatten
+
+        # Process rest of data
+        x_rest = ResMLP(
+            hidden_dims=self.network_config.resMLP_layers_rest,
+            activation=activation_fn
+        )(x_rest)
+
+        # Concatenate and final MLP
+        concatenated = jnp.concatenate([x_1m, x_5m, x_rest], axis=-1)
+        
+        final_features = ResMLP(
+            hidden_dims=self.network_config.resMLP_layers_final,
+            activation=activation_fn
+        )(concatenated)
+        
+        return final_features
+
+class TradingActor(nn.Module):
+    network_config: NetworkConfig
     action_dim: int
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray):
-        # x is raw observations (Batch, C, H, W)
-        encoded_x = AtariEncoder(name="encoder")(x)
-        
-        x = nn.Dense(features=512, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(encoded_x)
-        x = nn.gelu(x)
-        logits = nn.Dense(features=self.action_dim, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
+    def __call__(self, x: jnp.ndarray, deterministic: bool):
+        features = TradingNetwork(network_config=self.network_config)(x, deterministic=deterministic)
+        logits = nn.Dense(self.action_dim)(features)
         return logits
 
-# Critic Network for Atari (CNN based) - SoftQNetwork
-class CriticCNN(nn.Module):
-    action_dim: int # Though output is num_actions, good to have for consistency
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray):
-        # x is raw observations (Batch, C, H, W)
-        encoded_x = AtariEncoder(name="encoder")(x)
-        
-        x = nn.Dense(features=512, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(encoded_x)
-        x = nn.gelu(x)
-        q_values = nn.Dense(features=self.action_dim, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        return q_values
-
-# --- For CartPole (MLP based) ---
-class ActorMLP(nn.Module):
+class TradingCritic(nn.Module):
+    network_config: NetworkConfig
     action_dim: int
-
+    
     @nn.compact
-    def __call__(self, x: jnp.ndarray):
-        x = nn.Dense(features=64, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.gelu(x)
-        x = nn.Dense(features=64, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.gelu(x)
-        logits = nn.Dense(features=self.action_dim, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        return logits
-
-class CriticMLP(nn.Module):
-    action_dim: int
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray):
-        x = nn.Dense(features=64, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.gelu(x)
-        x = nn.Dense(features=64, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
-        x = nn.gelu(x)
-        q_values = nn.Dense(features=self.action_dim, kernel_init=nn.initializers.kaiming_normal(), bias_init=nn.initializers.constant(0.0))(x)
+    def __call__(self, x: jnp.ndarray, deterministic: bool):
+        features = TradingNetwork(network_config=self.network_config)(x, deterministic=deterministic)
+        q_values = nn.Dense(self.action_dim)(features)
         return q_values

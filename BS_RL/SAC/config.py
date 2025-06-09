@@ -1,11 +1,11 @@
 import os
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Optional, Union, Tuple, List
+from TradingEnv import EnvConfig as TradingEnvConfig
 
 @dataclass
 class EnvConfig:
-    env_id: str = "BeamRiderNoFrameskip-v4"
-    """the id of the environment"""
+    trading_env_config: TradingEnvConfig = field(default_factory=TradingEnvConfig)
     env_num: int = 1 # sac_atari.py uses 1 env
     """the number of parallel game environments"""
     seed: int = 1
@@ -86,7 +86,7 @@ class EvalConfig:
     """Number of episodes to run for evaluation during checkpointing."""
     greedy_actions: bool = True
     """Whether to use greedy actions during evaluation."""
-    capture_video: bool = True
+    capture_video: bool = False
     """Whether to capture video during evaluation (for the first eval environment)."""
     env_num: int = 16
     """the number of parallel game environments for evaluation"""
@@ -95,12 +95,31 @@ class EvalConfig:
     seed: int = 996
     """the seed for the evaluation environment"""
 @dataclass
+class TransformerConfig:
+    """Configuration for a Transformer encoder block."""
+    num_layers: int
+    embed_dim: int
+    num_heads: int
+    ffn_dim_multiplier: int = 4
+    dropout_rate: float = 0.1
+@dataclass
+class NetworkConfig:
+    shape_1m: Tuple[int, int]
+    shape_5m: Tuple[int, int]
+    transformer_layers_1m:TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=2, embed_dim=512, num_heads=8))
+    transformer_layers_5m:TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=2, embed_dim=256, num_heads=4))
+    resMLP_layers_rest:List[int] = field(default_factory=lambda: [64, 32, ])
+    resMLP_layers_final:List[int] = field(default_factory=lambda: [512, 256, 128])
+    activation:str = "gelu"
+    
+@dataclass
 class Args:
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
     algo: AlgoConfig = field(default_factory=AlgoConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    network: NetworkConfig = field(default_factory=NetworkConfig)
     def __post_init__(self):
         # Resolve ckpt_save_frequency
         if self.train.ckpt_save_frequency is not None:
