@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from .agent import SACAgent
-from .common import eval_env_maker
+from .common import eval_env_maker, MetricLogger, StatsAggregator
 from .config import EnvConfig, EvalConfig
 from TradingEnv import DataLoader
 
@@ -14,12 +14,14 @@ class Evaluator:
                  env_config: EnvConfig,
                  eval_config: EvalConfig,
                  data_loader: DataLoader,
-                 run_name_suffix: str):
+                 run_name_suffix: str,
+                 logger: MetricLogger = None):
         self.agent = agent
         self.env_config = env_config
         self.eval_config = eval_config
         self.data_loader = data_loader
         self.run_name_suffix = run_name_suffix
+        self.logger = logger
         self.eval_envs = None
 
         if self.eval_config.cache_env:
@@ -38,7 +40,7 @@ class Evaluator:
                     config=self.env_config.trading_env_config,
                     data_loader=self.data_loader,
                     # Capture video for the first eval env if configured
-                    capture_video=self.eval_config.capture_video and i == 0,
+                    capture_media=self.eval_config.capture_media and i == 0,
                     run_name=f"{self.run_name_suffix}_eval", # Simplified run name
                     capture_episode_trigger=lambda e: e == 0
                 )
@@ -48,21 +50,20 @@ class Evaluator:
 
     def evaluate(self, actor_params_eval: flax.core.FrozenDict, current_train_step: int):
         num_episodes = self.eval_config.eval_episodes
-        print(f"Starting evaluation for {num_episodes} episodes with seed {self.eval_config.seed} at step {current_train_step}...")
+        print(f"\nStarting evaluation for {num_episodes} episodes with seed {self.eval_config.seed} at step {current_train_step}...")
 
         eval_envs = self.eval_envs
         envs_were_created_here = False
         if eval_envs is None:
             eval_envs = self._make_envs()
             envs_were_created_here = True
-
-        episode_returns_unclipped = []
-        episode_lengths_unclipped = []
+        
+        stats_aggregator = StatsAggregator(num_episodes) #防止默认大小64<num_episodes时下面的代码陷入死循环
         key_eval_actions = jax.random.PRNGKey(self.eval_config.seed)
 
         obs, _ = eval_envs.reset(seed=self.eval_config.seed + current_train_step)
 
-        while len(episode_returns_unclipped) < num_episodes:
+        while len(stats_aggregator.buffer) < num_episodes:
             key_eval_actions, key_step = jax.random.split(key_eval_actions)
             
             actions_jax = self.agent.select_action(
@@ -77,31 +78,31 @@ class Evaluator:
             obs = next_obs
 
             if "final_info" in infos:
-                for info in infos["final_info"]:
+                for i, info in enumerate(infos["final_info"]):
                     if info and "episode" in info:
-                        unclipped_return = info["episode"]["r"]
-                        unclipped_length = info["episode"]["l"]
-                        episode_returns_unclipped.append(unclipped_return)
-                        episode_lengths_unclipped.append(unclipped_length)
-                        print(f"Eval Episode {len(episode_returns_unclipped)}/{num_episodes}: Return={unclipped_return:.2f}, Length={unclipped_length}")
-                        if len(episode_returns_unclipped) >= num_episodes:
+                        if i == 0 and self.logger:
+                            self.logger.log_env0_episode(info["episode"], current_train_step, prefix="eval")
+                        
+                        stats_aggregator.add(info["episode"])
+                        episode_return = info["episode"]["r"]
+                        episode_length = info["episode"]["l"]
+                        print(f"Eval Episode {len(stats_aggregator.buffer)}/{num_episodes}: Return={episode_return:.2f}, Length={episode_length}")
+                        if len(stats_aggregator.buffer) >= num_episodes:
                             break
         
         if envs_were_created_here:
             eval_envs.close()
 
-        if episode_returns_unclipped:
-            mean_return = np.mean(episode_returns_unclipped)
-            std_return = np.std(episode_returns_unclipped)
-        else:
-            mean_return, std_return = 0.0, 0.0
+        eval_metrics = stats_aggregator.get_aggregated_stats()
 
+        mean_return = eval_metrics.get("episodic_return_mean", 0.0)
+        std_return = eval_metrics.get("episodic_return_std", 0.0)
         print(f"Evaluation finished: Mean Return={mean_return:.2f} +/- {std_return:.2f}")
-        return {
-            "episodic_return_mean": mean_return,
-            "episodic_return_std": std_return,
-            "episodic_length_mean": np.mean(episode_lengths_unclipped) if episode_lengths_unclipped else 0.0,
-        }
+
+        if self.logger:
+            self.logger.log_stats(eval_metrics, current_train_step, "eval_buffered")
+            
+        return eval_metrics
 
     def close(self):
         if self.eval_envs:

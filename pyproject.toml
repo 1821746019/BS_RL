@@ -41,6 +41,7 @@ dependencies = [
     "numpy<2",
     "pygame",
     "gymnasium[atari,accept-rom-license,other]",
+    "joblib",
 ]
 # 可选依赖 - 只需要CPU版本
 [project.optional-dependencies]

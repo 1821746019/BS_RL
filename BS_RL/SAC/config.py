@@ -86,7 +86,7 @@ class EvalConfig:
     """Number of episodes to run for evaluation during checkpointing."""
     greedy_actions: bool = True
     """Whether to use greedy actions during evaluation."""
-    capture_video: bool = False
+    capture_media: bool = False
     """Whether to capture video during evaluation (for the first eval environment)."""
     env_num: int = 16
     """the number of parallel game environments for evaluation"""
@@ -117,10 +117,10 @@ class NetworkConfig:
     encoder_type: str = "convnext" # "transformer" or "convnext"
     transformer_layers_1m:TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=2, embed_dim=512, num_heads=8))
     transformer_layers_5m:TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=2, embed_dim=256, num_heads=4))
-    convnext_layers_1m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=2, embed_dim=512))
-    convnext_layers_5m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=2, embed_dim=256))
-    resMLP_layers_rest:List[int] = field(default_factory=lambda: [64, 32, ])
-    resMLP_layers_final:List[int] = field(default_factory=lambda: [512, 256, 128])
+    convnext_layers_1m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=2, embed_dim=192))
+    convnext_layers_5m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=2, embed_dim=48))
+    resMLP_layers_rest:List[int] = field(default_factory=lambda: [32, 16])
+    resMLP_layers_final:List[int] = field(default_factory=lambda: [128, 64])
     activation:str = "gelu"
     
 @dataclass

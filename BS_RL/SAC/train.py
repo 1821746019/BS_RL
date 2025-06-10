@@ -19,9 +19,10 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from flax.training import checkpoints
 import flax.jax_utils
 from tqdm.auto import tqdm
+import joblib
 
 from .config import Args
-from .common import train_env_maker
+from .common import train_env_maker, MetricLogger, StatsAggregator
 from .networks import TradingActor, TradingCritic
 from .agent import SACAgent
 from .eval import Evaluator
@@ -56,6 +57,7 @@ class Trainer:
         self.p_update_target_networks = None
         self.data_loader = None
         self.evaluator = None
+        self.logger = None
 
     def setup(self):
         self._setup_paths_and_run_name()
@@ -121,6 +123,7 @@ class Trainer:
 
     def _setup_wandb(self):
         if not self.args.wandb.track:
+            self.logger = MetricLogger(wandb_track=False)
             return
         wandb.init(
             project=self.args.wandb.project_name,
@@ -133,6 +136,7 @@ class Trainer:
             resume="allow" if self.args.train.resume else None,
             id=wandb.util.generate_id() if not self.restored_ckpt_path else None
         )
+        self.logger = MetricLogger(wandb_track=True)
         flat_args_dict = {}
         for main_key, main_value in asdict(self.args).items():
             if isinstance(main_value, dict):
@@ -299,12 +303,11 @@ class Trainer:
     def _setup_replay_buffer(self):
         loaded_rb = False
         if self.restored_ckpt_path:
-            rb_path = os.path.join(self.restored_ckpt_path, "replay_buffer.pkl")
+            rb_path = os.path.join(self.restored_ckpt_path, "replay_buffer.joblib.gz")
             if os.path.exists(rb_path):
                 try:
                     print(f"Loading replay buffer from {rb_path}...")
-                    with open(rb_path, 'rb') as f:
-                        self.rb:ReplayBuffer = pickle.load(f)
+                    self.rb:ReplayBuffer = joblib.load(rb_path)
                     print(f"Replay buffer loaded. Current size: {self.rb.size()}, full: {self.rb.full}")
                     assert self.rb.buffer_size == max(self.args.algo.buffer_size//self.args.env.env_num, 1) # 和SB3的ReplayBuffer的内部逻辑保持一致
                     assert self.rb.n_envs == self.args.env.env_num
@@ -333,15 +336,16 @@ class Trainer:
             env_config=self.args.env,
             eval_config=self.args.eval,
             data_loader=self.data_loader_eval,
-            run_name_suffix=self.run_name_suffix
+            run_name_suffix=self.run_name_suffix,
+            logger=self.logger,
         )
 
     def train(self):
         start_time = time.time()
         obs, _ = self.envs.reset(seed=self.args.env.seed + self.initial_global_step)
         
-        ep_stats_buffer_size = 64
-        episode_stats_buffer = collections.deque(maxlen=ep_stats_buffer_size)
+        
+        train_stats_aggregator = StatsAggregator()
         pbar_postfix = collections.OrderedDict()
 
         total_iterations = self.args.algo.total_timesteps // self.args.env.env_num
@@ -353,17 +357,35 @@ class Trainer:
                 
                 obs, infos = self._environment_step(obs, current_step)
                 
-                self._log_episode_stats(infos, current_step, episode_stats_buffer, pbar_postfix)
+                if "final_info" in infos and self.logger:
+                    for i, info_item in enumerate(infos["final_info"]):
+                        if info_item and "episode" in info_item:
+                            train_stats_aggregator.add(info_item)
+                            if i == 0:
+                                self.logger.log_env0_episode(info_item['episode'], current_step, prefix="train")
 
                 if current_step > self.args.algo.learning_starts:
                     if current_step % self.args.algo.update_frequency == 0:
-                        metrics = self._agent_update(current_step)
-                        if metrics:
+                        metrics_from_update = self._agent_update(current_step)
+                        if metrics_from_update:
                             sps = int((current_step - self.initial_global_step) / (time.time() - start_time + 1e-9))
                             pbar_postfix["SPS"] = sps
-                            metrics["charts/SPS"] = sps
+                            
+                            log_data = {}
+                            
+                            metrics_from_update["SPS"] = sps
+                            for k, v in metrics_from_update.items():
+                                log_data[f"metrics/{k}"] = v
+                            
+                            buffered_stats = train_stats_aggregator.get_aggregated_stats()
+                            if buffered_stats:
+                                for k, v in buffered_stats.items():
+                                    log_data[f"train_buffered/{k}"] = v
+                                if 'episodic_return_mean' in buffered_stats:
+                                    pbar_postfix["ret_mean"] = f"{buffered_stats['episodic_return_mean']:.2f}"
+                            
                             if self.args.wandb.track:
-                                wandb.log(metrics, step=current_step)
+                                wandb.log(log_data, step=current_step)
 
                     if current_step % self.args.algo.target_network_frequency == 0:
                         self._update_target_networks()
@@ -393,46 +415,11 @@ class Trainer:
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc and "final_observation" in infos and infos["final_observation"][idx] is not None:
+                warnings.warn(f"Truncation detected at step {current_step}, idx: {idx}. According to the current implementation, this should not happen.")
                 real_next_obs[idx] = infos["final_observation"][idx]
         
         self.rb.add(obs, real_next_obs, actions, rewards.astype(np.float32), terminations.astype(np.float32), infos)
         return next_obs, infos
-
-    def _log_episode_stats(self, infos, current_step, episode_stats_buffer: collections.deque, pbar_postfix: dict):
-        if "final_info" not in infos:
-            return
-            
-        for i, info_item in enumerate(infos["final_info"]):
-            if info_item and "episode" in info_item:
-                episode_stats = info_item['episode']
-                episode_stats_buffer.append(episode_stats)
-                if self.args.wandb.track and i == 0:
-                    log_dict = {f"charts/episodic_{k}_env0": v for k, v in episode_stats.items()}
-                    wandb.log(log_dict, step=current_step)
-
-        if episode_stats_buffer:
-            aggregated_stats = collections.defaultdict(list)
-            for stats in episode_stats_buffer:
-                for key, value in stats.items():
-                    try:
-                        aggregated_stats[key].append(float(value))
-                    except (ValueError, TypeError):
-                        pass
-
-            if 'r' in aggregated_stats:
-                mean_ret = np.mean(aggregated_stats['r'])
-                pbar_postfix["ret_mean"] = f"{mean_ret:.2f}"
-
-            if self.args.wandb.track:
-                log_data = {}
-                for key, values in aggregated_stats.items():
-                    if not values:
-                        continue
-                    log_data[f"charts/episodic_{key}_mean_buffered"] = np.mean(values)
-                    if len(values) > 1:
-                        log_data[f"charts/episodic_{key}_std_buffered"] = np.std(values)
-                if log_data:
-                    wandb.log(log_data, step=current_step)
 
     def _agent_update(self, current_step):
         self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
@@ -455,7 +442,7 @@ class Trainer:
         
         if current_step % (self.args.algo.update_frequency * 100) == 0:
             metrics = flax.jax_utils.unreplicate(metrics_sharded)
-            return {f"train/{k}": v for k, v in metrics.items()}
+            return {f"{k}": v for k, v in metrics.items()}
         return None
 
     def _update_target_networks(self):
@@ -463,8 +450,12 @@ class Trainer:
 
     def _run_evaluation(self, current_step, next_step):
         if not self.evaluator: return
-        eval_freq = self.args.eval.eval_frequency_abs_steps
-        if not eval_freq or next_step < eval_freq or (current_step // eval_freq) < (next_step // eval_freq):
+        
+        eval_freq = getattr(self.args.eval, 'eval_frequency_abs_steps', 0)
+        if not eval_freq and hasattr(self.args.eval, 'eval_frequency') and self.args.eval.eval_frequency > 0:
+            eval_freq = int(self.args.algo.total_timesteps * self.args.eval.eval_frequency)
+
+        if not eval_freq or next_step < eval_freq or (current_step // eval_freq) >= (next_step // eval_freq):
             return
         
         eval_trigger_step = (next_step // eval_freq) * eval_freq
@@ -476,8 +467,6 @@ class Trainer:
         )
         
         tqdm.write(f"Evaluation at step {current_step}: {eval_metrics}")
-        if self.args.wandb.track:
-            wandb.log({f"eval/{k}": v for k, v in eval_metrics.items()}, step=current_step)
 
     def _save_checkpoint(self, current_step, next_step, is_final=False):
         step_for_ckpt: int
@@ -514,8 +503,8 @@ class Trainer:
             
             if saved_path:
                 print(f"Checkpoint saved to {saved_path}")
-                with open(os.path.join(saved_path, "replay_buffer.pkl"), 'wb') as f:
-                    pickle.dump(self.rb, f)
+                rb_path = os.path.join(saved_path, "replay_buffer.joblib.gz")
+                joblib.dump(self.rb, rb_path, compress='gzip')
 
                 prng_states = {
                     'random_state': random.getstate(),
