@@ -16,7 +16,7 @@ class StatsAggregator:
         remapped = {}
         if 'r' in stats: remapped['return'] = stats['r']
         if 'l' in stats: remapped['length'] = stats['l']
-        if 'episode_ROI' in stats: remapped['roi'] = stats['episode_ROI']
+        if 'episode_ROI' in stats: remapped['ROI'] = stats['episode_ROI']
         if 'sharpe_ratio' in stats: remapped['sharpe'] = stats['sharpe_ratio']
         if 'sortino_ratio' in stats: remapped['sortino'] = stats['sortino_ratio']
         if 'episode_MDD' in stats: remapped['mdd'] = stats['episode_MDD']
