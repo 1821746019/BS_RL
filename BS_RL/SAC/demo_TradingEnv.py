@@ -10,7 +10,7 @@ if __name__ == "__main__":
     env_num = 96
     eval_env_num = 16
     trading_env_config = TradingEnvConfig(data_path="/root/project/processed_data/")
-    total_timesteps = int(1e6)
+    total_timesteps = int(200e6)
     args = Args(
         train=TrainConfig(
             exp_name=env_id,

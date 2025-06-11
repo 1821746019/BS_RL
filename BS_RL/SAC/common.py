@@ -21,6 +21,7 @@ class StatsAggregator:
         if 'sortino_ratio' in stats: remapped['sortino'] = stats['sortino_ratio']
         if 'episode_MDD' in stats: remapped['mdd'] = stats['episode_MDD']
         if 'episode_MDD_24h' in stats: remapped['mdd_24h'] = stats['episode_MDD_24h']
+        if 'cumulative_unleveraged_roi' in stats: remapped['unleveraged_roi'] = stats['cumulative_unleveraged_roi']
         return remapped
 
     def add(self, episode_info: dict):
@@ -84,8 +85,8 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
         account = Account(config)
         env = TradingEnv(config, data_loader, account, seed=seed)
         env = wrappers.DetailedRewardWrapper(env)
-        env = wrappers.NormalizationWrapper(env)
         env = wrappers.EpisodeStats(env)
+        env = wrappers.NormalizationWrapper(env)
         env = FlattenObservation(env)
         return env
 
@@ -97,8 +98,8 @@ def eval_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader,
         account = Account(config)
         env = TradingEnv(config, data_loader, account, seed=seed)
         env = wrappers.DetailedRewardWrapper(env)
-        env = wrappers.NormalizationWrapper(env)
         env = wrappers.EpisodeStats(env)
+        env = wrappers.NormalizationWrapper(env)
         if capture_media:
             env = wrappers.EpisodeRender(env)
         env = FlattenObservation(env)

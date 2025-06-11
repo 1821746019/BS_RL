@@ -503,6 +503,17 @@ class Trainer:
             
             if saved_path:
                 print(f"Checkpoint saved to {saved_path}")
+
+                # Log the model artifact to wandb before adding other files to the checkpoint directory.
+                # This ensures that only the model is part of the artifact.
+                if self.args.wandb.track and wandb.run:
+                    artifact = wandb.Artifact(f"model_ckpt_{self.wandb_run_name}", type="model")
+                    artifact.add_dir(str(saved_path))
+                    aliases = [f"step_{step_for_ckpt}"]
+                    if is_final:
+                        aliases.append("final")
+                    wandb.log_artifact(artifact, aliases=aliases)
+                
                 rb_path = os.path.join(saved_path, "replay_buffer.joblib.gz")
                 joblib.dump(self.rb, rb_path, compress='gzip')
 
@@ -516,13 +527,6 @@ class Trainer:
                 with open(os.path.join(saved_path, "prng_states.pkl"), 'wb') as f:
                     pickle.dump(prng_states, f)
 
-                if self.args.wandb.track and wandb.run:
-                    artifact = wandb.Artifact(f"model_ckpt_{self.wandb_run_name}", type="model")
-                    artifact.add_dir(str(saved_path))
-                    aliases = [f"step_{step_for_ckpt}"]
-                    if is_final:
-                        aliases.append("final")
-                    wandb.log_artifact(artifact, aliases=aliases)
             else:
                 print(f"Warning: Checkpoint for step {step_for_ckpt} could not be found after saving.")
         except Exception as e:
