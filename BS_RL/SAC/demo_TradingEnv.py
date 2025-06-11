@@ -8,7 +8,7 @@ if __name__ == "__main__":
     batch_size = 5120
     env_id = "TradingEnv"
     env_num = 96
-    eval_env_num = 16
+    eval_env_num = 48
     trading_env_config = TradingEnvConfig(data_path="/root/project/processed_data/")
     total_timesteps = int(200e6)
     args = Args(
@@ -21,7 +21,7 @@ if __name__ == "__main__":
         ),
         eval=EvalConfig(
             eval_frequency=0.01,
-            eval_episodes=16,
+            eval_episodes=48,
             greedy_actions=True,
             env_num=eval_env_num,
         ),
@@ -38,7 +38,7 @@ if __name__ == "__main__":
         algo=AlgoConfig(
             total_timesteps=total_timesteps, # 200M步
             buffer_size=int(1e5),
-            learning_starts=int(1e4), # 10k步后开始学习
+            learning_starts=int(2e4), # 20k步后开始学习
             batch_size=batch_size,
             update_frequency=4, # Update more frequently for simpler envs
             target_network_frequency=int(8e3),

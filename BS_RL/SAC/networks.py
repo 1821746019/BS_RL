@@ -2,7 +2,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from typing import List, Callable
-from .config import NetworkConfig, TransformerConfig, ConvNextConfig
+from .config import NetworkConfig, TransformerConfig, ConvNextConfig, Cnn1DConfig
 
 def get_activation(name: str) -> Callable:
     if name == "relu":
@@ -57,6 +57,41 @@ class ConvNeXtBlock(nn.Module):
         x = residual + x
         return x
 
+class Cnn1DEncoderBlock(nn.Module):
+    config: Cnn1DConfig
+    activation: Callable
+
+    @nn.compact
+    def __call__(self, x, deterministic: bool):
+        residual = x
+        y = nn.LayerNorm()(x)
+        y = nn.Conv(
+            features=self.config.embed_dim,
+            kernel_size=(self.config.kernel_size,),
+            padding='SAME'
+        )(y)
+        y = self.activation(y)
+        y = nn.Dropout(rate=self.config.dropout_rate)(y, deterministic=deterministic)
+
+        return residual + y
+
+class ResMLPBlock(nn.Module):
+    output_dim: int
+    activation: Callable
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray):
+        residual = x
+        
+        y = nn.Dense(self.output_dim)(x)
+        y = self.activation(y)
+        y = nn.LayerNorm()(y)
+
+        if residual.shape[-1] != self.output_dim:
+            residual = nn.Dense(self.output_dim, name="projection")(residual)
+        
+        return residual + y
+
 class ResMLP(nn.Module):
     hidden_dims: List[int]
     activation: Callable
@@ -64,10 +99,7 @@ class ResMLP(nn.Module):
     @nn.compact
     def __call__(self, x):
         for i, dim in enumerate(self.hidden_dims):
-            y = nn.Dense(dim)(x)
-            y = self.activation(y)
-            y = nn.LayerNorm()(y)
-            x = x + y if x.shape[-1] == y.shape[-1] else y
+            x = ResMLPBlock(output_dim=dim, activation=self.activation, name=f"res_mlp_block_{i}")(x)
         return x
 
 class SelfAttention(nn.Module):
@@ -124,6 +156,9 @@ class TradingNetwork(nn.Module):
         elif self.network_config.encoder_type == 'convnext':
             x_1m_config = self.network_config.convnext_layers_1m
             x_5m_config = self.network_config.convnext_layers_5m
+        elif self.network_config.encoder_type == 'cnn1d':
+            x_1m_config = self.network_config.cnn1d_layers_1m
+            x_5m_config = self.network_config.cnn1d_layers_5m
         else:
             raise ValueError(f"Unknown encoder type: {self.network_config.encoder_type}")
 
@@ -157,6 +192,21 @@ class TradingNetwork(nn.Module):
             # Process 5m data
             for _ in range(x_5m_config.num_layers):
                 x_5m = ConvNeXtBlock(
+                    config=x_5m_config,
+                    activation=activation_fn
+                )(x_5m, deterministic=deterministic)
+
+        elif self.network_config.encoder_type == 'cnn1d':
+             # Process 1m data
+            for _ in range(x_1m_config.num_layers):
+                x_1m = Cnn1DEncoderBlock(
+                    config=x_1m_config,
+                    activation=activation_fn
+                )(x_1m, deterministic=deterministic)
+
+            # Process 5m data
+            for _ in range(x_5m_config.num_layers):
+                x_5m = Cnn1DEncoderBlock(
                     config=x_5m_config,
                     activation=activation_fn
                 )(x_5m, deterministic=deterministic)
