@@ -86,8 +86,8 @@ class EvalConfig:
     """Number of episodes to run for evaluation during checkpointing."""
     greedy_actions: bool = True
     """Whether to use greedy actions during evaluation."""
-    capture_media: bool = False
-    """Whether to capture video during evaluation (for the first eval environment)."""
+    capture_media: bool = True
+    """Whether to capture video/image during evaluation (for the first eval environment)."""
     env_num: int = 16
     """the number of parallel game environments for evaluation"""
     async_vector_env: bool = False
@@ -122,16 +122,17 @@ class NetworkConfig:
     shape_1m: Tuple[int, int]
     shape_5m: Tuple[int, int]
     encoder_type: str = "convnext"  # "transformer", "convnext" or "cnn1d"
-    transformer_layers_1m: TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=2, embed_dim=128, num_heads=8))
-    transformer_layers_5m: TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=2, embed_dim=48, num_heads=4))
-    convnext_layers_1m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=2, embed_dim=192))
-    convnext_layers_5m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=2, embed_dim=48))
-    cnn1d_layers_1m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=2, embed_dim=128))
-    cnn1d_layers_5m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=2, embed_dim=48))
+    transformer_layers_1m: TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=3, embed_dim=128, num_heads=8))
+    transformer_layers_5m: TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=3, embed_dim=48, num_heads=4))
+    convnext_layers_1m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=3, embed_dim=128))
+    convnext_layers_5m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=3, embed_dim=48)) # 48=128*0.375
+    cnn1d_layers_1m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=3, embed_dim=128))
+    cnn1d_layers_5m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=3, embed_dim=48))
     """"""
-    resMLP_layers_rest: List[int] = field(default_factory=lambda: [32, 32]) # restet有39维
-    resMLP_layers_final: List[int] = field(default_factory=lambda: [512, 512, 512])
-    activation: str = "gelu"
+    MLP_layers_rest: List[int] = field(default_factory=lambda: [33, 32]) # restet有39维
+    MLP_layers_final: List[int] = field(default_factory=lambda: [514, 513, 512])
+    MLP_type: str = "ResMLP" # "MLP", "ResMLP", or "MLP_with_LayerNorm"
+    activation:str = "gelu"
     
 @dataclass
 class Args:

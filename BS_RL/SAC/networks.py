@@ -91,6 +91,38 @@ class ResMLPBlock(nn.Module):
             residual = nn.Dense(self.output_dim, name="projection")(residual)
         
         return residual + y
+class MLP(nn.Module):
+    hidden_dims: List[int]
+    activation: Callable
+
+    @nn.compact
+    def __call__(self, x):
+        for dim in self.hidden_dims:
+            x = nn.Dense(dim)(x)
+            x = self.activation(x)
+        return x
+
+class MLPWithLayerNorm(nn.Module):
+    hidden_dims: List[int]
+    activation: Callable
+
+    @nn.compact
+    def __call__(self, x):
+        for dim in self.hidden_dims:
+            x = nn.Dense(dim)(x)
+            x = self.activation(x)
+            x = nn.LayerNorm()(x)
+        return x
+
+# class ResMLP(nn.Module):
+#     hidden_dims: List[int]
+#     activation: Callable
+
+#     @nn.compact
+#     def __call__(self, x):
+#         for i, dim in enumerate(self.hidden_dims):
+#             x = ResMLPBlock(output_dim=dim, activation=self.activation, name=f"res_mlp_block_{i}")(x)
+#         return x
 
 class ResMLP(nn.Module):
     hidden_dims: List[int]
@@ -99,9 +131,12 @@ class ResMLP(nn.Module):
     @nn.compact
     def __call__(self, x):
         for i, dim in enumerate(self.hidden_dims):
-            x = ResMLPBlock(output_dim=dim, activation=self.activation, name=f"res_mlp_block_{i}")(x)
+            y = nn.Dense(dim)(x)
+            y = self.activation(y)
+            y = nn.LayerNorm()(y)
+            x = x + y if x.shape[-1] == y.shape[-1] else y
         return x
-
+    
 class SelfAttention(nn.Module):
     config: TransformerConfig
     
@@ -214,17 +249,26 @@ class TradingNetwork(nn.Module):
         x_1m = x_1m.reshape((x_1m.shape[0], -1)) # Flatten
         x_5m = x_5m.reshape((x_5m.shape[0], -1)) # Flatten
 
+        if self.network_config.MLP_type == "ResMLP":
+            MLP_module = ResMLP
+        elif self.network_config.MLP_type == "MLP_with_LayerNorm":
+            MLP_module = MLPWithLayerNorm
+        elif self.network_config.MLP_type == "MLP":
+            MLP_module = MLP
+        else:
+            raise ValueError(f"Unknown MLP type: {self.network_config.MLP_type}")
+
         # Process rest of data
-        x_rest = ResMLP(
-            hidden_dims=self.network_config.resMLP_layers_rest,
+        x_rest = MLP_module(
+            hidden_dims=self.network_config.MLP_layers_rest,
             activation=activation_fn
         )(x_rest)
 
         # Concatenate and final MLP
         concatenated = jnp.concatenate([x_1m, x_5m, x_rest], axis=-1)
         
-        final_features = ResMLP(
-            hidden_dims=self.network_config.resMLP_layers_final,
+        final_features = MLP_module(
+            hidden_dims=self.network_config.MLP_layers_final,
             activation=activation_fn
         )(concatenated)
         

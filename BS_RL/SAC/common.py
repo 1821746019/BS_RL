@@ -14,14 +14,18 @@ class StatsAggregator:
     @staticmethod
     def _remap_and_filter(stats: dict) -> dict:
         remapped = {}
-        if 'r' in stats: remapped['return'] = stats['r']
-        if 'l' in stats: remapped['length'] = stats['l']
-        if 'episode_ROI' in stats: remapped['ROI'] = stats['episode_ROI']
-        if 'sharpe_ratio' in stats: remapped['sharpe'] = stats['sharpe_ratio']
-        if 'sortino_ratio' in stats: remapped['sortino'] = stats['sortino_ratio']
-        if 'episode_MDD' in stats: remapped['mdd'] = stats['episode_MDD']
-        if 'episode_MDD_24h' in stats: remapped['mdd_24h'] = stats['episode_MDD_24h']
-        if 'cumulative_unleveraged_roi' in stats: remapped['unleveraged_roi'] = stats['cumulative_unleveraged_roi']
+        keys_to_rename = {
+            'r': 'return',
+            'l': 'length',
+        }
+        keys_to_exclude = set(['t'])
+        for metric,value in stats.items():
+            if metric in keys_to_exclude:
+                continue
+            if metric in keys_to_rename:
+                remapped[keys_to_rename[metric]] = value
+            else:
+                remapped[metric] = value
         return remapped
 
     def add(self, episode_info: dict):
@@ -48,11 +52,11 @@ class StatsAggregator:
         results = {}
         for key, values in aggregated.items():
             if not values: continue
-            results[f"episodic_{key}_mean"] = np.mean(values)
+            results[f"{key}_mean"] = np.mean(values)
             if len(values) > 1:
-                results[f"episodic_{key}_std"] = np.std(values)
-            results[f"episodic_{key}_max"] = np.max(values)
-            results[f"episodic_{key}_min"] = np.min(values)
+                results[f"{key}_std"] = np.std(values)
+            results[f"{key}_max"] = np.max(values)
+            results[f"{key}_min"] = np.min(values)
         return results
 
     def clear(self):
@@ -76,7 +80,7 @@ class MetricLogger:
         
         remapped = StatsAggregator._remap_and_filter(episode_info)
         if remapped:
-            log_dict = {f"{prefix}/episodic_{k}_env0": v for k, v in remapped.items()}
+            log_dict = {f"{prefix}/{k}_env0": v for k, v in remapped.items()}
             wandb.log(log_dict, step=step)
 
 def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader, capture_video: bool=False, run_name: str=None,capture_episode_trigger: Callable[[int], bool]=None):
@@ -92,7 +96,7 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
 
     return thunk
 
-def eval_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader, capture_media: bool=False, run_name: str=None,capture_episode_trigger: Callable[[int], bool]=None):
+def eval_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader, capture_media: bool=True, run_name: str=None,capture_episode_trigger: Callable[[int], bool]=None):
    
     def thunk():
         account = Account(config)

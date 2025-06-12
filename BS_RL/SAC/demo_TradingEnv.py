@@ -16,7 +16,7 @@ if __name__ == "__main__":
             exp_name=env_id,
             save_model=True,
             ckpt_save_frequency=0.01,
-            resume=True,
+            resume=False,
             save_dir=f"runs/{env_id}_convnext_light",
         ),
         eval=EvalConfig(

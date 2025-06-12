@@ -39,8 +39,8 @@ class Evaluator:
                     seed=self.eval_config.seed + i,
                     config=self.env_config.trading_env_config,
                     data_loader=self.data_loader,
-                    # Capture video for the first eval env if configured
-                    capture_media=self.eval_config.capture_media and i == 0,
+                    # Capture media for the first eval env if configured
+                    capture_media=self.eval_config.capture_media,# 解除注释则只对env0绘制图片and i == 0,
                     run_name=f"{self.run_name_suffix}_eval", # Simplified run name
                     capture_episode_trigger=lambda e: e == 0
                 )
@@ -95,8 +95,8 @@ class Evaluator:
 
         eval_metrics = stats_aggregator.get_aggregated_stats()
 
-        mean_return = eval_metrics.get("episodic_return_mean", 0.0)
-        std_return = eval_metrics.get("episodic_return_std", 0.0)
+        mean_return = eval_metrics.get("episode_return_mean", 0.0)
+        std_return = eval_metrics.get("episode_return_std", 0.0)
         print(f"Evaluation finished: Mean Return={mean_return:.2f} +/- {std_return:.2f}")
 
         if self.logger:

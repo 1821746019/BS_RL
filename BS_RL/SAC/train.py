@@ -1,7 +1,8 @@
+import os
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache" # 设置缓存目录才会启用编译缓存
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
 warnings.filterwarnings("ignore", category=UserWarning, module="absl")
-import os
 import copy
 import random
 import time
@@ -381,8 +382,8 @@ class Trainer:
                             if buffered_stats:
                                 for k, v in buffered_stats.items():
                                     log_data[f"train_buffered/{k}"] = v
-                                if 'episodic_return_mean' in buffered_stats:
-                                    pbar_postfix["ret_mean"] = f"{buffered_stats['episodic_return_mean']:.2f}"
+                                if 'return_mean' in buffered_stats:
+                                    pbar_postfix["return_mean"] = f"{buffered_stats['return_mean']:.2f}"
                             
                             if self.args.wandb.track:
                                 wandb.log(log_data, step=current_step)
@@ -415,7 +416,6 @@ class Trainer:
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc and "final_observation" in infos and infos["final_observation"][idx] is not None:
-                warnings.warn(f"Truncation detected at step {current_step}, idx: {idx}. According to the current implementation, this should not happen.")
                 real_next_obs[idx] = infos["final_observation"][idx]
         
         self.rb.add(obs, real_next_obs, actions, rewards.astype(np.float32), terminations.astype(np.float32), infos)
