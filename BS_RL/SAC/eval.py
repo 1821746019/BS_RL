@@ -1,3 +1,4 @@
+import copy
 import flax
 import gymnasium as gym
 import jax
@@ -13,16 +14,18 @@ class Evaluator:
                  agent: SACAgent,
                  env_config: EnvConfig,
                  eval_config: EvalConfig,
-                 data_loader: DataLoader,
                  run_name_suffix: str,
                  logger: MetricLogger = None):
         self.agent = agent
         self.env_config = env_config
         self.eval_config = eval_config
-        self.data_loader = data_loader
         self.run_name_suffix = run_name_suffix
         self.logger = logger
         self.eval_envs = None
+
+        eval_trading_config = copy.deepcopy(self.env_config.trading_env_config)
+        eval_trading_config.data_path = self.eval_config.data_path
+        self.data_loader = DataLoader(eval_trading_config)
 
         if self.eval_config.cache_env:
             self.eval_envs = self._make_envs()

@@ -73,7 +73,8 @@ class TrainConfig:
     """Frequency to save a checkpoint. If > 1, it's absolute steps. If (0, 1], it's fraction of total_timesteps."""
     ckpt_save_frequency_abs_steps: Optional[int] = None # Will be populated by Args.__post_init__
     """Absolute step frequency for saving checkpoints, resolved from ckpt_save_frequency."""
-
+    upload_model: bool = False
+    """Whether to upload the model checkpoint to wandb."""
 @dataclass
 class EvalConfig:
     eval_frequency: Union[float, int] = 0.01
@@ -94,6 +95,8 @@ class EvalConfig:
     """whether to use async vector env for evaluation"""
     seed: int = 996
     """the seed for the evaluation environment"""
+    data_path: str = "/root/project/processed_data/test_dataset/"
+    """path to the evaluation dataset"""
 @dataclass
 class TransformerConfig:
     """Configuration for a Transformer encoder block."""
@@ -129,9 +132,9 @@ class NetworkConfig:
     cnn1d_layers_1m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=3, embed_dim=128))
     cnn1d_layers_5m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=3, embed_dim=48))
     """"""
-    MLP_layers_rest: List[int] = field(default_factory=lambda: [33, 32]) # restet有39维
-    MLP_layers_final: List[int] = field(default_factory=lambda: [514, 513, 512])
-    MLP_type: str = "ResMLP" # "MLP", "ResMLP", or "MLP_with_LayerNorm"
+    MLP_layers_rest: List[int] = field(default_factory=lambda: [32, 32]) # restet有39维
+    MLP_layers_final: List[int] = field(default_factory=lambda: [512, 512, 512])
+    MLP_type: str = "MLPWithLayerNorm" # "MLP", "ResMLP", or "MLPWithLayerNorm"
     activation:str = "gelu"
     
 @dataclass
@@ -145,12 +148,12 @@ class Args:
     def __post_init__(self):
         # Resolve ckpt_save_frequency
         if self.train.ckpt_save_frequency is not None:
-            if 0 < self.train.ckpt_save_frequency <= 1.0:
+            if 0 < self.train.ckpt_save_frequency and isinstance(self.train.ckpt_save_frequency, float):
                 if self.algo.total_timesteps > 0:
                     self.train.ckpt_save_frequency_abs_steps = int(self.train.ckpt_save_frequency * self.algo.total_timesteps)
                 else: # Should not happen if total_timesteps is properly set
                     self.train.ckpt_save_frequency_abs_steps = None # Or raise error
-            elif self.train.ckpt_save_frequency > 1.0:
+            elif self.train.ckpt_save_frequency > 1 and isinstance(self.train.ckpt_save_frequency, int):
                 self.train.ckpt_save_frequency_abs_steps = int(self.train.ckpt_save_frequency)
             else: # 0 or negative, effectively disabling scheduled ckpting based on this param
                 self.train.ckpt_save_frequency_abs_steps = None
@@ -161,12 +164,12 @@ class Args:
 
         # Resolve eval_frequency
         if self.eval.eval_frequency is not None:
-            if 0 < self.eval.eval_frequency <= 1.0:
+            if 0 < self.eval.eval_frequency and isinstance(self.eval.eval_frequency, float):
                 if self.algo.total_timesteps > 0:
                     self.eval.eval_frequency_abs_steps = int(self.eval.eval_frequency * self.algo.total_timesteps)
                 else:
                     self.eval.eval_frequency_abs_steps = None
-            elif self.eval.eval_frequency > 1.0:
+            elif self.eval.eval_frequency > 1 and isinstance(self.eval.eval_frequency, int):
                 self.eval.eval_frequency_abs_steps = int(self.eval.eval_frequency)
             else:
                 self.eval.eval_frequency_abs_steps = None

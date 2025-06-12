@@ -5,22 +5,27 @@ import os
 from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_size
 
 if __name__ == "__main__":
+    total_timesteps = int(200e6)
+    resume = False
     batch_size = 5120
     env_id = "TradingEnv"
     env_num = 96
     eval_env_num = 48
     trading_env_config = TradingEnvConfig(data_path="/root/project/processed_data/")
-    total_timesteps = int(200e6)
+    is_test = total_timesteps!=int(200e6)
+    learning_starts = int(batch_size) if is_test else int(2e4)
+    ckpt_save_frequency = None if is_test else 0.01
+    eval_frequency = None if is_test else 0.01
     args = Args(
         train=TrainConfig(
             exp_name=env_id,
             save_model=True,
-            ckpt_save_frequency=0.01,
-            resume=False,
+            ckpt_save_frequency=ckpt_save_frequency,
+            resume=resume,
             save_dir=f"runs/{env_id}_convnext_light",
         ),
         eval=EvalConfig(
-            eval_frequency=0.01,
+            eval_frequency=eval_frequency,
             eval_episodes=48,
             greedy_actions=True,
             env_num=eval_env_num,
@@ -36,9 +41,9 @@ if __name__ == "__main__":
             # encoder_type 默认为 "convnext". 若要使用 transformer, 设置: encoder_type="transformer"
         ),
         algo=AlgoConfig(
-            total_timesteps=total_timesteps, # 200M步
+            total_timesteps=total_timesteps,
             buffer_size=int(1e5),
-            learning_starts=int(2e4), # 20k步后开始学习
+            learning_starts=learning_starts, 
             batch_size=batch_size,
             update_frequency=4, # Update more frequently for simpler envs
             target_network_frequency=int(8e3),

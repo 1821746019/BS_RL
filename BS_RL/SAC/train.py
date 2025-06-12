@@ -175,12 +175,8 @@ class Trainer:
             self.key_actions_base, self.key_update_base = jax.random.split(key_for_loop)
 
     def _setup_data_loader(self):
-        print("Initializing DataLoader...")
+        print("Initializing Trainer's DataLoader...")
         self.data_loader = DataLoader(self.args.env.trading_env_config)
-        # 拷贝一份，避免修改原始的trading_env_config
-        config_eval = copy.deepcopy(self.args.env.trading_env_config)
-        config_eval.data_path = "/root/project/processed_data/test_dataset/"
-        self.data_loader_eval = DataLoader(config_eval)
         print("DataLoader initialized.")
 
     def _setup_environments(self):
@@ -336,7 +332,6 @@ class Trainer:
             agent=self.agent,
             env_config=self.args.env,
             eval_config=self.args.eval,
-            data_loader=self.data_loader_eval,
             run_name_suffix=self.run_name_suffix,
             logger=self.logger,
         )
@@ -506,7 +501,7 @@ class Trainer:
 
                 # Log the model artifact to wandb before adding other files to the checkpoint directory.
                 # This ensures that only the model is part of the artifact.
-                if self.args.wandb.track and wandb.run:
+                if self.args.wandb.track and wandb.run and self.args.train.upload_model:
                     artifact = wandb.Artifact(f"model_ckpt_{self.wandb_run_name}", type="model")
                     artifact.add_dir(str(saved_path))
                     aliases = [f"step_{step_for_ckpt}"]

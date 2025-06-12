@@ -91,6 +91,7 @@ class ResMLPBlock(nn.Module):
             residual = nn.Dense(self.output_dim, name="projection")(residual)
         
         return residual + y
+
 class MLP(nn.Module):
     hidden_dims: List[int]
     activation: Callable
@@ -113,7 +114,17 @@ class MLPWithLayerNorm(nn.Module):
             x = self.activation(x)
             x = nn.LayerNorm()(x)
         return x
+class MLPWithLayerNormPreActivation(nn.Module):
+    hidden_dims: List[int]
+    activation: Callable
 
+    @nn.compact
+    def __call__(self, x):
+        for dim in self.hidden_dims:
+            y = nn.LayerNorm()(x)
+            y = self.activation(y)
+            y = nn.Dense(dim)(y)
+        return x
 # class ResMLP(nn.Module):
 #     hidden_dims: List[int]
 #     activation: Callable
@@ -131,11 +142,59 @@ class ResMLP(nn.Module):
     @nn.compact
     def __call__(self, x):
         for i, dim in enumerate(self.hidden_dims):
+            # Apply pre-activation style residual block
+            # This is generally more stable than post-activation
+            
+            # Project input to the hidden dimension if necessary
+            if x.shape[-1] != dim:
+                # This projection acts as the first dense layer in a standard MLP
+                # or as a projection for the residual connection.
+                x = nn.Dense(dim, name=f"projection_{i}")(x)
+            
+            residual = x
+            
+            y = nn.LayerNorm(name=f"ln_{i}")(x)
+            y = self.activation(y)
+            y = nn.Dense(dim, name=f"dense_{i}")(y)
+            
+            x = residual + y
+            
+        return x
+class ResMLPWithFallbackRobust(nn.Module): # 实测没有任何卵用，不管第一层是否预激活
+    """采用了"Pre-activation"风格的残差块，这种结构通过更好的归一化和连接方式，解决了激活值爆炸的问题"""
+    hidden_dims: List[int]
+    activation: Callable
+
+    @nn.compact
+    def __call__(self, x):
+        for i, dim in enumerate(self.hidden_dims):
+            # Pre-activation: 先标准化，再激活，最后线性变换
+            # if i == 0:
+            #     # 第一层不需要预激活，直接处理输入
+            #     y = nn.Dense(dim)(x)
+            # else:
+            y = nn.LayerNorm()(x)
+            y = self.activation(y)
+            y = nn.Dense(dim)(y)
+            
+            # 残差连接
+            x = x + y if x.shape[-1] == y.shape[-1] else y
+        return x
+    
+class ResMLPWithFallback(nn.Module): 
+    """bug: 当隐藏层维度相同时，其简单的x = x + y残差结构会导致激活值不受控制地累积，最终引发梯度爆炸"""
+    hidden_dims: List[int]
+    activation: Callable
+
+    @nn.compact
+    def __call__(self, x):
+        for i, dim in enumerate(self.hidden_dims):
             y = nn.Dense(dim)(x)
             y = self.activation(y)
             y = nn.LayerNorm()(y)
             x = x + y if x.shape[-1] == y.shape[-1] else y
         return x
+    
     
 class SelfAttention(nn.Module):
     config: TransformerConfig
@@ -248,16 +307,17 @@ class TradingNetwork(nn.Module):
 
         x_1m = x_1m.reshape((x_1m.shape[0], -1)) # Flatten
         x_5m = x_5m.reshape((x_5m.shape[0], -1)) # Flatten
-
-        if self.network_config.MLP_type == "ResMLP":
-            MLP_module = ResMLP
-        elif self.network_config.MLP_type == "MLP_with_LayerNorm":
-            MLP_module = MLPWithLayerNorm
-        elif self.network_config.MLP_type == "MLP":
-            MLP_module = MLP
-        else:
+        MLP_type_map = {
+            "ResMLP": ResMLP,
+            "MLP": MLP,
+            "MLPWithLayerNorm": MLPWithLayerNorm,
+            "MLPWithLayerNormPreActivation": MLPWithLayerNormPreActivation,
+            "ResMLPWithFallback": ResMLPWithFallback,
+            "ResMLPWithFallbackRobust": ResMLPWithFallbackRobust
+        }
+        if self.network_config.MLP_type not in MLP_type_map:
             raise ValueError(f"Unknown MLP type: {self.network_config.MLP_type}")
-
+        MLP_module = MLP_type_map[self.network_config.MLP_type]
         # Process rest of data
         x_rest = MLP_module(
             hidden_dims=self.network_config.MLP_layers_rest,
