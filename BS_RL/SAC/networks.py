@@ -14,15 +14,6 @@ def get_activation(name: str) -> Callable:
     else:
         raise ValueError(f"Unknown activation: {name}")
 
-def get_normalizer(name: str) -> Callable:
-    """Returns the normalizer class."""
-    if name.lower() == "layernorm":
-        return nn.LayerNorm
-    elif name.lower() == "batchnorm":
-        return nn.BatchNorm
-    else:
-        raise ValueError(f"Unknown normalizer: {name}")
-
 class DropPath(nn.Module):
     drop_prob: float
 
@@ -41,37 +32,29 @@ class DropPath(nn.Module):
 class ConvNeXtBlock(nn.Module):
     config: ConvNextConfig
     activation: Callable
-    normalizer: Callable
-    pre_activation: bool = False
 
     @nn.compact
     def __call__(self, x, deterministic: bool):
         residual = x
         
-        if self.pre_activation:
-            # Pre-activation style
-            y = self.normalizer()(x)
-            y = nn.Conv(
-                features=self.config.embed_dim,
-                kernel_size=(self.config.depthwise_kernel_size,),
-                strides=(1,),
-                padding='SAME',
-                feature_group_count=self.config.embed_dim
-            )(y)
-        else:
-            # Post-activation style
-            y = nn.Conv(
-                features=self.config.embed_dim,
-                kernel_size=(self.config.depthwise_kernel_size,),
-                strides=(1,),
-                padding='SAME',
-                feature_group_count=self.config.embed_dim
-            )(x)
-            y = self.normalizer()(y)
+        # 完整的预激活：Norm -> Activation -> Conv
+        y = nn.LayerNorm()(x)
+        y = self.activation(y)  # 添加激活函数
+        y = nn.Conv(
+            features=self.config.embed_dim,
+            kernel_size=(self.config.depthwise_kernel_size,),
+            strides=(1,),
+            padding='SAME',
+            feature_group_count=self.config.embed_dim
+        )(y)
 
-        # Inverted Bottleneck
+        # MLP部分也改为预激活
         mlp_dim = self.config.embed_dim * self.config.ffn_dim_multiplier
+        y = nn.LayerNorm()(y)  # 第二个LayerNorm
+        y = self.activation(y)
         y = nn.Dense(features=mlp_dim)(y)
+        
+        y = nn.LayerNorm()(y)  # 第三个LayerNorm
         y = self.activation(y)
         y = nn.Dense(features=self.config.embed_dim)(y)
         
@@ -84,92 +67,52 @@ class ConvNeXtBlock(nn.Module):
 class Cnn1DEncoderBlock(nn.Module):
     config: Cnn1DConfig
     activation: Callable
-    normalizer: Callable
-    pre_activation: bool = False
 
     @nn.compact
     def __call__(self, x, deterministic: bool):
         residual = x
         
-        if self.pre_activation:
-            y = self.normalizer()(x)
-            y = self.activation(y)
-            y = nn.Conv(
-                features=self.config.embed_dim,
-                kernel_size=(self.config.kernel_size,),
-                padding='SAME'
-            )(y)
-        else:
-            y = nn.Conv(
-                features=self.config.embed_dim,
-                kernel_size=(self.config.kernel_size,),
-                padding='SAME'
-            )(x)
-            y = self.normalizer()(y)
-            y = self.activation(y)
+        y = nn.LayerNorm()(x)
+        y = self.activation(y)
+        y = nn.Conv(
+            features=self.config.embed_dim,
+            kernel_size=(self.config.kernel_size,),
+            padding='SAME'
+        )(y)
 
         y = nn.Dropout(rate=self.config.dropout_rate)(y, deterministic=deterministic)
 
         return residual + y
 
 class ResidualBlock1D(nn.Module):
-    """1D Residual Block supporting both Pre-activation (ResNetV2) and Post-activation (ResNetV1)."""
+    """1D Residual Block for Pre-activation (ResNetV2)."""
     features: int
     strides: int
     activation: Callable
-    normalizer: Callable
-    pre_activation: bool = False
     
     @nn.compact
     def __call__(self, x, deterministic: bool):
         residual = x
         
-        # Determine if BatchNorm should use running averages
-        use_running_average = not deterministic if self.normalizer == nn.BatchNorm else None
-
-        def norm(name):
-            kwargs = {'use_running_average': use_running_average} if use_running_average is not None else {}
-            return self.normalizer(name=name, **kwargs)
-
-        if self.pre_activation:
-            # Pre-activation (ResNetV2 style)
-            y = norm(name='norm1')(x)
-            y = self.activation(y)
-            y = nn.Conv(
-                features=self.features,
-                kernel_size=(3,),
-                strides=(self.strides,),
-                padding='SAME',
-                name='conv1'
-            )(y)
-            
-            y = norm(name='norm2')(y)
-            y = self.activation(y)
-            y = nn.Conv(
-                features=self.features,
-                kernel_size=(3,),
-                padding='SAME',
-                name='conv2'
-            )(y)
-        else:
-            # Post-activation (ResNetV1 style)
-            y = nn.Conv(
-                features=self.features,
-                kernel_size=(3,),
-                strides=(self.strides,),
-                padding='SAME',
-                name='conv1'
-            )(x)
-            y = norm(name='norm1')(y)
-            y = self.activation(y)
-            
-            y = nn.Conv(
-                features=self.features,
-                kernel_size=(3,),
-                padding='SAME',
-                name='conv2'
-            )(y)
-            y = norm(name='norm2')(y)
+        # Pre-activation (ResNetV2 style)
+        y = nn.LayerNorm(name='norm1')(x)
+        y = self.activation(y)
+        y = nn.Conv(
+            features=self.features,
+            kernel_size=(3,),
+            strides=(self.strides,),
+            padding='SAME',
+            name='conv1'
+        )(y)
+        
+        y = nn.LayerNorm(name='norm2')(y)
+        y = self.activation(y)
+        y = nn.Conv(
+            features=self.features,
+            kernel_size=(3,),
+            padding='SAME',
+            name='conv2'
+        )(y)
 
         # Shortcut connection
         if residual.shape != y.shape:
@@ -180,26 +123,15 @@ class ResidualBlock1D(nn.Module):
                 name='shortcut_conv'
             )(x)
             
-        if self.pre_activation:
-            return residual + y
-        else:
-            y += residual
-            y = self.activation(y)
-            return y
+        return residual + y
 
 class ResNet1DEncoder(nn.Module):
     """1D ResNet Encoder."""
     config: ResNet1DConfig
     activation: Callable
-    normalizer: Callable
-    pre_activation: bool = False
 
     @nn.compact
     def __call__(self, x, deterministic: bool):
-        use_running_average = not deterministic if self.normalizer == nn.BatchNorm else None
-        def norm(**kwargs):
-            norm_kwargs = {'use_running_average': use_running_average} if use_running_average is not None else {}
-            return self.normalizer(**kwargs, **norm_kwargs)
 
         # Stem
         x = nn.Conv(
@@ -209,7 +141,7 @@ class ResNet1DEncoder(nn.Module):
             padding='SAME',
             name='stem_conv'
         )(x)
-        x = norm(name='stem_norm')(x)
+        x = nn.LayerNorm(name='stem_norm')(x)
         x = self.activation(x)
         x = nn.max_pool(x, window_shape=(3,), strides=(2,), padding='SAME')
 
@@ -221,15 +153,12 @@ class ResNet1DEncoder(nn.Module):
                     features=features,
                     strides=strides,
                     activation=self.activation,
-                    normalizer=self.normalizer,
-                    pre_activation=self.pre_activation,
                     name=f'stage_{i+1}_block_{j+1}'
                 )(x, deterministic=deterministic)
         
         # In pre-activation mode, a final normalization and activation is applied before pooling.
-        if self.pre_activation:
-            x = norm(name='final_encoder_norm')(x)
-            x = self.activation(x)
+        x = nn.LayerNorm(name='final_encoder_norm')(x)
+        x = self.activation(x)
         
         # Global average pooling
         return jnp.mean(x, axis=1)
@@ -237,27 +166,22 @@ class ResNet1DEncoder(nn.Module):
 class MLP(nn.Module):
     hidden_dims: List[int]
     activation: Callable
-    normalizer: Callable
-    pre_activation: bool = False
+    skip_initial_ln: bool = False
 
     @nn.compact
     def __call__(self, x):
-        for dim in self.hidden_dims:
-            if self.pre_activation:
-                y = self.normalizer()(x)
-                y = self.activation(y)
-                x = nn.Dense(dim)(y)
-            else:
-                x = nn.Dense(dim)(x)
-                x = self.activation(x)
-                x = self.normalizer()(x)
+        for i, dim in enumerate(self.hidden_dims):
+            y = x
+            if not (self.skip_initial_ln and i == 0):
+                y = nn.LayerNorm()(y)
+            y = self.activation(y)
+            x = nn.Dense(dim)(y)
         return x
 
 class ResMLP(nn.Module):
     hidden_dims: List[int]
     activation: Callable
-    normalizer: Callable
-    pre_activation: bool = False
+    skip_initial_ln: bool = False
 
     @nn.compact
     def __call__(self, x):
@@ -268,18 +192,39 @@ class ResMLP(nn.Module):
             else:
                 shortcut = x
 
-            if self.pre_activation:
-                # Pre-activation
-                y = self.normalizer(name=f"norm_{i}")(x)
-                y = self.activation(y)
-                y = nn.Dense(dim, name=f"dense_{i}")(y)
-            else:
-                # Post-activation
-                y = nn.Dense(dim, name=f"dense_{i}")(x)
-                y = self.activation(y)
-                y = self.normalizer(name=f"norm_{i}")(y)
+            # Pre-activation
+            y = x
+            if not (self.skip_initial_ln and i == 0):
+                y = nn.LayerNorm(name=f"norm_{i}")(y)
+            y = self.activation(y)
+            y = nn.Dense(dim, name=f"dense_{i}")(y)
             
             x = shortcut + y
+            
+        return x
+
+class ResMLPNoProjection(nn.Module):
+    hidden_dims: List[int]
+    activation: Callable
+    skip_initial_ln: bool = False
+
+    @nn.compact
+    def __call__(self, x):
+        for i, dim in enumerate(self.hidden_dims):
+            shortcut = x
+
+            # Pre-activation
+            y = x
+            if not (self.skip_initial_ln and i == 0):
+                y = nn.LayerNorm(name=f"norm_{i}")(y)
+            y = self.activation(y)
+            y = nn.Dense(dim, name=f"dense_{i}")(y)
+            
+            if shortcut.shape[-1] == y.shape[-1]:
+                x = shortcut + y
+            else:
+                # Drop residual connection if dimensions mis-match
+                x = y
             
         return x
 
@@ -289,8 +234,6 @@ class TradingNetwork(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         activation_fn = get_activation(self.network_config.activation)
-        normalizer_cls = get_normalizer(self.network_config.normalizer)
-        pre_activation = self.network_config.pre_activation
         
         # Split and reshape
         dim_1m = self.network_config.shape_1m[0] * self.network_config.shape_1m[1]
@@ -300,6 +243,10 @@ class TradingNetwork(nn.Module):
         x_5m = x[:, dim_1m:dim_1m+dim_5m].reshape((-1, *self.network_config.shape_5m))
         x_rest = x[:, dim_1m+dim_5m:]
 
+        # Initial normalization
+        x_1m = nn.LayerNorm(name="initial_norm_1m")(x_1m)
+        x_5m = nn.LayerNorm(name="initial_norm_5m")(x_5m)
+        x_rest = nn.LayerNorm(name="initial_norm_rest")(x_rest)
 
         if self.network_config.encoder_type == 'convnext':
             x_1m_config = self.network_config.convnext_layers_1m
@@ -321,15 +268,11 @@ class TradingNetwork(nn.Module):
             x_1m = ResNet1DEncoder(
                 config=x_1m_config,
                 activation=activation_fn,
-                normalizer=normalizer_cls,
-                pre_activation=pre_activation,
                 name='resnet1d_1m'
             )(x_1m, deterministic=deterministic)
             x_5m = ResNet1DEncoder(
                 config=x_5m_config,
                 activation=activation_fn,
-                normalizer=normalizer_cls,
-                pre_activation=pre_activation,
                 name='resnet1d_5m'
             )(x_5m, deterministic=deterministic)
         else:
@@ -342,8 +285,6 @@ class TradingNetwork(nn.Module):
                 x_1m = EncoderBlock(
                     config=x_1m_config,
                     activation=activation_fn,
-                    normalizer=normalizer_cls,
-                    pre_activation=pre_activation,
                     name=f'encoder_1m_block_{i}'
                 )(x_1m, deterministic=deterministic)
 
@@ -352,8 +293,6 @@ class TradingNetwork(nn.Module):
                 x_5m = EncoderBlock(
                     config=x_5m_config,
                     activation=activation_fn,
-                    normalizer=normalizer_cls,
-                    pre_activation=pre_activation,
                     name=f'encoder_5m_block_{i}'
                 )(x_5m, deterministic=deterministic)
 
@@ -363,22 +302,17 @@ class TradingNetwork(nn.Module):
         MLP_type_map = {
             "MLP": MLP,
             "ResMLP": ResMLP,
+            "ResMLPNoProjection": ResMLPNoProjection,
         }
         if self.network_config.MLP_type not in MLP_type_map:
             raise ValueError(f"Unknown MLP type: {self.network_config.MLP_type}")
         MLP_module = MLP_type_map[self.network_config.MLP_type]
         
-        # Prepare MLP kwargs
-        mlp_kwargs = {
-            "activation": activation_fn,
-            "normalizer": normalizer_cls,
-            "pre_activation": pre_activation
-        }
-
         # Process rest of data
         x_rest = MLP_module(
             hidden_dims=self.network_config.MLP_layers_rest,
-            **mlp_kwargs
+            activation=activation_fn,
+            skip_initial_ln=True
         )(x_rest)
 
         # Concatenate and final MLP
@@ -386,16 +320,16 @@ class TradingNetwork(nn.Module):
         
         final_features = MLP_module(
             hidden_dims=self.network_config.MLP_layers_final,
-            **mlp_kwargs
+            activation=activation_fn
         )(concatenated)
         
         # With pre-activation, the final output comes from a linear layer and is not normalized.
         # This can lead to very large feature values, causing instability in the actor's output logits.
         # We add a final normalization and activation step to stabilize the output.
         # This mirrors the behavior of post-activation, where the final operation in a block is normalization.
-        if pre_activation:
-            final_features = normalizer_cls(name="final_norm")(final_features)
-            final_features = activation_fn(final_features)
+        # but after applying LN to each parts of the initial input x, it seems that no need to do this anymore
+        # final_features = nn.LayerNorm(name="final_norm")(final_features)
+        # final_features = activation_fn(final_features)
         
         return final_features
 
