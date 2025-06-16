@@ -200,7 +200,8 @@ class SACAgent:
             actor_loss_components = action_probs * (actor_effective_alpha * action_log_probs - min_qf_values)
             loss = jnp.sum(actor_loss_components, axis=1).mean()
             
-            entropy = -jnp.sum(action_probs * action_log_probs, axis=1).mean()
+            # Add a small epsilon to action_probs for numerical stability.
+            entropy = -jnp.sum((action_probs + 1e-8) * action_log_probs, axis=1).mean()
             return loss, entropy
 
         (actor_loss_val, entropy_val), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)

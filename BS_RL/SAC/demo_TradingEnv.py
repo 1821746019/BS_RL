@@ -5,8 +5,9 @@ import os
 from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_size
 
 if __name__ == "__main__":
+    encoder="resnet1d"
     total_timesteps = int(200e6)
-    resume = False
+    resume = True
     batch_size = 5120
     env_id = "TradingEnv"
     env_num = 96
@@ -22,7 +23,7 @@ if __name__ == "__main__":
             save_model=True,
             ckpt_save_frequency=ckpt_save_frequency,
             resume=resume,
-            save_dir=f"runs/{env_id}_convnext_light",
+            save_dir=f"runs/{env_id}_{encoder}",
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,
@@ -36,6 +37,7 @@ if __name__ == "__main__":
             env_num=env_num, # SAC typically uses 1 env for off-policy learning
         ),
         network=NetworkConfig(
+            encoder_type=encoder,
             shape_1m=(trading_env_config.window_size_1m, trading_env_config.kline_dim_1m),
             shape_5m=(trading_env_config.window_size_5m, trading_env_config.kline_dim_5m),
             # encoder_type 默认为 "convnext". 若要使用 transformer, 设置: encoder_type="transformer"

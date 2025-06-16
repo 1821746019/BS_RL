@@ -97,14 +97,14 @@ class EvalConfig:
     """the seed for the evaluation environment"""
     data_path: str = "/root/project/processed_data/test_dataset/"
     """path to the evaluation dataset"""
+
 @dataclass
-class TransformerConfig:
-    """Configuration for a Transformer encoder block."""
-    num_layers: int
-    embed_dim: int
-    num_heads: int
-    ffn_dim_multiplier: int = 4
-    dropout_rate: float = 0.1
+class ResNet1DConfig:
+    """Configuration for a 1D ResNet encoder."""
+    stage_sizes: List[int]
+    num_filters: List[int]
+    stem_features: int = 64
+
 @dataclass
 class ConvNextConfig:
     """Configuration for a ConvNeXt encoder block."""
@@ -113,6 +113,7 @@ class ConvNextConfig:
     ffn_dim_multiplier: int = 4
     drop_path_rate: float = 0.1
     depthwise_kernel_size: int = 7
+
 @dataclass
 class Cnn1DConfig:
     """Configuration for a 1D CNN encoder."""
@@ -120,22 +121,28 @@ class Cnn1DConfig:
     embed_dim: int
     kernel_size: int = 3
     dropout_rate: float = 0.1
+
 @dataclass
 class NetworkConfig:
     shape_1m: Tuple[int, int]
     shape_5m: Tuple[int, int]
-    encoder_type: str = "convnext"  # "transformer", "convnext" or "cnn1d"
-    transformer_layers_1m: TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=3, embed_dim=128, num_heads=8))
-    transformer_layers_5m: TransformerConfig = field(default_factory=lambda: TransformerConfig(num_layers=3, embed_dim=48, num_heads=4))
+    encoder_type: str = "resnet1d"  # "convnext", "cnn1d", or "resnet1d"
+    normalizer: str = "layernorm" # "layernorm" or "batchnorm"
+    
+    # Encoder configs
     convnext_layers_1m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=3, embed_dim=128))
     convnext_layers_5m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=3, embed_dim=48)) # 48=128*0.375
     cnn1d_layers_1m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=3, embed_dim=128))
     cnn1d_layers_5m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=3, embed_dim=48))
-    """"""
+    resnet1d_layers_1m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(stage_sizes=[2, 2], num_filters=[64, 128]))
+    resnet1d_layers_5m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(stage_sizes=[2, 2], num_filters=[32, 64]))
+    
+    # MLP configs
     MLP_layers_rest: List[int] = field(default_factory=lambda: [32, 32]) # restet有39维
     MLP_layers_final: List[int] = field(default_factory=lambda: [512, 512, 512])
-    MLP_type: str = "MLPWithLayerNorm" # "MLP", "ResMLP", or "MLPWithLayerNorm"
+    MLP_type: str = "MLP" # "MLP" or "ResMLP"
     activation:str = "gelu"
+    pre_activation: bool = False # False -> Post-activation, True -> Pre-activation
     
 @dataclass
 class Args:

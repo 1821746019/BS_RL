@@ -91,6 +91,7 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
         env = wrappers.DetailedRewardWrapper(env)
         env = wrappers.EpisodeStats(env)
         env = wrappers.NormalizationWrapper(env)
+        env = wrappers.ObsWrapper(env)
         env = FlattenObservation(env)
         return env
 
@@ -103,9 +104,10 @@ def eval_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader,
         env = TradingEnv(config, data_loader, account, seed=seed)
         env = wrappers.DetailedRewardWrapper(env)
         env = wrappers.EpisodeStats(env)
-        env = wrappers.NormalizationWrapper(env)
         if capture_media:
             env = wrappers.EpisodeRender(env)
+        env = wrappers.NormalizationWrapper(env)
+        env = wrappers.ObsWrapper(env)
         env = FlattenObservation(env)
         return env
 
