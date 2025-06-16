@@ -142,7 +142,7 @@ class NetworkConfig:
     MLP_layers_final: List[int] = field(default_factory=lambda: [512, 512, 512])
     MLP_type: str = "MLP" # "MLP" or "ResMLP"
     activation:str = "gelu"
-    pre_activation: bool = False # False -> Post-activation, True -> Pre-activation
+    pre_activation: bool = True # False -> Post-activation, True -> Pre-activation
     
 @dataclass
 class Args:

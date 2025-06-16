@@ -226,6 +226,11 @@ class ResNet1DEncoder(nn.Module):
                     name=f'stage_{i+1}_block_{j+1}'
                 )(x, deterministic=deterministic)
         
+        # In pre-activation mode, a final normalization and activation is applied before pooling.
+        if self.pre_activation:
+            x = norm(name='final_encoder_norm')(x)
+            x = self.activation(x)
+        
         # Global average pooling
         return jnp.mean(x, axis=1)
 
@@ -383,6 +388,14 @@ class TradingNetwork(nn.Module):
             hidden_dims=self.network_config.MLP_layers_final,
             **mlp_kwargs
         )(concatenated)
+        
+        # With pre-activation, the final output comes from a linear layer and is not normalized.
+        # This can lead to very large feature values, causing instability in the actor's output logits.
+        # We add a final normalization and activation step to stabilize the output.
+        # This mirrors the behavior of post-activation, where the final operation in a block is normalization.
+        if pre_activation:
+            final_features = normalizer_cls(name="final_norm")(final_features)
+            final_features = activation_fn(final_features)
         
         return final_features
 
