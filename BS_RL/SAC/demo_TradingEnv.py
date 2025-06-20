@@ -5,14 +5,15 @@ import os
 from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_size
 
 if __name__ == "__main__":
-    trading_timeframe = "1m"
+    trading_timeframe = "5m"
     encoder="kline"
     total_timesteps = int(200e6)
     resume = True
     batch_size = 5120
     env_id = f"TradingEnv{trading_timeframe}"
     env_num = 96
-    eval_env_num = 48
+    eval_env_num = 24 # 从48改为24减少评估耗时，若能实现异步评估就更好了
+    eval_episodes = eval_env_num
     trading_env_config = TradingEnvConfig(
         data_path="/root/project/processed_data/",
         window_size_5m=int(4*60/5),
@@ -32,7 +33,7 @@ if __name__ == "__main__":
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,
-            eval_episodes=48,
+            eval_episodes=eval_episodes,
             greedy_actions=True,
             env_num=eval_env_num,
         ),
