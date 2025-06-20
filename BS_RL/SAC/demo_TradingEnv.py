@@ -5,14 +5,19 @@ import os
 from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_size
 
 if __name__ == "__main__":
+    trading_timeframe = "1m"
     encoder="kline"
     total_timesteps = int(200e6)
     resume = True
     batch_size = 5120
-    env_id = "TradingEnv"
+    env_id = f"TradingEnv{trading_timeframe}"
     env_num = 96
     eval_env_num = 48
-    trading_env_config = TradingEnvConfig(data_path="/root/project/processed_data/",window_size_5m=int(4*60/5))
+    trading_env_config = TradingEnvConfig(
+        data_path="/root/project/processed_data/",
+        window_size_5m=int(4*60/5),
+        trading_timeframe=trading_timeframe
+    )
     is_test = total_timesteps!=int(200e6)
     learning_starts = int(batch_size) if is_test else int(2e4)
     ckpt_save_frequency = None if is_test else 0.01

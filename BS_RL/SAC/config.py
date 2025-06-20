@@ -154,7 +154,7 @@ class NetworkConfig:
     # 但是data_reset主要是回合+账户仓位+时间特征信息，并不能对盈利起决定性作用故不应用太多维度和层数都不应过大？
     ResMLP_rest: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
             hidden_dims=[96, 96],
-            skip_final_ln=True,
+            skip_initial_ln=True,
             residual_strategy=ResidualStrategy.CONV,
             dropout_rate=0.1,
             name="conv_based",
