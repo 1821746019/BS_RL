@@ -10,8 +10,7 @@ class EnvConfig:
     """the number of parallel game environments"""
     seed: int = 1
     """seed of the experiment"""
-    async_vector_env: bool = False
-    """whether to use async vector env"""
+
 
 @dataclass
 class AlgoConfig:
@@ -75,6 +74,8 @@ class TrainConfig:
     """Absolute step frequency for saving checkpoints, resolved from ckpt_save_frequency."""
     upload_model: bool = False
     """Whether to upload the model checkpoint to wandb."""
+    async_vector_env: bool = False
+    """whether to use async vector env"""
 @dataclass
 class EvalConfig:
     eval_frequency: Union[float, int] = 0.01

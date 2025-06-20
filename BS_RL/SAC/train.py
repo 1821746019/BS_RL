@@ -181,7 +181,7 @@ class Trainer:
 
     def _setup_environments(self):
         print("Creating training environments...")
-        vec_env_cls = gym.vector.AsyncVectorEnv if self.args.env.async_vector_env else gym.vector.SyncVectorEnv
+        vec_env_cls = gym.vector.AsyncVectorEnv if self.args.train.async_vector_env else gym.vector.SyncVectorEnv
         self.envs = vec_env_cls(
             [train_env_maker(
                 seed=self.args.env.seed + i,

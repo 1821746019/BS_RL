@@ -6,6 +6,7 @@ from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_
 
 if __name__ == "__main__":
     trading_timeframe = "5m"
+    reward_by_baseline = True
     encoder="kline"
     total_timesteps = int(200e6)
     resume = True
@@ -17,12 +18,14 @@ if __name__ == "__main__":
     trading_env_config = TradingEnvConfig(
         data_path="/root/project/processed_data/",
         window_size_5m=int(4*60/5),
-        trading_timeframe=trading_timeframe
+        trading_timeframe=trading_timeframe,
+        reward_by_baseline=reward_by_baseline
     )
     is_test = total_timesteps!=int(200e6)
     learning_starts = int(batch_size) if is_test else int(2e4)
     ckpt_save_frequency = None if is_test else 0.01
     eval_frequency = None if is_test else 0.01
+    async_vector_env = True # 开启以利用CPU多核。v3-8的CPU主频似乎v4-8低很多，实测SPS会低近1半(900-->500)
     args = Args(
         train=TrainConfig(
             exp_name=env_id,
@@ -30,12 +33,14 @@ if __name__ == "__main__":
             ckpt_save_frequency=ckpt_save_frequency,
             resume=resume,
             save_dir=f"runs/{env_id}_{encoder}",
+            async_vector_env=async_vector_env,
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,
             eval_episodes=eval_episodes,
             greedy_actions=True,
             env_num=eval_env_num,
+            async_vector_env=async_vector_env,
         ),
         env=EnvConfig(
             trading_env_config=trading_env_config,
