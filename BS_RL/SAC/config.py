@@ -2,7 +2,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional, Union, Tuple, List
 from TradingEnv import EnvConfig as TradingEnvConfig
-
+from .nn.ResMLP import ResMLPConfig, ResidualStrategy, ActivationPosition, ResMLPPresets
 @dataclass
 class EnvConfig:
     trading_env_config: TradingEnvConfig = field(default_factory=TradingEnvConfig)
@@ -123,10 +123,17 @@ class Cnn1DConfig:
     dropout_rate: float = 0.1
 
 @dataclass
+class KLineEncoderConfig:
+    """Configuration for a KLine encoder."""
+    block_features: List[int]
+    kernel_sizes: List[int]
+
+
+@dataclass
 class NetworkConfig:
     shape_1m: Tuple[int, int]
     shape_5m: Tuple[int, int]
-    encoder_type: str = "resnet1d"  # "convnext", "cnn1d", or "resnet1d"
+    encoder_type: str = "resnet1d"  # "convnext", "cnn1d", "resnet1d", "kline"
     
     # Encoder configs
     convnext_layers_1m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=8, embed_dim=16))
@@ -135,13 +142,29 @@ class NetworkConfig:
     cnn1d_layers_5m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=8, embed_dim=16))
     resnet1d_layers_1m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(stage_sizes=[2, 2], num_filters=[64, 128]))
     resnet1d_layers_5m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(stage_sizes=[2, 2], num_filters=[32, 64]))
-    
-    # MLP configs
-    MLP_layers_rest: List[int] = field(default_factory=lambda: [32, 32]) # restet有40维
-    MLP_layers_final: List[int] = field(default_factory=lambda: [128, 128])
-    MLP_type: str = "MLP" # "MLP" or "ResMLP"
+    kline_encoder_1m: KLineEncoderConfig = field(default_factory=lambda: KLineEncoderConfig(block_features=[64, 128, 128, 128, 128], kernel_sizes=[7, 5, 3, 3, 3]))
+    kline_encoder_5m: KLineEncoderConfig = field(default_factory=lambda: KLineEncoderConfig(block_features=[64, 128, 128, 128, 128], kernel_sizes=[7, 5, 3, 3, 3]))
+
+    # # MLP configs
+    # MLP_layers_rest: List[int] = field(default_factory=lambda: [32, 32]) # restet有40维
+    # MLP_layers_final: List[int] = field(default_factory=lambda: [128, 128, 128])
+    MLP_type: str = "ResMLP" # "MLP" or "ResMLP"
     activation:str = "gelu"
-    
+    ResMLP_rest: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
+            hidden_dims=[64, 64],
+            skip_final_ln=True,
+            residual_strategy=ResidualStrategy.CONV,
+            dropout_rate=0.1,
+            name="conv_based",
+            description="使用卷积投影的配置，适合有空间结构的数据"
+        ))
+    ResMLP_final: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
+            hidden_dims=[256, 256, 256],
+            residual_strategy=ResidualStrategy.CONV,
+            dropout_rate=0.1,
+            name="conv_based",
+            description="使用卷积投影的配置，适合有空间结构的数据"
+        ))
 @dataclass
 class Args:
     train: TrainConfig = field(default_factory=TrainConfig)

@@ -87,7 +87,7 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
    
     def thunk():
         account = Account(config)
-        env = TradingEnv(config, data_loader, account, seed=seed)
+        env = TradingEnv(config, data_loader, account)
         env = wrappers.DetailedRewardWrapper(env)
         env = wrappers.EpisodeStats(env)
         env = wrappers.NormalizationWrapper(env)
@@ -101,7 +101,7 @@ def eval_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader,
    
     def thunk():
         account = Account(config)
-        env = TradingEnv(config, data_loader, account, seed=seed)
+        env = TradingEnv(config, data_loader, account)
         env = wrappers.DetailedRewardWrapper(env)
         env = wrappers.EpisodeStats(env)
         if capture_media:

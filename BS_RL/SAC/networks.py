@@ -3,6 +3,8 @@ import jax
 import jax.numpy as jnp
 from typing import List, Callable, Sequence
 from .config import NetworkConfig, ConvNextConfig, Cnn1DConfig, ResNet1DConfig
+from .nn.KlineEncoder import KLineEncoder
+from .nn.ResMLP import UnifiedResMLP, ResMLPConfig
 
 def get_activation(name: str) -> Callable:
     if name == "relu":
@@ -163,70 +165,6 @@ class ResNet1DEncoder(nn.Module):
         # Global average pooling
         return jnp.mean(x, axis=1)
 
-class MLP(nn.Module):
-    hidden_dims: List[int]
-    activation: Callable
-    skip_initial_ln: bool = False
-
-    @nn.compact
-    def __call__(self, x):
-        for i, dim in enumerate(self.hidden_dims):
-            y = x
-            if not (self.skip_initial_ln and i == 0):
-                y = nn.LayerNorm()(y)
-            y = self.activation(y)
-            x = nn.Dense(dim)(y)
-        return x
-
-class ResMLP(nn.Module):
-    hidden_dims: List[int]
-    activation: Callable
-    skip_initial_ln: bool = False
-
-    @nn.compact
-    def __call__(self, x):
-        for i, dim in enumerate(self.hidden_dims):
-            if x.shape[-1] != dim:
-                # Project input to the hidden dimension if necessary for the residual connection
-                shortcut = nn.Dense(dim, name=f"shortcut_projection_{i}")(x)
-            else:
-                shortcut = x
-
-            # Pre-activation
-            y = x
-            if not (self.skip_initial_ln and i == 0):
-                y = nn.LayerNorm(name=f"norm_{i}")(y)
-            y = self.activation(y)
-            y = nn.Dense(dim, name=f"dense_{i}")(y)
-            
-            x = shortcut + y
-            
-        return x
-
-class ResMLPNoProjection(nn.Module):
-    hidden_dims: List[int]
-    activation: Callable
-    skip_initial_ln: bool = False
-
-    @nn.compact
-    def __call__(self, x):
-        for i, dim in enumerate(self.hidden_dims):
-            shortcut = x
-
-            # Pre-activation
-            y = x
-            if not (self.skip_initial_ln and i == 0):
-                y = nn.LayerNorm(name=f"norm_{i}")(y)
-            y = self.activation(y)
-            y = nn.Dense(dim, name=f"dense_{i}")(y)
-            
-            if shortcut.shape[-1] == y.shape[-1]:
-                x = shortcut + y
-            else:
-                # Drop residual connection if dimensions mis-match
-                x = y
-            
-        return x
 
 class TradingNetwork(nn.Module):
     network_config: NetworkConfig
@@ -260,6 +198,10 @@ class TradingNetwork(nn.Module):
             x_1m_config = self.network_config.resnet1d_layers_1m
             x_5m_config = self.network_config.resnet1d_layers_5m
             # ResNet1DEncoder is a full encoder, not a block
+        elif self.network_config.encoder_type == 'kline':
+            x_1m_config = self.network_config.kline_encoder_1m
+            x_5m_config = self.network_config.kline_encoder_5m
+            EncoderBlock = KLineEncoder
         else:
             raise ValueError(f"Unknown encoder type: {self.network_config.encoder_type}")
 
@@ -275,6 +217,19 @@ class TradingNetwork(nn.Module):
                 activation=activation_fn,
                 name='resnet1d_5m'
             )(x_5m, deterministic=deterministic)
+        elif self.network_config.encoder_type == 'kline':
+            x_1m = KLineEncoder(
+                block_features=x_1m_config.block_features,
+                kernel_sizes=x_1m_config.kernel_sizes,
+                activation=activation_fn,
+                name='kline_1m'
+            )(x_1m)
+            x_5m = KLineEncoder(
+                block_features=x_5m_config.block_features,
+                kernel_sizes=x_5m_config.kernel_sizes,
+                activation=activation_fn,
+                name='kline_5m'
+            )(x_5m)
         else:
             # Project to embed_dim before encoders
             x_1m = nn.Dense(x_1m_config.embed_dim, name='projection_1m')(x_1m)
@@ -299,29 +254,13 @@ class TradingNetwork(nn.Module):
             x_1m = x_1m.reshape((x_1m.shape[0], -1)) # Flatten
             x_5m = x_5m.reshape((x_5m.shape[0], -1)) # Flatten
         
-        MLP_type_map = {
-            "MLP": MLP,
-            "ResMLP": ResMLP,
-            "ResMLPNoProjection": ResMLPNoProjection,
-        }
-        if self.network_config.MLP_type not in MLP_type_map:
-            raise ValueError(f"Unknown MLP type: {self.network_config.MLP_type}")
-        MLP_module = MLP_type_map[self.network_config.MLP_type]
-        
         # Process rest of data
-        x_rest = MLP_module(
-            hidden_dims=self.network_config.MLP_layers_rest,
-            activation=activation_fn,
-            skip_initial_ln=True
-        )(x_rest)
+        x_rest = UnifiedResMLP(config=self.network_config.ResMLP_rest, activation=activation_fn)(x_rest)
 
         # Concatenate and final MLP
         concatenated = jnp.concatenate([x_1m, x_5m, x_rest], axis=-1)
         
-        final_features = MLP_module(
-            hidden_dims=self.network_config.MLP_layers_final,
-            activation=activation_fn
-        )(concatenated)
+        final_features = UnifiedResMLP(config=self.network_config.ResMLP_final, activation=activation_fn)(concatenated)
         
         # With pre-activation, the final output comes from a linear layer and is not normalized.
         # This can lead to very large feature values, causing instability in the actor's output logits.
