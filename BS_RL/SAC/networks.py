@@ -262,14 +262,6 @@ class TradingNetwork(nn.Module):
         
         final_features = UnifiedResMLP(config=self.network_config.ResMLP_final, activation=activation_fn)(concatenated)
         
-        # With pre-activation, the final output comes from a linear layer and is not normalized.
-        # This can lead to very large feature values, causing instability in the actor's output logits.
-        # We add a final normalization and activation step to stabilize the output.
-        # This mirrors the behavior of post-activation, where the final operation in a block is normalization.
-        # but after applying LN to each parts of the initial input x, it seems that no need to do this anymore
-        # final_features = nn.LayerNorm(name="final_norm")(final_features)
-        # final_features = activation_fn(final_features)
-        
         return final_features
 
 class TradingActor(nn.Module):
@@ -278,7 +270,10 @@ class TradingActor(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
+        activation_fn = get_activation(self.network_config.activation)
         features = TradingNetwork(network_config=self.network_config)(x, deterministic=deterministic)
+        features = nn.LayerNorm(name="final_norm")(features)
+        features = activation_fn(features)
         logits = nn.Dense(self.action_dim)(features)
         return logits
 
@@ -288,6 +283,9 @@ class TradingCritic(nn.Module):
     
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
+        activation_fn = get_activation(self.network_config.activation)
         features = TradingNetwork(network_config=self.network_config)(x, deterministic=deterministic)
+        features = nn.LayerNorm(name="final_norm")(features)
+        features = activation_fn(features)
         q_values = nn.Dense(self.action_dim)(features)
         return q_values

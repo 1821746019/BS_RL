@@ -150,8 +150,10 @@ class NetworkConfig:
     # MLP_layers_final: List[int] = field(default_factory=lambda: [128, 128, 128])
     MLP_type: str = "ResMLP" # "MLP" or "ResMLP"
     activation:str = "gelu"
+    # CartPole的观察是4维向量，网络用的(64,64)，那么通道的扩展倍数是64/4=16。若要借鉴的话：40*16=640
+    # 但是data_reset主要是回合+账户仓位+时间特征信息，并不能对盈利起决定性作用故不应用太多维度和层数都不应过大？
     ResMLP_rest: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
-            hidden_dims=[64, 64],
+            hidden_dims=[96, 96],
             skip_final_ln=True,
             residual_strategy=ResidualStrategy.CONV,
             dropout_rate=0.1,
@@ -159,7 +161,7 @@ class NetworkConfig:
             description="使用卷积投影的配置，适合有空间结构的数据"
         ))
     ResMLP_final: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
-            hidden_dims=[256, 256, 256],
+            hidden_dims=[1024, 1024, 1024],
             residual_strategy=ResidualStrategy.CONV,
             dropout_rate=0.1,
             name="conv_based",

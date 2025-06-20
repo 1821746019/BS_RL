@@ -82,6 +82,16 @@ class ResMLPConfig:
         if (self.residual_strategy == ResidualStrategy.CONV and 
             self.use_highway):
             print("警告: CONV投影与Highway连接同时使用可能导致参数冗余")
+            
+        # skip_final_ln只在有post-activation时有用
+        if (self.skip_final_ln and 
+            self.activation_position == ActivationPosition.PRE):
+            print("警告: skip_final_ln在PRE激活模式下无效，因为没有post LayerNorm")
+            
+        # skip_initial_ln只在有pre-activation时有用  
+        if (self.skip_initial_ln and 
+            self.activation_position == ActivationPosition.POST):
+            print("警告: skip_initial_ln在POST激活模式下无效，因为没有pre LayerNorm")
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典，用于序列化"""
@@ -194,7 +204,7 @@ class UnifiedResMLP(nn.Module):
     使用ResMLPConfig进行配置，支持多种残差连接策略和激活模式。
     """
     config: ResMLPConfig
-    activation: Callable = nn.gelu
+    activation: Callable = nn.relu
     
     def setup(self):
         """模块初始化"""
@@ -369,7 +379,7 @@ class UnifiedResMLP(nn.Module):
                 return y
 
 # 便利的工厂函数
-def create_resmlp(config: Union[ResMLPConfig, str], activation: Callable = nn.gelu) -> UnifiedResMLP:
+def create_resmlp(config: Union[ResMLPConfig, str], activation: Callable = nn.relu) -> UnifiedResMLP:
     """创建ResMLP模型
     
     Args:
