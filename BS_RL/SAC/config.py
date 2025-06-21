@@ -153,21 +153,23 @@ class NetworkConfig:
     activation:str = "gelu"
     # CartPole的观察是4维向量，网络用的(64,64)，那么通道的扩展倍数是64/4=16。若要借鉴的话：40*16=640
     # 但是data_reset主要是回合+账户仓位+时间特征信息，并不能对盈利起决定性作用故不应用太多维度和层数都不应过大？
+    # 卷积投影适合有空间结构的数据(相邻特征有时/空关系)，在这里用不合适
     ResMLP_rest: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
-            hidden_dims=[96, 96],
+            hidden_dims=[32, 32],
             skip_initial_ln=True,
-            residual_strategy=ResidualStrategy.CONV,
+            residual_strategy=ResidualStrategy.PROJECTION,
             dropout_rate=0.1,
-            name="conv_based",
-            description="使用卷积投影的配置，适合有空间结构的数据"
+            name="account_state",
+            description="账户状态数据处理配置"
         ))
     ResMLP_final: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
-            hidden_dims=[1024, 1024, 1024],
-            residual_strategy=ResidualStrategy.CONV,
+            hidden_dims=[512, 512, 512, 512, 512],
+            residual_strategy=ResidualStrategy.PROJECTION,  # 线性投影，适合特征融合
+            use_highway=True,                               # 门控机制，动态选择特征
             dropout_rate=0.1,
-            name="conv_based",
-            description="使用卷积投影的配置，适合有空间结构的数据"
-        ))
+            name="time_series+account_state_fusion",
+            description="时间序列+账户状态特征融合配置"
+    ))
 @dataclass
 class Args:
     train: TrainConfig = field(default_factory=TrainConfig)
