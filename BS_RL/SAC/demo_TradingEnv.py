@@ -2,11 +2,11 @@ import tyro
 from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
 from .train import train
 import os
-from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_size
+from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_size, RewardSchema
 
 if __name__ == "__main__":
     trading_timeframe = "5m"
-    reward_by_baseline = True
+    reward_schema = RewardSchema.exp_baseline
     encoder="kline"
     total_timesteps = int(200e6)
     resume = True
@@ -19,7 +19,7 @@ if __name__ == "__main__":
         data_path="/root/project/processed_data/",
         window_size_5m=int(4*60/5),
         trading_timeframe=trading_timeframe,
-        reward_by_baseline=reward_by_baseline
+        reward_schema=reward_schema
     )
     is_test = total_timesteps!=int(200e6)
     learning_starts = int(batch_size) if is_test else int(2e4)
