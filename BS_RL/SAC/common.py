@@ -5,6 +5,7 @@ from gymnasium.wrappers import FlattenObservation
 import collections
 import numpy as np
 import wandb
+import gymnasium
 
 class StatsAggregator:
     """A helper class to aggregate episode statistics."""
@@ -93,6 +94,7 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
         env = wrappers.NormalizationWrapper(env)
         env = wrappers.ObsWrapper(env)
         env = FlattenObservation(env)
+        env = FiniteCheck(env)
         return env
 
     return thunk
@@ -109,6 +111,14 @@ def eval_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader,
         env = wrappers.NormalizationWrapper(env)
         env = wrappers.ObsWrapper(env)
         env = FlattenObservation(env)
+        env = FiniteCheck(env)
         return env
 
     return thunk
+
+class FiniteCheck(gymnasium.Wrapper):
+    def step(self, action):
+        obs, r, term, trunc, info = super().step(action)
+        assert np.isfinite(obs).all(), "obs contains non-finite"
+        assert np.isfinite(r), "reward non-finite"
+        return obs, r, term, trunc, info
