@@ -94,7 +94,8 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
         env = wrappers.NormalizationWrapper(env)
         env = wrappers.ObsWrapper(env)
         env = FlattenObservation(env)
-        env = FiniteCheck(env)
+        # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
+        # env = FiniteCheck(env)
         return env
 
     return thunk
@@ -111,7 +112,8 @@ def eval_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader,
         env = wrappers.NormalizationWrapper(env)
         env = wrappers.ObsWrapper(env)
         env = FlattenObservation(env)
-        env = FiniteCheck(env)
+        # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
+        # env = FiniteCheck(env)
         return env
 
     return thunk
