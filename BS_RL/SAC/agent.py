@@ -37,19 +37,28 @@ class SACAgent:
 
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
         actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, dummy_obs, deterministic=True)['params']
+        actor_optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(learning_rate=algo_config.policy_lr, eps=algo_config.adam_eps),
+        )
         self.actor_state = TrainState.create(
             apply_fn=self.actor_model.apply,
             params=actor_params,
-            tx=optax.adamw(learning_rate=algo_config.policy_lr, eps=algo_config.adam_eps)
+            tx=actor_optimizer
         )
 
         self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
+        critic_optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps),
+        )
+
         qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, dummy_obs, deterministic=True)['params']
         self.qf1_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf1_params,
             target_params=qf1_params,
-            tx=optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps)
+            tx=critic_optimizer
         )
 
         qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, dummy_obs, deterministic=True)['params']
@@ -57,7 +66,7 @@ class SACAgent:
             apply_fn=self.critic_model.apply,
             params=qf2_params,
             target_params=qf2_params,
-            tx=optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps)
+            tx=critic_optimizer
         )
 
         if algo_config.autotune:
@@ -66,7 +75,7 @@ class SACAgent:
             self.log_alpha_state = TrainState.create(
                 apply_fn=None,
                 params=log_alpha_params,
-                tx=optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps)
+                tx=critic_optimizer
             )
             self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
         else:
