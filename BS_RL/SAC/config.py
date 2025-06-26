@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Union, Tuple, List
 from TradingEnv import EnvConfig as TradingEnvConfig
 from .nn.ResMLP import ResMLPConfig, ResidualStrategy, ActivationPosition, ResMLPPresets
+from .nn.ResNet1DEncoder import ResNet1DConfig, ResidualBlock1D
 @dataclass
 class EnvConfig:
     trading_env_config: TradingEnvConfig = field(default_factory=TradingEnvConfig)
@@ -99,12 +100,6 @@ class EvalConfig:
     data_path: str = "/root/project/processed_data/test_dataset/"
     """path to the evaluation dataset"""
 
-@dataclass
-class ResNet1DConfig:
-    """Configuration for a 1D ResNet encoder."""
-    stage_sizes: List[int]
-    num_filters: List[int]
-    stem_features: int = 64
 
 @dataclass
 class ConvNextConfig:
@@ -141,17 +136,24 @@ class NetworkConfig:
     convnext_layers_5m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=8, embed_dim=16)) # 48=128*0.375
     cnn1d_layers_1m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=8, embed_dim=16))
     cnn1d_layers_5m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=8, embed_dim=16))
-    resnet1d_layers_1m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(stage_sizes=[2, 2], num_filters=[64, 128]))
-    resnet1d_layers_5m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(stage_sizes=[2, 2], num_filters=[32, 64]))
+    # ResNet1D-34 的配置
+    resnet1d_layers_1m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(
+        stage_sizes=[3, 4, 6, 3],
+        block_cls=ResidualBlock1D,
+        ))
+    resnet1d_layers_5m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(
+        stage_sizes=[3, 4, 6, 3],
+        block_cls=ResidualBlock1D,
+        ))
     # 针对1m数据，shape为(30, 14)（序列短，噪声多）的配置
     kline_encoder_1m: KLineEncoderConfig = field(default_factory=lambda: KLineEncoderConfig(
         block_features=[64, 128, 128, 256, 256, 256],
-        kernel_sizes=[7, 5, 5, 3, 3, 3]
+        kernel_sizes=[7, 5, 5, 3, 3, 3],
     ))
     # 针对5m数据, shape为(48, 18)（序列长，趋势更明显）的配置
     kline_encoder_5m: KLineEncoderConfig = field(default_factory=lambda: KLineEncoderConfig(
         block_features=[64, 128, 256, 256, 512, 512, 512, 512],
-        kernel_sizes=[9, 7, 5, 5, 3, 3, 3, 3]
+        kernel_sizes=[9, 7, 5, 5, 3, 3, 3, 3],
     ))
 
     # # MLP configs

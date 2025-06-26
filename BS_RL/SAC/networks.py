@@ -5,7 +5,7 @@ from typing import List, Callable, Sequence
 from .config import NetworkConfig, ConvNextConfig, Cnn1DConfig, ResNet1DConfig
 from .nn.KlineEncoder import KLineEncoder
 from .nn.ResMLP import UnifiedResMLP, ResMLPConfig
-
+from .nn.ResNet1DEncoder import ResNet1DEncoder
 def get_activation(name: str) -> Callable:
     if name == "relu":
         return nn.relu
@@ -85,86 +85,6 @@ class Cnn1DEncoderBlock(nn.Module):
         y = nn.Dropout(rate=self.config.dropout_rate)(y, deterministic=deterministic)
 
         return residual + y
-
-class ResidualBlock1D(nn.Module):
-    """1D Residual Block for Pre-activation (ResNetV2)."""
-    features: int
-    strides: int
-    activation: Callable
-    
-    @nn.compact
-    def __call__(self, x, deterministic: bool):
-        residual = x
-        
-        # Pre-activation (ResNetV2 style)
-        y = nn.LayerNorm(name='norm1')(x)
-        y = self.activation(y)
-        y = nn.Conv(
-            features=self.features,
-            kernel_size=(3,),
-            strides=(self.strides,),
-            padding='SAME',
-            name='conv1'
-        )(y)
-        
-        y = nn.LayerNorm(name='norm2')(y)
-        y = self.activation(y)
-        y = nn.Conv(
-            features=self.features,
-            kernel_size=(3,),
-            padding='SAME',
-            name='conv2'
-        )(y)
-
-        # Shortcut connection
-        if residual.shape != y.shape:
-            residual = nn.Conv(
-                features=self.features,
-                kernel_size=(1,),
-                strides=(self.strides,),
-                name='shortcut_conv'
-            )(x)
-            
-        return residual + y
-
-class ResNet1DEncoder(nn.Module):
-    """1D ResNet Encoder."""
-    config: ResNet1DConfig
-    activation: Callable
-
-    @nn.compact
-    def __call__(self, x, deterministic: bool):
-
-        # Stem
-        x = nn.Conv(
-            features=self.config.stem_features,
-            kernel_size=(7,),
-            strides=(2,),
-            padding='SAME',
-            name='stem_conv'
-        )(x)
-        x = nn.LayerNorm(name='stem_norm')(x)
-        x = self.activation(x)
-        x = nn.max_pool(x, window_shape=(3,), strides=(2,), padding='SAME')
-
-        # Stages
-        for i, (num_blocks, features) in enumerate(zip(self.config.stage_sizes, self.config.num_filters)):
-            for j in range(num_blocks):
-                strides = 2 if j == 0 and i > 0 else 1
-                x = ResidualBlock1D(
-                    features=features,
-                    strides=strides,
-                    activation=self.activation,
-                    name=f'stage_{i+1}_block_{j+1}'
-                )(x, deterministic=deterministic)
-        
-        # In pre-activation mode, a final normalization and activation is applied before pooling.
-        x = nn.LayerNorm(name='final_encoder_norm')(x)
-        x = self.activation(x)
-        
-        # Global average pooling
-        return jnp.mean(x, axis=1)
-
 
 class TradingNetwork(nn.Module):
     network_config: NetworkConfig

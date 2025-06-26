@@ -8,7 +8,7 @@ from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_
 if __name__ == "__main__":
     trading_timeframe = "5m"
     reward_schema = RewardSchema.exp_baseline
-    encoder="kline"
+    encoder="resnet1d"
     total_timesteps = int(200e6)
     resume = True
     batch_size = 512
