@@ -26,7 +26,7 @@ class SACAgent:
         self.algo_config = algo_config
         self.action_dim = action_dim
         self.network_config = network_config
-        
+        self.norm_limit = 0.6 # 限制梯度范数<0.6
         key_actor, key_qf1, key_qf2, key_log_alpha = jax.random.split(key, 4)
         self.key_buffer = key
 
@@ -38,7 +38,7 @@ class SACAgent:
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
         actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, dummy_obs, deterministic=True)['params']
         actor_optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0),
+            optax.clip_by_global_norm(self.norm_limit),
             optax.adamw(learning_rate=algo_config.policy_lr, eps=algo_config.adam_eps),
         )
         self.actor_state = TrainState.create(
@@ -49,7 +49,7 @@ class SACAgent:
 
         self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
         critic_optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0),
+            optax.clip_by_global_norm(self.norm_limit),
             optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps),
         )
 

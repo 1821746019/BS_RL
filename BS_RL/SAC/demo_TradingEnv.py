@@ -1,3 +1,4 @@
+import numpy as np
 import tyro
 from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
 from .train import train
@@ -10,7 +11,7 @@ if __name__ == "__main__":
     encoder="kline"
     total_timesteps = int(200e6)
     resume = True
-    batch_size = 5120
+    batch_size = 512
     env_id = f"TradingEnv{trading_timeframe}"
     env_num = 96
     eval_env_num = 24 # 从48改为24减少评估耗时，若能实现异步评估就更好了
@@ -62,8 +63,8 @@ if __name__ == "__main__":
             target_network_frequency=int(8e3),
             gamma=0.99,
             tau=1, # Softer updates can be better for MLP envs, but 1.0 is also fine
-            policy_lr=3e-4*(batch_size/64)**0.5,
-            q_lr=3e-4*(batch_size/64)**0.5,
+            policy_lr=3e-4*np.log1p(batch_size/64), 
+            q_lr=3e-4*np.log1p(batch_size/64),
             autotune=True,
             target_entropy_scale=0.89, # Adjusted for CartPole (action space size 2)
                                       # Target entropy = -scale * log(1/action_dim)
