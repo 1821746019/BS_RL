@@ -24,10 +24,16 @@ class SACAgent:
                  ):
 
         self.algo_config = algo_config
+        # Convenience flag
+        self.use_twin_critic = self.algo_config.use_twin_critic
         self.action_dim = action_dim
         self.network_config = network_config
         self.norm_limit = 0.6 # 限制梯度范数<0.6
-        key_actor, key_qf1, key_qf2, key_log_alpha = jax.random.split(key, 4)
+        if self.use_twin_critic:
+            # We only need two keys if the critic shares backbone (one for critic params, one for actor, plus alpha)
+            key_actor, key_critic, key_log_alpha = jax.random.split(key, 3)
+        else:
+            key_actor, key_qf1, key_qf2, key_log_alpha = jax.random.split(key, 4)
         self.key_buffer = key
 
         if len(observation_space_shape) == 3:
@@ -47,27 +53,46 @@ class SACAgent:
             tx=actor_optimizer
         )
 
-        self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
         critic_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
             optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps),
         )
 
-        qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, dummy_obs, deterministic=True)['params']
-        self.qf1_state = CriticTrainState.create(
-            apply_fn=self.critic_model.apply,
-            params=qf1_params,
-            target_params=qf1_params,
-            tx=critic_optimizer
-        )
+        if self.use_twin_critic:
+            # Use TradingTwinCritic with shared backbone
+            from .networks import TradingTwinCritic  # Local import to avoid circular deps if any
+            self.critic_model = TradingTwinCritic(network_config=self.network_config, action_dim=self.action_dim)
 
-        qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, dummy_obs, deterministic=True)['params']
-        self.qf2_state = CriticTrainState.create(
-            apply_fn=self.critic_model.apply,
-            params=qf2_params,
-            target_params=qf2_params,
-            tx=critic_optimizer
-        )
+            critic_params = self.critic_model.init({'params': key_critic, 'dropout': key_critic}, dummy_obs, deterministic=True)['params']
+            critic_state = CriticTrainState.create(
+                apply_fn=self.critic_model.apply,
+                params=critic_params,
+                target_params=critic_params,
+                tx=critic_optimizer
+            )
+
+            # For compatibility we assign the same state to qf1_state and qf2_state
+            self.qf1_state = critic_state
+            self.qf2_state = critic_state
+        else:
+            # Original two independent critics
+            self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
+
+            qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, dummy_obs, deterministic=True)['params']
+            self.qf1_state = CriticTrainState.create(
+                apply_fn=self.critic_model.apply,
+                params=qf1_params,
+                target_params=qf1_params,
+                tx=critic_optimizer
+            )
+
+            qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, dummy_obs, deterministic=True)['params']
+            self.qf2_state = CriticTrainState.create(
+                apply_fn=self.critic_model.apply,
+                params=qf2_params,
+                target_params=qf2_params,
+                tx=critic_optimizer
+            )
 
         if algo_config.autotune:
             self.target_entropy = -algo_config.target_entropy_scale * jnp.log(1.0 / action_dim)
@@ -255,14 +280,159 @@ class SACAgent:
         return actor_state_new, log_alpha_state_to_return, current_alpha_to_return, actor_loss_val, actor_metrics
 
     @partial(jax.jit, static_argnums=(0,))
+    def _update_critic_shared(self,
+                              actor_state: TrainState,
+                              critic_state: CriticTrainState,
+                              log_alpha_input: Union[flax.core.FrozenDict, jnp.ndarray],
+                              data: dict,
+                              key: jax.random.PRNGKey):
+        """Critic update when Q1/Q2 share backbone (single parameter set with two heads)."""
+        if self.algo_config.autotune:
+            current_alpha = jnp.exp(log_alpha_input['log_alpha'])
+        else:
+            current_alpha = log_alpha_input
+
+        key_next_logits, key_q_target = jax.random.split(key)
+        next_logits = self.actor_model.apply(
+            {'params': actor_state.params}, data['next_observations'],
+            deterministic=False, rngs={'dropout': key_next_logits}
+        )
+        next_action_probs = nn.softmax(next_logits, axis=-1)
+        next_action_log_probs = nn.log_softmax(next_logits, axis=-1)
+
+        q1_next_target, q2_next_target = self.critic_model.apply(
+            {'params': critic_state.target_params}, data['next_observations'],
+            deterministic=True, rngs={'dropout': key_q_target}
+        )
+        min_qf_next_target = jnp.minimum(q1_next_target, q2_next_target)
+
+        next_q_value_components = next_action_probs * (min_qf_next_target - current_alpha * next_action_log_probs)
+        next_q_value = jnp.sum(next_q_value_components, axis=1)
+
+        target_q_values = data['rewards'] + (1.0 - data['dones']) * self.algo_config.gamma * next_q_value
+        target_q_values = jax.lax.stop_gradient(target_q_values)
+
+        def critic_loss_fn(params):
+            q1_all_actions, q2_all_actions = self.critic_model.apply(
+                {'params': params}, data['observations'],
+                deterministic=True, rngs={'dropout': key}
+            )
+            q1_taken_action = jnp.take_along_axis(q1_all_actions, data['actions'], axis=1).squeeze(-1)
+            q2_taken_action = jnp.take_along_axis(q2_all_actions, data['actions'], axis=1).squeeze(-1)
+            qf1_loss = ((q1_taken_action - target_q_values) ** 2).mean()
+            qf2_loss = ((q2_taken_action - target_q_values) ** 2).mean()
+            loss = (qf1_loss + qf2_loss) / 2.0
+            return loss, (qf1_loss, qf2_loss, q1_taken_action.mean(), q2_taken_action.mean())
+
+        (combined_loss, aux_vals), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(critic_state.params)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        combined_loss = jax.lax.pmean(combined_loss, axis_name='batch')
+        qf1_loss_val, qf2_loss_val, qf1_values_mean, qf2_values_mean = [jax.lax.pmean(v, axis_name='batch') for v in aux_vals]
+
+        critic_state_new = critic_state.apply_gradients(grads=grads)
+
+        metrics = {
+            'qf1_loss': qf1_loss_val,
+            'qf2_loss': qf2_loss_val,
+            'qf1_values': qf1_values_mean,
+            'qf2_values': qf2_values_mean
+        }
+        return critic_state_new, combined_loss, metrics
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _update_actor_and_alpha_shared(self,
+                                       actor_state: TrainState,
+                                       critic_state: CriticTrainState,
+                                       log_alpha_input: Union[TrainState, jnp.ndarray],
+                                       data: dict,
+                                       key: jax.random.PRNGKey):
+        key_actor, key_alpha = jax.random.split(key)
+        if self.algo_config.autotune:
+            actor_effective_alpha = jnp.exp(log_alpha_input.params['log_alpha'])
+        else:
+            actor_effective_alpha = log_alpha_input
+
+        def actor_loss_fn(actor_params):
+            logits = self.actor_model.apply(
+                {'params': actor_params}, data['observations'],
+                deterministic=False, rngs={'dropout': key_actor}
+            )
+            action_probs = nn.softmax(logits, axis=-1)
+            action_log_probs = nn.log_softmax(logits, axis=-1)
+
+            q1_all_actions, q2_all_actions = self.critic_model.apply(
+                {'params': critic_state.params}, data['observations'],
+                deterministic=True, rngs={'dropout': key_actor}
+            )
+            min_qf_values = jnp.minimum(q1_all_actions, q2_all_actions)
+            min_qf_values = jax.lax.stop_gradient(min_qf_values)
+
+            actor_loss_components = action_probs * (actor_effective_alpha * action_log_probs - min_qf_values)
+            loss = jnp.sum(actor_loss_components, axis=1).mean()
+
+            entropy = -jnp.sum((action_probs + 1e-8) * action_log_probs, axis=1).mean()
+            return loss, entropy
+
+        (actor_loss_val, entropy_val), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
+        actor_grads = jax.lax.pmean(actor_grads, axis_name='batch')
+        actor_loss_val = jax.lax.pmean(actor_loss_val, axis_name='batch')
+        entropy_val = jax.lax.pmean(entropy_val, axis_name='batch')
+        actor_state_new = actor_state.apply_gradients(grads=actor_grads)
+
+        alpha_loss_val = 0.0
+        log_alpha_state_to_return = log_alpha_input
+        current_alpha_to_return = actor_effective_alpha
+
+        if self.algo_config.autotune:
+            def alpha_loss_fn(log_alpha_params_dict):
+                logits_old_actor = self.actor_model.apply(
+                    {'params': actor_state.params}, data['observations'],
+                    deterministic=True, rngs={'dropout': key_alpha}
+                )
+                action_log_probs_old_actor = nn.log_softmax(logits_old_actor, axis=-1)
+                detached_log_probs = jax.lax.stop_gradient(action_log_probs_old_actor)
+
+                action_probs_old_actor = nn.softmax(logits_old_actor, axis=-1)
+                detached_probs = jax.lax.stop_gradient(action_probs_old_actor)
+
+                alpha_loss_components = detached_probs * (
+                    -jnp.exp(log_alpha_params_dict['log_alpha']) * (detached_log_probs + self.target_entropy)
+                )
+                loss = jnp.sum(alpha_loss_components, axis=1).mean()
+                return loss
+
+            alpha_loss_val_scalar, alpha_grads_dict = jax.value_and_grad(alpha_loss_fn)(log_alpha_input.params)
+            alpha_grads_dict = jax.lax.pmean(alpha_grads_dict, axis_name='batch')
+            alpha_loss_val = jax.lax.pmean(alpha_loss_val_scalar, axis_name='batch')
+
+            log_alpha_state_updated = log_alpha_input.apply_gradients(grads=alpha_grads_dict)
+            log_alpha_state_to_return = log_alpha_state_updated
+            current_alpha_to_return = jnp.exp(log_alpha_state_updated.params['log_alpha'])
+
+        actor_metrics = {
+            'actor_loss': actor_loss_val,
+            'alpha_loss': alpha_loss_val,
+            'alpha': current_alpha_to_return,
+            'entropy': entropy_val
+        }
+        return actor_state_new, log_alpha_state_to_return, current_alpha_to_return, actor_loss_val, actor_metrics
+
+    @partial(jax.jit, static_argnums=(0,))
     def update_target_networks(self, qf1_state: CriticTrainState, qf2_state: CriticTrainState):
-        qf1_state_new = qf1_state.replace(
-            target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, self.algo_config.tau)
-        )
-        qf2_state_new = qf2_state.replace(
-            target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, self.algo_config.tau)
-        )
-        return qf1_state_new, qf2_state_new
+        if self.use_twin_critic:
+            critic_state_new = qf1_state.replace(
+                target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, self.algo_config.tau)
+            )
+            # Return duplicated state for compatibility
+            return critic_state_new, critic_state_new
+        else:
+            qf1_state_new = qf1_state.replace(
+                target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, self.algo_config.tau)
+            )
+            qf2_state_new = qf2_state.replace(
+                target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, self.algo_config.tau)
+            )
+            return qf1_state_new, qf2_state_new
 
     # Combined update function
     @partial(jax.jit, static_argnums=(0,))
@@ -274,23 +444,30 @@ class SACAgent:
                    data: dict,
                    key: jax.random.PRNGKey
                    ):
-
-        key_critic, key_actor = jax.random.split(key)
-
-        alpha_arg_for_critic = log_alpha_input.params if self.algo_config.autotune and hasattr(log_alpha_input, 'params') else log_alpha_input
-        
-        qf1_state, qf2_state, critic_loss, critic_metrics = self._update_critic(
-            actor_state, qf1_state, qf2_state, 
-            alpha_arg_for_critic, 
-            data, key_critic
-        )
-        
-        actor_state, returned_log_alpha_state, returned_current_alpha, actor_loss, actor_alpha_metrics = self._update_actor_and_alpha(
-            actor_state, qf1_state, qf2_state, 
-            log_alpha_input, 
-            data,
-            key_actor
-        )
-        
-        all_metrics = {**critic_metrics, **actor_alpha_metrics, 'critic_loss_combined': critic_loss}
-        return actor_state, qf1_state, qf2_state, returned_log_alpha_state, returned_current_alpha, all_metrics
+        if self.use_twin_critic:
+            key_critic, key_actor = jax.random.split(key)
+            alpha_arg_for_critic = log_alpha_input.params if self.algo_config.autotune and hasattr(log_alpha_input, 'params') else log_alpha_input
+            critic_state = qf1_state  # since both are same
+            critic_state, critic_loss, critic_metrics = self._update_critic_shared(
+                actor_state, critic_state, alpha_arg_for_critic, data, key_critic
+            )
+            actor_state, returned_log_alpha_state, returned_current_alpha, actor_loss, actor_alpha_metrics = self._update_actor_and_alpha_shared(
+                actor_state, critic_state, log_alpha_input, data, key_actor
+            )
+            all_metrics = {**critic_metrics, **actor_alpha_metrics, 'critic_loss_combined': critic_loss}
+            # Return critic_state duplicated for compatibility
+            return actor_state, critic_state, critic_state, returned_log_alpha_state, returned_current_alpha, all_metrics
+        else:
+            # Original path
+            key_critic, key_actor = jax.random.split(key)
+            alpha_arg_for_critic = log_alpha_input.params if self.algo_config.autotune and hasattr(log_alpha_input, 'params') else log_alpha_input
+            qf1_state, qf2_state, critic_loss, critic_metrics = self._update_critic(
+                actor_state, qf1_state, qf2_state,
+                alpha_arg_for_critic,
+                data, key_critic
+            )
+            actor_state, returned_log_alpha_state, returned_current_alpha, actor_loss, actor_alpha_metrics = self._update_actor_and_alpha(
+                actor_state, qf1_state, qf2_state, log_alpha_input, data, key_actor
+            )
+            all_metrics = {**critic_metrics, **actor_alpha_metrics, 'critic_loss_combined': critic_loss}
+            return actor_state, qf1_state, qf2_state, returned_log_alpha_state, returned_current_alpha, all_metrics

@@ -209,3 +209,18 @@ class TradingCritic(nn.Module):
         features = activation_fn(features)
         q_values = nn.Dense(self.action_dim)(features)
         return q_values
+
+class TradingTwinCritic(nn.Module):
+    """Critic with shared feature extractor and two separate Q-value heads (Q1, Q2)."""
+    network_config: NetworkConfig
+    action_dim: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, deterministic: bool):
+        activation_fn = get_activation(self.network_config.activation)
+        features = TradingNetwork(network_config=self.network_config)(x, deterministic=deterministic)
+        features = nn.LayerNorm(name="final_norm")(features)
+        features = activation_fn(features)
+        q1_values = nn.Dense(self.action_dim, name="q1_head")(features)
+        q2_values = nn.Dense(self.action_dim, name="q2_head")(features)
+        return q1_values, q2_values
