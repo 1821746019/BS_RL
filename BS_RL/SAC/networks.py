@@ -101,11 +101,6 @@ class TradingNetwork(nn.Module):
         x_5m = x[:, dim_1m:dim_1m+dim_5m].reshape((-1, *self.network_config.shape_5m))
         x_rest = x[:, dim_1m+dim_5m:]
 
-        # Initial normalization
-        x_1m = nn.LayerNorm(name="initial_norm_1m")(x_1m)
-        x_5m = nn.LayerNorm(name="initial_norm_5m")(x_5m)
-        x_rest = nn.LayerNorm(name="initial_norm_rest")(x_rest)
-
         if self.network_config.encoder_type == 'convnext':
             x_1m_config = self.network_config.convnext_layers_1m
             x_5m_config = self.network_config.convnext_layers_5m
