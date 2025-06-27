@@ -8,10 +8,10 @@ from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_
 if __name__ == "__main__":
     trading_timeframe = "5m"
     reward_schema = RewardSchema.exp_baseline
-    encoder="resnet1d"
+    encoder="kline"
     total_timesteps = int(200e6)
     resume = True
-    batch_size = 512
+    batch_size = 256
     env_id = f"TradingEnv{trading_timeframe}"
     env_num = 96
     eval_env_num = 24 # 从48改为24减少评估耗时，若能实现异步评估就更好了

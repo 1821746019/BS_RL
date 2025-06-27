@@ -140,11 +140,11 @@ class NetworkConfig:
     cnn1d_layers_5m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=8, embed_dim=16))
     # ResNet1D-34 的配置
     resnet1d_layers_1m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(
-        stage_sizes=[3, 4, 6, 3],
+        stage_sizes=[2, 2, 2, 2],
         block_cls=ResidualBlock1D,
         ))
     resnet1d_layers_5m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(
-        stage_sizes=[3, 4, 6, 3],
+        stage_sizes=[2, 2, 2, 2],
         block_cls=ResidualBlock1D,
         ))
     # 针对1m数据，shape为(30, 14)（序列短，噪声多）的配置
@@ -168,14 +168,15 @@ class NetworkConfig:
     # 卷积投影适合有空间结构的数据(相邻特征有时/空关系)，在这里用不合适
     ResMLP_rest: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
             hidden_dims=[32, 32],
-            skip_initial_ln=True,
+            add_initial_embedding_layer=True,
             residual_strategy=ResidualStrategy.PROJECTION,
             dropout_rate=0.1,
             name="account_state",
             description="账户状态数据处理配置"
         ))
     ResMLP_final: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
-            hidden_dims=[512, 512, 512, 512, 512],
+            hidden_dims=[384, 384, 384, 384, 384],
+            add_initial_embedding_layer=True,
             residual_strategy=ResidualStrategy.PROJECTION,  # 线性投影，适合特征融合
             use_highway=True,                               # 门控机制，动态选择特征
             dropout_rate=0.1,

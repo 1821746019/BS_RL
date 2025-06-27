@@ -34,7 +34,7 @@ class ResMLPConfig:
     # 激活和归一化配置
     activation_position: Union[str, ActivationPosition] = ActivationPosition.PRE
     use_layer_norm: bool = True
-    skip_initial_ln: bool = False
+    add_initial_embedding_layer: bool = True
     skip_final_ln: bool = False
     
     # 投影配置
@@ -88,10 +88,10 @@ class ResMLPConfig:
             self.activation_position == ActivationPosition.PRE):
             print("警告: skip_final_ln在PRE激活模式下无效，因为没有post LayerNorm")
             
-        # skip_initial_ln只在有pre-activation时有用  
-        if (self.skip_initial_ln and 
+        # add_initial_embedding_layer只在有pre-activation时有用  
+        if (self.add_initial_embedding_layer and 
             self.activation_position == ActivationPosition.POST):
-            print("警告: skip_initial_ln在POST激活模式下无效，因为没有pre LayerNorm")
+            print("警告: add_initial_embedding_layer在POST激活模式下无效，因为没有pre LayerNorm")
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典，用于序列化"""
@@ -234,7 +234,10 @@ class UnifiedResMLP(nn.Module):
         """
         
         for i, dim in enumerate(self.config.hidden_dims):
-            input_x = x
+            if i == 0 and self.config.add_initial_embedding_layer:
+                input_x = nn.Dense(dim, kernel_init=self.kernel_init_fn, bias_init=self.bias_init_fn, name=f"embedding_{i}")(x)
+            else:
+                input_x = x
             
             # 计算残差连接的shortcut
             shortcut = self._compute_shortcut(input_x, dim, i)
@@ -303,8 +306,7 @@ class UnifiedResMLP(nn.Module):
         
         # Pre-activation
         if self.config.activation_position in [ActivationPosition.PRE, ActivationPosition.BOTH]:
-            if (self.config.use_layer_norm and 
-                not (self.config.skip_initial_ln and layer_idx == 0)):
+            if (self.config.use_layer_norm):
                 y = nn.LayerNorm(name=f"pre_norm_{layer_idx}")(y)
             y = self.activation(y)
         
