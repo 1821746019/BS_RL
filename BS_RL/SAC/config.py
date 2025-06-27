@@ -43,7 +43,7 @@ class AlgoConfig:
     """coefficient for scaling the autotune entropy target (e.g., 0.89 for Atari)"""
     # JAX-specific Adam epsilon, matching PyTorch default for fair comparison
     adam_eps: float = 1e-4 # CleanRL used 1e-4 for PyTorch Adam, default optax Adam is 1e-8.
-    use_twin_critic: bool = True #shared_critic_backbone
+    use_twin_critic: bool = False #shared_critic_backbone
     """If True, Q1 and Q2 critics will share a common feature extractor with separate output heads."""
 
 @dataclass
