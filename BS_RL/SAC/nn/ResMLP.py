@@ -222,7 +222,7 @@ class UnifiedResMLP(nn.Module):
             self.bias_init_fn = nn.initializers.zeros
     
     @nn.compact
-    def __call__(self, x, training: bool = True):
+    def __call__(self, x: jnp.ndarray, training: bool = True):
         """前向传播
         
         Args:
@@ -250,7 +250,7 @@ class UnifiedResMLP(nn.Module):
             
         return x
     
-    def _compute_shortcut(self, x, target_dim: int, layer_idx: int):
+    def _compute_shortcut(self, x: jnp.ndarray, target_dim: int, layer_idx: int):
         """计算残差连接的shortcut"""
         if self.config.residual_strategy == ResidualStrategy.NONE:
             return None
@@ -300,7 +300,7 @@ class UnifiedResMLP(nn.Module):
         else:
             raise ValueError(f"未知的残差策略: {self.config.residual_strategy}")
     
-    def _forward_branch(self, x, target_dim: int, layer_idx: int, training: bool):
+    def _forward_branch(self, x: jnp.ndarray, target_dim: int, layer_idx: int, training: bool):
         """计算主分支"""
         y = x
         
@@ -362,7 +362,7 @@ class UnifiedResMLP(nn.Module):
         
         return y
     
-    def _apply_residual(self, shortcut, y, input_x, target_dim: int):
+    def _apply_residual(self, shortcut, y, input_x: jnp.ndarray, target_dim: int):
         """应用残差连接"""
         if self.config.residual_strategy == ResidualStrategy.NONE:
             return y

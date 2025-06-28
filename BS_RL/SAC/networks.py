@@ -20,7 +20,7 @@ class DropPath(nn.Module):
     drop_prob: float
 
     @nn.compact
-    def __call__(self, x, deterministic: bool):
+    def __call__(self, x: jnp.ndarray, deterministic: bool):
         if self.drop_prob == 0.0 or deterministic:
             return x
         
@@ -36,7 +36,7 @@ class ConvNeXtBlock(nn.Module):
     activation: Callable
 
     @nn.compact
-    def __call__(self, x, deterministic: bool):
+    def __call__(self, x: jnp.ndarray, deterministic: bool):
         residual = x
         
         # 完整的预激活：Norm -> Activation -> Conv
@@ -71,7 +71,7 @@ class Cnn1DEncoderBlock(nn.Module):
     activation: Callable
 
     @nn.compact
-    def __call__(self, x, deterministic: bool):
+    def __call__(self, x: jnp.ndarray, deterministic: bool):
         residual = x
         
         y = nn.LayerNorm()(x)
@@ -179,7 +179,48 @@ class TradingNetwork(nn.Module):
         
         return final_features
 
-class TradingActor(nn.Module):
+LOG_STD_MAX = 2
+LOG_STD_MIN = -20
+
+class ContinuousTradingActor(nn.Module):
+    network_config: NetworkConfig
+    action_dim: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, deterministic: bool):
+        activation_fn = get_activation(self.network_config.activation)
+        features = TradingNetwork(network_config=self.network_config)(x, deterministic=deterministic)
+        features = nn.LayerNorm(name="final_norm")(features)
+        features = activation_fn(features)
+        
+        mean = nn.Dense(self.action_dim, name="mean")(features)
+        log_std = nn.Dense(self.action_dim, name="log_std")(features)
+        log_std = jnp.clip(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        
+        return mean, log_std
+
+class ContinuousTradingCritic(nn.Module):
+    network_config: NetworkConfig
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, action: jnp.ndarray, deterministic: bool):
+        activation_fn = get_activation(self.network_config.activation)
+        features = TradingNetwork(network_config=self.network_config)(x, deterministic=deterministic)
+        
+        combined = jnp.concatenate([features, action], axis=-1)
+        
+        # Simple MLP for Q-value
+        q = nn.Dense(256)(combined)
+        q = activation_fn(q)
+        q = nn.LayerNorm()(q)
+        q = nn.Dense(256)(q)
+        q = activation_fn(q)
+        q = nn.LayerNorm()(q)
+        q_value = nn.Dense(1)(q).squeeze(-1)
+        
+        return q_value
+
+class DiscreteTradingActor(nn.Module):
     network_config: NetworkConfig
     action_dim: int
 
@@ -192,7 +233,7 @@ class TradingActor(nn.Module):
         logits = nn.Dense(self.action_dim)(features)
         return logits
 
-class TradingCritic(nn.Module):
+class DiscreteTradingCritic(nn.Module):
     network_config: NetworkConfig
     action_dim: int
     

@@ -24,8 +24,8 @@ import joblib
 
 from .config import Args
 from .common import train_env_maker, MetricLogger, StatsAggregator
-from .networks import TradingActor, TradingCritic
-from .agent import SACAgent
+from .networks import DiscreteTradingActor, DiscreteTradingCritic, ContinuousTradingActor, ContinuousTradingCritic
+from .agent import SACAgentDiscrete, SACAgentContinuous
 from .eval import Evaluator
 from TradingEnv import DataLoader
 import wandb
@@ -59,6 +59,7 @@ class Trainer:
         self.data_loader = None
         self.evaluator = None
         self.logger = None
+        self.is_discrete = True
 
     def setup(self):
         self._setup_paths_and_run_name()
@@ -189,16 +190,26 @@ class Trainer:
                 data_loader=self.data_loader
             ) for i in range(self.args.env.env_num)]
         )
-        assert isinstance(self.envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported by this SAC version"
+        self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
+        if not self.is_discrete:
+            print("Continuous action space detected.")
 
     def _setup_agent(self):
         obs_shape = self.envs.single_observation_space.shape
-        action_dim = self.envs.single_action_space.n
 
-        actor_model_cls, critic_model_cls = TradingActor, TradingCritic
-        
+        if self.is_discrete:
+            action_dim = self.envs.single_action_space.n
+            actor_model_cls, critic_model_cls = DiscreteTradingActor, DiscreteTradingCritic
+            agent_cls = SACAgentDiscrete
+            print(f"Using Discrete SAC with action dim: {action_dim}")
+        else:
+            action_dim = self.envs.single_action_space.shape[0]
+            actor_model_cls, critic_model_cls = ContinuousTradingActor, ContinuousTradingCritic
+            agent_cls = SACAgentContinuous
+            print(f"Using Continuous SAC with action dim: {action_dim}")
+
         key_agent, self.key = jax.random.split(self.key)
-        self.agent = SACAgent(
+        self.agent = agent_cls(
             action_dim=action_dim,
             observation_space_shape=obs_shape,
             key=key_agent,
@@ -419,9 +430,16 @@ class Trainer:
     def _agent_update(self, current_step):
         self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
         data = self.rb.sample(self.args.algo.batch_size)
+
+        actions_np = data.actions.numpy()
+        if self.is_discrete:
+            actions_np = actions_np.astype(np.int32)
+
         data_numpy = {
-            'observations': data.observations.numpy(), 'actions': data.actions.numpy().astype(np.int32),
-            'next_observations': data.next_observations.numpy(), 'rewards': data.rewards.numpy().flatten(),
+            'observations': data.observations.numpy(), 
+            'actions': actions_np,
+            'next_observations': data.next_observations.numpy(), 
+            'rewards': data.rewards.numpy().flatten(),
             'dones': data.dones.numpy().flatten()
         }
         sharded_data = {k: v.reshape(self.num_devices, self.batch_size_per_device, *v.shape[1:]) for k, v in data_numpy.items()}
