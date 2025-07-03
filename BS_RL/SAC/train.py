@@ -24,7 +24,7 @@ import joblib
 
 from .config import Args
 from .common import train_env_maker, MetricLogger, StatsAggregator
-from .networks import DiscreteTradingActor, DiscreteTradingCritic, ContinuousTradingActor, ContinuousTradingCritic
+from .networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
 from .agent import SACAgentDiscrete, SACAgentContinuous
 from .eval import Evaluator
 from TradingEnv import DataLoader
@@ -199,12 +199,12 @@ class Trainer:
 
         if self.is_discrete:
             action_dim = self.envs.single_action_space.n
-            actor_model_cls, critic_model_cls = DiscreteTradingActor, DiscreteTradingCritic
+            actor_model_cls, critic_model_cls = TradingActorDiscrete, TradingCriticDiscrete
             agent_cls = SACAgentDiscrete
             print(f"Using Discrete SAC with action dim: {action_dim}")
         else:
             action_dim = self.envs.single_action_space.shape[0]
-            actor_model_cls, critic_model_cls = ContinuousTradingActor, ContinuousTradingCritic
+            actor_model_cls, critic_model_cls = TradingActorContinuous, TradingCriticContinuous
             agent_cls = SACAgentContinuous
             print(f"Using Continuous SAC with action dim: {action_dim}")
 

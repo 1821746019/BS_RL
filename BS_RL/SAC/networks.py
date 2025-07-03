@@ -182,7 +182,7 @@ class TradingNetwork(nn.Module):
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
 
-class ContinuousTradingActor(nn.Module):
+class TradingActorContinuous(nn.Module):
     network_config: NetworkConfig
     action_dim: int
 
@@ -199,7 +199,7 @@ class ContinuousTradingActor(nn.Module):
         
         return mean, log_std
 
-class ContinuousTradingCritic(nn.Module):
+class TradingCriticContinuous(nn.Module):
     network_config: NetworkConfig
     
     @nn.compact
@@ -220,7 +220,7 @@ class ContinuousTradingCritic(nn.Module):
         
         return q_value
 
-class DiscreteTradingActor(nn.Module):
+class TradingActorDiscrete(nn.Module):
     network_config: NetworkConfig
     action_dim: int
 
@@ -233,7 +233,7 @@ class DiscreteTradingActor(nn.Module):
         logits = nn.Dense(self.action_dim)(features)
         return logits
 
-class DiscreteTradingCritic(nn.Module):
+class TradingCriticDiscrete(nn.Module):
     network_config: NetworkConfig
     action_dim: int
     

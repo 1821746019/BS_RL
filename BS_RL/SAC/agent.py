@@ -9,12 +9,110 @@ from typing import Union
 import tensorflow_probability.substrates.jax.distributions as tfd
 
 from .config import AlgoConfig, NetworkConfig
-from .networks import DiscreteTradingActor, DiscreteTradingCritic, ContinuousTradingActor, ContinuousTradingCritic
+from .networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
 
 class CriticTrainState(TrainState):
     target_params: flax.core.FrozenDict
 
-class SACAgentDiscrete:
+class SACAgentBase:
+    def __init__(self,
+                 action_dim: int,
+                 observation_space_shape,
+                 key: jax.random.PRNGKey,
+                 network_config: NetworkConfig,
+                 algo_config: AlgoConfig,
+                 actor_model_cls,
+                 critic_model_cls,
+                 norm_limit: float
+                 ):
+
+        self.algo_config = algo_config
+        self.action_dim = action_dim
+        self.network_config = network_config
+        self.norm_limit = norm_limit
+        key_actor, key_qf1, key_qf2, key_log_alpha = jax.random.split(key, 4)
+        self.key_buffer = key
+
+        if len(observation_space_shape) == 3:
+            self.dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
+        else:
+            self.dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
+
+        critic_optimizer = self._create_models_and_states(
+            key_actor, key_qf1, key_qf2,
+            actor_model_cls, critic_model_cls
+        )
+        
+        self.log_alpha_state = None
+        self.target_entropy = 0.0
+
+        if algo_config.autotune:
+            self._setup_autotune(key_log_alpha, critic_optimizer)
+            self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
+        else:
+            self.current_alpha = jnp.array(algo_config.alpha, dtype=jnp.float32)
+
+    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls, critic_model_cls) -> optax.GradientTransformation:
+        raise NotImplementedError
+
+    def _setup_autotune(self, key_log_alpha, critic_optimizer: optax.GradientTransformation):
+        raise NotImplementedError
+
+    @partial(jax.jit, static_argnums=(0, 4))
+    def select_action(self, actor_params: flax.core.FrozenDict, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
+        raise NotImplementedError
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _update_critic(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
+        raise NotImplementedError
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _update_actor_and_alpha(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
+        raise NotImplementedError
+
+    @partial(jax.jit, static_argnums=(0,))
+    def update_target_networks(self, qf1_state: CriticTrainState, qf2_state: CriticTrainState):
+        qf1_state_new = qf1_state.replace(
+            target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, self.algo_config.tau)
+        )
+        qf2_state_new = qf2_state.replace(
+            target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, self.algo_config.tau)
+        )
+        return qf1_state_new, qf2_state_new
+
+    # Combined update function
+    @partial(jax.jit, static_argnums=(0,))
+    def update_all(self,
+                   actor_state: TrainState,
+                   qf1_state: CriticTrainState,
+                   qf2_state: CriticTrainState,
+                   log_alpha_input: Union[TrainState, flax.core.FrozenDict, jnp.ndarray],
+                   data: dict,
+                   key: jax.random.PRNGKey
+                   ):
+
+        key_critic, key_actor = jax.random.split(key)
+
+        alpha_arg_for_critic = log_alpha_input.params if self.algo_config.autotune and hasattr(log_alpha_input, 'params') else log_alpha_input
+        
+        qf1_state, qf2_state, critic_loss, critic_metrics = self._update_critic(
+            actor_state, qf1_state, qf2_state, 
+            alpha_arg_for_critic, 
+            data, key_critic
+        )
+        
+        actor_state, returned_log_alpha_state, returned_current_alpha, actor_loss, actor_alpha_metrics = self._update_actor_and_alpha(
+            actor_state, qf1_state, qf2_state, 
+            log_alpha_input, 
+            data,
+            key_actor
+        )
+        
+        all_metrics = {**critic_metrics, **actor_alpha_metrics, 'critic_loss_combined': critic_loss}
+        return actor_state, qf1_state, qf2_state, returned_log_alpha_state, returned_current_alpha, all_metrics
+
+
+class SACAgentDiscrete(SACAgentBase):
     def __init__(self,
                  action_dim: int,
                  observation_space_shape,
@@ -24,24 +122,24 @@ class SACAgentDiscrete:
                  actor_model_cls,
                  critic_model_cls
                  ):
+        super().__init__(
+            action_dim=action_dim,
+            observation_space_shape=observation_space_shape,
+            key=key,
+            network_config=network_config,
+            algo_config=algo_config,
+            actor_model_cls=actor_model_cls,
+            critic_model_cls=critic_model_cls,
+            norm_limit=0.6
+        )
 
-        self.algo_config = algo_config
-        self.action_dim = action_dim
-        self.network_config = network_config
-        self.norm_limit = 0.6 # 限制梯度范数<0.6
-        key_actor, key_qf1, key_qf2, key_log_alpha = jax.random.split(key, 4)
-        self.key_buffer = key
-
-        if len(observation_space_shape) == 3:
-            dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
-        else:
-            dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
-
+    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls, critic_model_cls):
+        # Actor setup
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, dummy_obs, deterministic=True)['params']
+        actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, self.dummy_obs, deterministic=True)['params']
         actor_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
-            optax.adamw(learning_rate=algo_config.policy_lr, eps=algo_config.adam_eps),
+            optax.adamw(learning_rate=self.algo_config.policy_lr, eps=self.algo_config.adam_eps),
         )
         self.actor_state = TrainState.create(
             apply_fn=self.actor_model.apply,
@@ -49,13 +147,14 @@ class SACAgentDiscrete:
             tx=actor_optimizer
         )
 
+        # Critic setup
         self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
         critic_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
-            optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps),
+            optax.adamw(learning_rate=self.algo_config.q_lr, eps=self.algo_config.adam_eps),
         )
 
-        qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, dummy_obs, deterministic=True)['params']
+        qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, self.dummy_obs, deterministic=True)['params']
         self.qf1_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf1_params,
@@ -63,27 +162,23 @@ class SACAgentDiscrete:
             tx=critic_optimizer
         )
 
-        qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, dummy_obs, deterministic=True)['params']
+        qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, self.dummy_obs, deterministic=True)['params']
         self.qf2_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf2_params,
             target_params=qf2_params,
             tx=critic_optimizer
         )
-
-        if algo_config.autotune:
-            self.target_entropy = -algo_config.target_entropy_scale * jnp.log(1.0 / action_dim)
-            log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
-            self.log_alpha_state = TrainState.create(
-                apply_fn=None,
-                params=log_alpha_params,
-                tx=critic_optimizer
-            )
-            self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
-        else:
-            self.current_alpha = jnp.array(algo_config.alpha, dtype=jnp.float32)
-            self.log_alpha_state = None
-            self.target_entropy = 0.0
+        return critic_optimizer
+    
+    def _setup_autotune(self, key_log_alpha, critic_optimizer: optax.GradientTransformation):
+        self.target_entropy = -self.algo_config.target_entropy_scale * jnp.log(1.0 / self.action_dim)
+        log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
+        self.log_alpha_state = TrainState.create(
+            apply_fn=None,
+            params=log_alpha_params,
+            tx=critic_optimizer
+        )
 
     @partial(jax.jit, static_argnums=(0, 4))
     def select_action(self, actor_params: flax.core.FrozenDict, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
@@ -256,73 +351,36 @@ class SACAgentDiscrete:
         
         return actor_state_new, log_alpha_state_to_return, current_alpha_to_return, actor_loss_val, actor_metrics
 
-    @partial(jax.jit, static_argnums=(0,))
-    def update_target_networks(self, qf1_state: CriticTrainState, qf2_state: CriticTrainState):
-        qf1_state_new = qf1_state.replace(
-            target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, self.algo_config.tau)
-        )
-        qf2_state_new = qf2_state.replace(
-            target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, self.algo_config.tau)
-        )
-        return qf1_state_new, qf2_state_new
-
-    # Combined update function
-    @partial(jax.jit, static_argnums=(0,))
-    def update_all(self,
-                   actor_state: TrainState,
-                   qf1_state: CriticTrainState,
-                   qf2_state: CriticTrainState,
-                   log_alpha_input: Union[TrainState, flax.core.FrozenDict, jnp.ndarray],
-                   data: dict,
-                   key: jax.random.PRNGKey
-                   ):
-
-        key_critic, key_actor = jax.random.split(key)
-
-        alpha_arg_for_critic = log_alpha_input.params if self.algo_config.autotune and hasattr(log_alpha_input, 'params') else log_alpha_input
-        
-        qf1_state, qf2_state, critic_loss, critic_metrics = self._update_critic(
-            actor_state, qf1_state, qf2_state, 
-            alpha_arg_for_critic, 
-            data, key_critic
-        )
-        
-        actor_state, returned_log_alpha_state, returned_current_alpha, actor_loss, actor_alpha_metrics = self._update_actor_and_alpha(
-            actor_state, qf1_state, qf2_state, 
-            log_alpha_input, 
-            data,
-            key_actor
-        )
-        
-        all_metrics = {**critic_metrics, **actor_alpha_metrics, 'critic_loss_combined': critic_loss}
-        return actor_state, qf1_state, qf2_state, returned_log_alpha_state, returned_current_alpha, all_metrics
-
-class SACAgentContinuous:
+class SACAgentContinuous(SACAgentBase):
     def __init__(self,
                  action_dim: int,
                  observation_space_shape,
                  key: jax.random.PRNGKey,
                  network_config: NetworkConfig,
                  algo_config: AlgoConfig,
-                 actor_model_cls=ContinuousTradingActor,
-                 critic_model_cls=ContinuousTradingCritic
+                 actor_model_cls=TradingActorContinuous,
+                 critic_model_cls=TradingCriticContinuous
                  ):
+        super().__init__(
+            action_dim=action_dim,
+            observation_space_shape=observation_space_shape,
+            key=key,
+            network_config=network_config,
+            algo_config=algo_config,
+            actor_model_cls=actor_model_cls,
+            critic_model_cls=critic_model_cls,
+            norm_limit=1.0
+        )
 
-        self.algo_config = algo_config
-        self.action_dim = action_dim
-        self.network_config = network_config
-        self.norm_limit = 1.0 
-        key_actor, key_qf1, key_qf2, key_log_alpha = jax.random.split(key, 4)
-        self.key_buffer = key
-
-        dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
-        dummy_action = jnp.zeros((1, action_dim), dtype=jnp.float32)
-
+    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls, critic_model_cls):
+        dummy_action = jnp.zeros((1, self.action_dim), dtype=jnp.float32)
+        
+        # Actor setup
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, dummy_obs, deterministic=True)['params']
+        actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, self.dummy_obs, deterministic=True)['params']
         actor_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
-            optax.adamw(learning_rate=algo_config.policy_lr, eps=algo_config.adam_eps),
+            optax.adamw(learning_rate=self.algo_config.policy_lr, eps=self.algo_config.adam_eps),
         )
         self.actor_state = TrainState.create(
             apply_fn=self.actor_model.apply,
@@ -330,13 +388,14 @@ class SACAgentContinuous:
             tx=actor_optimizer
         )
 
+        # Critic setup
         self.critic_model = critic_model_cls(network_config=self.network_config)
         critic_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
-            optax.adamw(learning_rate=algo_config.q_lr, eps=algo_config.adam_eps),
+            optax.adamw(learning_rate=self.algo_config.q_lr, eps=self.algo_config.adam_eps),
         )
 
-        qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, dummy_obs, dummy_action, deterministic=True)['params']
+        qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, self.dummy_obs, dummy_action, deterministic=True)['params']
         self.qf1_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf1_params,
@@ -344,27 +403,23 @@ class SACAgentContinuous:
             tx=critic_optimizer
         )
 
-        qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, dummy_obs, dummy_action, deterministic=True)['params']
+        qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, self.dummy_obs, dummy_action, deterministic=True)['params']
         self.qf2_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf2_params,
             target_params=qf2_params,
             tx=critic_optimizer
         )
-        
-        if algo_config.autotune:
-            self.target_entropy = -float(self.action_dim)
-            log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
-            self.log_alpha_state = TrainState.create(
-                apply_fn=None,
-                params=log_alpha_params,
-                tx=critic_optimizer
-            )
-            self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
-        else:
-            self.current_alpha = jnp.array(algo_config.alpha, dtype=jnp.float32)
-            self.log_alpha_state = None
-            self.target_entropy = 0.0
+        return critic_optimizer
+
+    def _setup_autotune(self, key_log_alpha, critic_optimizer: optax.GradientTransformation):
+        self.target_entropy = -float(self.action_dim)
+        log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
+        self.log_alpha_state = TrainState.create(
+            apply_fn=None,
+            params=log_alpha_params,
+            tx=critic_optimizer
+        )
 
     def _get_action_dist(self, actor_params, obs, key_dropout, deterministic):
         mean, log_std = self.actor_model.apply(
@@ -493,30 +548,3 @@ class SACAgentContinuous:
         actor_metrics = {'actor_loss': actor_loss_val, 'alpha_loss': alpha_loss_val, 'alpha': current_alpha_to_return, 'entropy': entropy_val}
         
         return actor_state_new, log_alpha_state_to_return, current_alpha_to_return, actor_loss_val, actor_metrics
-        
-    @partial(jax.jit, static_argnums=(0,))
-    def update_target_networks(self, qf1_state: CriticTrainState, qf2_state: CriticTrainState):
-        qf1_state_new = qf1_state.replace(
-            target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, self.algo_config.tau)
-        )
-        qf2_state_new = qf2_state.replace(
-            target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, self.algo_config.tau)
-        )
-        return qf1_state_new, qf2_state_new
-
-    @partial(jax.jit, static_argnums=(0,))
-    def update_all(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
-        key_critic, key_actor = jax.random.split(key)
-
-        alpha_arg_for_critic = log_alpha_input.params if self.algo_config.autotune and hasattr(log_alpha_input, 'params') else log_alpha_input
-        
-        qf1_state, qf2_state, critic_loss, critic_metrics = self._update_critic(
-            actor_state, qf1_state, qf2_state, alpha_arg_for_critic, data, key_critic
-        )
-        
-        actor_state, returned_log_alpha_state, returned_current_alpha, actor_loss, actor_alpha_metrics = self._update_actor_and_alpha(
-            actor_state, qf1_state, qf2_state, log_alpha_input, data, key_actor
-        )
-        
-        all_metrics = {**critic_metrics, **actor_alpha_metrics, 'critic_loss_combined': critic_loss}
-        return actor_state, qf1_state, qf2_state, returned_log_alpha_state, returned_current_alpha, all_metrics
