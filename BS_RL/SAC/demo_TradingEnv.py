@@ -5,8 +5,12 @@ from .train import train
 import os
 from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_size, RewardSchema
 
+def valid_step_to_gamma(valid_step: int):
+    return 1-1/valid_step
+
 if __name__ == "__main__":
     trading_timeframe = "5m"
+    valid_step = 2*60/int(trading_timeframe[:-1]) #让agent只关注未来2h的reward
     reward_schema = RewardSchema.exp_baseline
     encoder="kline"
     total_timesteps = int(200e6)
@@ -61,14 +65,12 @@ if __name__ == "__main__":
             batch_size=batch_size,
             update_frequency=4, # Update more frequently for simpler envs
             target_network_frequency=int(8e3),
-            gamma=0.99,
+            gamma=valid_step_to_gamma(valid_step), 
             tau=1, # Softer updates can be better for MLP envs, but 1.0 is also fine
             policy_lr=3e-4*np.log1p(batch_size/64), 
             q_lr=3e-4*np.log1p(batch_size/64),
             autotune=True,
-            target_entropy_scale=0.89, # Adjusted for CartPole (action space size 2)
-                                      # Target entropy = -scale * log(1/action_dim)
-                                      # For CartPole (2 actions): -0.7 * log(0.5) approx 0.48
+            target_entropy_scale=0.89*(6/11), # 无操作(1)、多空减减仓(4)、其它的权重视为(1)
             adam_eps=1e-4
         ),
         wandb=WandbConfig(
