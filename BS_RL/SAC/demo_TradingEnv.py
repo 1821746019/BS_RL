@@ -3,8 +3,7 @@ import tyro
 from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
 from .train import train
 import os
-from TradingEnv import EnvConfig as TradingEnvConfig, get_discrete_action_space_size, RewardSchema, DeathPenaltySchema
-
+from TradingEnv import TradingEnvConfig as TradingEnvConfig, RewardSchema
 def valid_step_to_gamma(valid_step: int):
     return 1-1/valid_step
 
@@ -12,21 +11,19 @@ if __name__ == "__main__":
     trading_timeframe = "5m"
     valid_step = 2*60/int(trading_timeframe[:-1]) #让agent只关注未来2h的reward
     reward_schema = RewardSchema.exp_baseline
-    death_penalty_schema = DeathPenaltySchema.fixed
     encoder="kline"
     total_timesteps = int(200e6)
     resume = True
     batch_size = 256
     env_id = f"TradingEnv{trading_timeframe}"
     env_num = 96
-    eval_env_num = 24 # 从48改为24减少评估耗时，若能实现异步评估就更好了
+    eval_env_num = 12 # 从48改为12减少评估耗时，若能实现异步评估就更好了
     eval_episodes = eval_env_num
     trading_env_config = TradingEnvConfig(
         data_path="/root/project/processed_data/",
         window_size_5m=int(4*60/5),
-        trading_timeframe=trading_timeframe,
-        reward_schema=reward_schema,
-        death_penalty_schema=death_penalty_schema
+        timeframe_minutes=trading_timeframe,
+        reward_schema=reward_schema
     )
     is_test = total_timesteps!=int(200e6)
     learning_starts = int(batch_size) if is_test else int(2e4)

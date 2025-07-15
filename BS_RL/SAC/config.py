@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass, field
 from typing import Optional, Union, Tuple, List
-from TradingEnv import EnvConfig as TradingEnvConfig
+from TradingEnv import TradingEnvConfig as TradingEnvConfig
 from .nn.ResMLP import ResMLPConfig, ResidualStrategy, ActivationPosition, ResMLPPresets
 from .nn.ResNet1DEncoder import ResNet1DConfig, ResidualBlock1D
 @dataclass

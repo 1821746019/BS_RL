@@ -4,14 +4,14 @@ import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
-from .agent import SACAgentDiscrete
+from .agent import SACAgentBase
 from .common import eval_env_maker, MetricLogger, StatsAggregator
 from .config import EnvConfig, EvalConfig
 from TradingEnv import DataLoader
 
 class Evaluator:
     def __init__(self,
-                 agent: SACAgentDiscrete,
+                 agent: SACAgentBase,
                  env_config: EnvConfig,
                  eval_config: EvalConfig,
                  run_name_suffix: str,
@@ -24,7 +24,7 @@ class Evaluator:
         self.eval_envs = None
 
         eval_trading_config = copy.deepcopy(self.env_config.trading_env_config)
-        eval_trading_config.data_path = self.eval_config.data_path
+        # eval_trading_config.data_path = self.eval_config.data_path
         self.data_loader = DataLoader(eval_trading_config)
 
         if self.eval_config.cache_env:
@@ -87,8 +87,8 @@ class Evaluator:
                             self.logger.log_env0_episode(info["episode"], current_train_step, prefix="eval")
                         
                         stats_aggregator.add(info["episode"])
-                        episode_return = info["episode"]["r"]
-                        episode_length = info["episode"]["l"]
+                        episode_return = float(info["episode"]["r"])
+                        episode_length = int(info["episode"]["l"])
                         print(f"Eval Episode {len(stats_aggregator.buffer)}/{num_episodes}: Return={episode_return:.2f}, Length={episode_length}")
                         if len(stats_aggregator.buffer) >= num_episodes:
                             break

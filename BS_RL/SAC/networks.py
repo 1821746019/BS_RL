@@ -93,6 +93,17 @@ class TradingNetwork(nn.Module):
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         activation_fn = get_activation(self.network_config.activation)
         
+        # 检查是否为简单向量输入（如gym环境）
+        if (self.network_config.encoder_type == "none" or 
+            (self.network_config.shape_1m[0] == 0 and self.network_config.shape_5m[0] == 0)):
+            # 简单向量输入，直接使用最终MLP处理
+            final_features = UnifiedResMLP(
+                config=self.network_config.ResMLP_final, 
+                activation=activation_fn
+            )(x)
+            return final_features
+        
+        # 原有的交易环境处理逻辑
         # Split and reshape
         dim_1m = self.network_config.shape_1m[0] * self.network_config.shape_1m[1]
         dim_5m = self.network_config.shape_5m[0] * self.network_config.shape_5m[1]
