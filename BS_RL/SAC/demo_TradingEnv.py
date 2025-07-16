@@ -1,17 +1,15 @@
+from .common import valid_step_to_gamma
 import numpy as np
 import tyro
 from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
 from .train import train
 import os
 from TradingEnv import TradingEnvConfig as TradingEnvConfig, RewardSchema
-def valid_step_to_gamma(valid_step: int):
-    return 1-1/valid_step
-
 if __name__ == "__main__":
     trading_timeframe = "5m"
-    valid_step = 2*60/int(trading_timeframe[:-1]) #让agent只关注未来2h的reward
+    valid_step = 100 #2*60/int(trading_timeframe[:-1]) #让agent只关注未来2h的reward
     reward_schema = RewardSchema.exp_baseline
-    encoder="kline"
+    encoder="none"
     total_timesteps = int(200e6)
     resume = True
     batch_size = 256
@@ -21,7 +19,6 @@ if __name__ == "__main__":
     eval_episodes = eval_env_num
     trading_env_config = TradingEnvConfig(
         data_path="/root/project/processed_data/",
-        window_size_5m=int(4*60/5),
         timeframe_minutes=trading_timeframe,
         reward_schema=reward_schema
     )
@@ -53,8 +50,7 @@ if __name__ == "__main__":
         ),
         network=NetworkConfig(
             encoder_type=encoder,
-            shape_1m=(trading_env_config.window_size_1m, trading_env_config.kline_dim_1m),
-            shape_5m=(trading_env_config.window_size_5m, trading_env_config.kline_dim_5m),
+            shape_tickers_positions=(trading_env_config.window_size, trading_env_config.kline_dim_5m),
             # encoder_type 默认为 "convnext". 若要使用 transformer, 设置: encoder_type="transformer"
         ),
         algo=AlgoConfig(
@@ -73,7 +69,7 @@ if __name__ == "__main__":
             adam_eps=1e-4
         ),
         wandb=WandbConfig(
-            project_name="SAC-Discrete_TradingEnv",
+            project_name="SAC_TradingEnv",
             entity=None # Your WandB entity
         )
     )

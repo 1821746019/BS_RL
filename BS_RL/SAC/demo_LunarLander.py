@@ -110,7 +110,6 @@ if __name__ == "__main__":
             env_num=eval_env_num,
             async_vector_env=False,
             capture_media=True,  # 记录视频
-            data_path="",  # gym环境不需要data_path
         ),
         env=EnvConfig(
             trading_env_config=TradingEnvConfig(),  # 提供默认配置，但不会使用
@@ -119,8 +118,7 @@ if __name__ == "__main__":
         ),
         network=NetworkConfig(
             # LunarLander不需要时间序列编码器，直接用MLP
-            shape_1m=(0, 0),  # 不使用
-            shape_5m=(0, 0),  # 不使用
+            shape_tickers_positions=(0, 0),  # 不使用
             encoder_type="none",  # 标记为不使用编码器
             
             # 为8维观察空间设计的ResMLP配置

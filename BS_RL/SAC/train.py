@@ -12,6 +12,7 @@ import shutil
 import pickle
 import collections
 import gymnasium as gym
+from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -46,7 +47,7 @@ class Trainer:
         self.key = None
         self.key_actions_base = None
         self.key_update_base = None
-        self.envs = None
+        self.envs: AsyncVectorEnv| SyncVectorEnv
         self.agent = None
         self.rb = None
         self.actor_state = None
@@ -59,7 +60,7 @@ class Trainer:
         self.data_loader = None
         self.evaluator = None
         self.logger = None
-        self.is_discrete = True
+        self.is_discrete: bool
 
     def setup(self):
         self._setup_paths_and_run_name()
@@ -72,6 +73,7 @@ class Trainer:
         self._setup_agent()
         self._setup_replay_buffer()
         self._setup_evaluator()
+        self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
 
     def _setup_paths_and_run_name(self):
         run_name_suffix = f"{self.args.train.exp_name}__{self.args.env.seed}__{int(time.time())}"
@@ -177,12 +179,12 @@ class Trainer:
 
     def _setup_data_loader(self):
         print("Initializing Trainer's DataLoader...")
-        self.data_loader = DataLoader(self.args.env.trading_env_config)
+        self.data_loader = DataLoader(self.args.env.trading_env_config.data_loader_config)
         print("DataLoader initialized.")
 
     def _setup_environments(self):
         print("Creating training environments...")
-        vec_env_cls = gym.vector.AsyncVectorEnv if self.args.train.async_vector_env else gym.vector.SyncVectorEnv
+        vec_env_cls = AsyncVectorEnv if self.args.train.async_vector_env else SyncVectorEnv
         self.envs = vec_env_cls(
             [train_env_maker(
                 seed=self.args.env.seed + i,

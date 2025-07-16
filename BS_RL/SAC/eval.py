@@ -7,7 +7,7 @@ import numpy as np
 from .agent import SACAgentBase
 from .common import eval_env_maker, MetricLogger, StatsAggregator
 from .config import EnvConfig, EvalConfig
-from TradingEnv import DataLoader
+from TradingEnv import DataLoader, DataLoaderConfig, TradingEnvConfig
 
 class Evaluator:
     def __init__(self,
@@ -22,11 +22,10 @@ class Evaluator:
         self.run_name_suffix = run_name_suffix
         self.logger = logger
         self.eval_envs = None
-
-        eval_trading_config = copy.deepcopy(self.env_config.trading_env_config)
-        # eval_trading_config.data_path = self.eval_config.data_path
-        self.data_loader = DataLoader(eval_trading_config)
-
+        trading_env_config = copy.deepcopy(self.env_config.trading_env_config)
+        trading_env_config.data_loader_config.mode = "test"
+        self.data_loader = DataLoader(trading_env_config.data_loader_config)
+        self.env_config.trading_env_config = trading_env_config
         if self.eval_config.cache_env:
             self.eval_envs = self._make_envs()
 

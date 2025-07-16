@@ -97,9 +97,6 @@ class EvalConfig:
     """whether to use async vector env for evaluation"""
     seed: int = 996
     """the seed for the evaluation environment"""
-    data_path: str = "/root/project/processed_data/test_dataset/"
-    """path to the evaluation dataset"""
-
 
 @dataclass
 class ConvNextConfig:
@@ -127,29 +124,18 @@ class KLineEncoderConfig:
 
 @dataclass
 class NetworkConfig:
-    shape_1m: Tuple[int, int]
-    shape_5m: Tuple[int, int]
+    shape_tickers_positions: Tuple[int, int]
     encoder_type: str = "resnet1d"  # "convnext", "cnn1d", "resnet1d", "kline"
     
     # Encoder configs
-    convnext_layers_1m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=8, embed_dim=16))
     convnext_layers_5m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=8, embed_dim=16)) # 48=128*0.375
-    cnn1d_layers_1m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=8, embed_dim=16))
     cnn1d_layers_5m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=8, embed_dim=16))
     # ResNet1D-34 的配置
-    resnet1d_layers_1m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(
-        stage_sizes=[2, 2, 2, 2],
-        block_cls=ResidualBlock1D,
-        ))
     resnet1d_layers_5m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(
         stage_sizes=[2, 2, 2, 2],
         block_cls=ResidualBlock1D,
         ))
-    # 针对1m数据，shape为(30, 14)（序列短，噪声多）的配置
-    kline_encoder_1m: KLineEncoderConfig = field(default_factory=lambda: KLineEncoderConfig(
-        block_features=[64, 128, 128, 256, 256, 256],
-        kernel_sizes=[7, 5, 5, 3, 3, 3],
-    ))
+
     # 针对5m数据, shape为(48, 18)（序列长，趋势更明显）的配置
     kline_encoder_5m: KLineEncoderConfig = field(default_factory=lambda: KLineEncoderConfig(
         block_features=[64, 128, 256, 256, 512, 512, 512, 512],

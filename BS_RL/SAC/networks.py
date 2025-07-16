@@ -95,7 +95,7 @@ class TradingNetwork(nn.Module):
         
         # 检查是否为简单向量输入（如gym环境）
         if (self.network_config.encoder_type == "none" or 
-            (self.network_config.shape_1m[0] == 0 and self.network_config.shape_5m[0] == 0)):
+            (self.network_config.shape_1m[0] == 0 and self.network_config.shape_tickers_positions[0] == 0)):
             # 简单向量输入，直接使用最终MLP处理
             final_features = UnifiedResMLP(
                 config=self.network_config.ResMLP_final, 
@@ -106,10 +106,10 @@ class TradingNetwork(nn.Module):
         # 原有的交易环境处理逻辑
         # Split and reshape
         dim_1m = self.network_config.shape_1m[0] * self.network_config.shape_1m[1]
-        dim_5m = self.network_config.shape_5m[0] * self.network_config.shape_5m[1]
+        dim_5m = self.network_config.shape_tickers_positions[0] * self.network_config.shape_tickers_positions[1]
         
         x_1m = x[:, :dim_1m].reshape((-1, *self.network_config.shape_1m))
-        x_5m = x[:, dim_1m:dim_1m+dim_5m].reshape((-1, *self.network_config.shape_5m))
+        x_5m = x[:, dim_1m:dim_1m+dim_5m].reshape((-1, *self.network_config.shape_tickers_positions))
         x_rest = x[:, dim_1m+dim_5m:]
 
         if self.network_config.encoder_type == 'convnext':
@@ -220,13 +220,13 @@ class TradingCriticContinuous(nn.Module):
         
         combined = jnp.concatenate([features, action], axis=-1)
         
-        # Simple MLP for Q-value
+        # Simple MLP for Q-value. use pre-activation
         q = nn.Dense(256)(combined)
-        q = activation_fn(q)
         q = nn.LayerNorm()(q)
+        q = activation_fn(q)
         q = nn.Dense(256)(q)
-        q = activation_fn(q)
         q = nn.LayerNorm()(q)
+        q = activation_fn(q)
         q_value = nn.Dense(1)(q).squeeze(-1)
         
         return q_value

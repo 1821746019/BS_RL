@@ -1,7 +1,7 @@
 import copy
-from typing import Callable, Deque, List, Dict, Any, Optional
-from TradingEnv import TradingEnv, TradingEnvConfig as TradingEnvConfig, DataLoader, Account
-from TradingEnv import wrappers
+from typing import Callable, Deque, List, Dict, Any, Optional, Iterable
+from TradingEnv import TradingEnv, TradingEnvConfig , DataLoader, Account
+from TradingEnv import wrappers, StartMode
 import collections
 import numpy as np
 import wandb
@@ -48,7 +48,14 @@ class StatsAggregator:
         aggregated = collections.defaultdict(list)
         for stats in self.buffer:
             for key, value in stats.items():
-                aggregated[key].append(float(value))
+                # 只跳过复杂的容器类型（如list, dict, tuple），但保留字符串和数值类型
+                if isinstance(value, (list, dict, tuple, set)):
+                    continue
+                try:
+                    # 尝试转换为float，如果失败则跳过该值
+                    aggregated[key].append(float(value))
+                except (ValueError, TypeError):
+                    continue
 
         results = {}
         for key, values in aggregated.items():
@@ -90,7 +97,7 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
         account = Account(config)
         env = TradingEnv(config, data_loader, account)
         env = wrappers.EpisodeWrapper(env)
-        env = wrappers.TrainWrapper(env)
+        env = wrappers.RandomWrapper(env)
         env = wrappers.ObsWrapper(env)
         # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
         # env = FiniteCheck(env)
@@ -104,6 +111,7 @@ def eval_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader,
         account = Account(config)
         env = TradingEnv(config, data_loader, account)
         env = wrappers.EpisodeWrapper(env)
+        env = wrappers.RandomWrapper(env)
         if capture_media:
             env = wrappers.EpisodeRender(env)
         env = wrappers.ObsWrapper(env)
@@ -143,3 +151,7 @@ class FiniteCheck(gymnasium.Wrapper):
         assert np.isfinite(obs).all(), "obs contains non-finite"
         assert np.isfinite(r), "reward non-finite"
         return obs, r, term, trunc, info
+
+
+def valid_step_to_gamma(valid_step: int):
+    return 1-1/valid_step
