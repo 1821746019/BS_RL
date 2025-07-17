@@ -12,6 +12,8 @@ from TradingEnv import TradingEnvConfig
 
 if __name__ == "__main__":
     env_id = "TradingEnv"
+    window_size = 1
+    exp_name = f"window_{window_size}_{env_id}_SAC"
     total_timesteps = int(200e6) 
     batch_size = 256
     env_num = 1  # SAC通常使用单环境
@@ -27,7 +29,7 @@ if __name__ == "__main__":
     
     args = Args(
         train=TrainConfig(
-            exp_name=f"SAC_{env_id}",
+            exp_name=exp_name,
             save_model=True,
             ckpt_save_frequency=ckpt_save_frequency,
             resume=True,  # 首次运行设为False
@@ -43,7 +45,7 @@ if __name__ == "__main__":
             capture_media=True,  # 记录视频
         ),
         env=EnvConfig(
-            trading_env_config=TradingEnvConfig(data_loader_config=DataLoaderConfig(data_path="~/project/processed_data")),
+            trading_env_config=TradingEnvConfig(data_loader_config=DataLoaderConfig(data_path="~/project/processed_data"),window_size=window_size),
             env_num=env_num,
         ),
         network=NetworkConfig(
@@ -53,7 +55,7 @@ if __name__ == "__main__":
             
             # 为128维观察空间设计的ResMLP配置
             ResMLP_final=ResMLPConfig(
-                hidden_dims=[1024, 1024, 1024, 1024, 1024],  # 适中的网络深度
+                hidden_dims=[1024, 1024, 1024],  # 适中的网络深度
                 add_initial_embedding_layer=True,
                 residual_strategy=ResidualStrategy.PROJECTION,
                 dropout_rate=0.0,  # LunarLander通常不需要dropout
@@ -87,5 +89,5 @@ if __name__ == "__main__":
     print(f"总步数: {total_timesteps:,}")
     print(f"批次大小: {batch_size}")
     print(f"学习开始步数: {learning_starts:,}")
-    
+    print(f"使用SGD: {args.algo.use_SGD}")
     train(args)

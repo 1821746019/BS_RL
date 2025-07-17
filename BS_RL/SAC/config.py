@@ -43,6 +43,8 @@ class AlgoConfig:
     """coefficient for scaling the autotune entropy target (e.g., 0.89 for Atari)"""
     # JAX-specific Adam epsilon, matching PyTorch default for fair comparison
     adam_eps: float = 1e-4 # CleanRL used 1e-4 for PyTorch Adam, default optax Adam is 1e-8.
+    use_SGD: bool = True
+    """whether to use SGD instead of Adam"""
 
 @dataclass
 class WandbConfig:
@@ -60,7 +62,7 @@ class TrainConfig:
     save_model: bool = False # This will be implicitly True if checkpointing is frequent
     """whether to save model into the `runs/{run_name}` folder (deprecated by save_dir and ckpt logic)"""
     # JAX specific
-    jax_platform_name: Optional[str] = "tpu" # "cpu", "gpu", "tpu". None means JAX default.
+    jax_platform_name: Optional[str] = None # "cpu", "gpu", "tpu". None means JAX default.
     """The platform to run JAX on"""
 
     # parameters for save directories, resume, checkpointing, and evaluation

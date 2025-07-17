@@ -139,7 +139,7 @@ class SACAgentDiscrete(SACAgentBase):
         actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, self.dummy_obs, deterministic=True)['params']
         actor_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
-            optax.adamw(learning_rate=self.algo_config.policy_lr, eps=self.algo_config.adam_eps),
+            optax.sgd(learning_rate=self.algo_config.policy_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.policy_lr, eps=self.algo_config.adam_eps),
         )
         self.actor_state = TrainState.create(
             apply_fn=self.actor_model.apply,
@@ -151,7 +151,7 @@ class SACAgentDiscrete(SACAgentBase):
         self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
         critic_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
-            optax.adamw(learning_rate=self.algo_config.q_lr, eps=self.algo_config.adam_eps),
+            optax.sgd(learning_rate=self.algo_config.q_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.q_lr, eps=self.algo_config.adam_eps),
         )
 
         qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, self.dummy_obs, deterministic=True)['params']
@@ -380,7 +380,7 @@ class SACAgentContinuous(SACAgentBase):
         actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, self.dummy_obs, deterministic=True)['params']
         actor_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
-            optax.adamw(learning_rate=self.algo_config.policy_lr, eps=self.algo_config.adam_eps),
+            optax.sgd(learning_rate=self.algo_config.policy_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.policy_lr, eps=self.algo_config.adam_eps),
         )
         self.actor_state = TrainState.create(
             apply_fn=self.actor_model.apply,
@@ -392,7 +392,7 @@ class SACAgentContinuous(SACAgentBase):
         self.critic_model = critic_model_cls(network_config=self.network_config)
         critic_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
-            optax.adamw(learning_rate=self.algo_config.q_lr, eps=self.algo_config.adam_eps),
+            optax.sgd(learning_rate=self.algo_config.q_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.q_lr, eps=self.algo_config.adam_eps),
         )
 
         qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, self.dummy_obs, dummy_action, deterministic=True)['params']
