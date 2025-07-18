@@ -45,7 +45,7 @@ if __name__ == "__main__":
             capture_media=True,  # 记录视频
         ),
         env=EnvConfig(
-            trading_env_config=TradingEnvConfig(data_loader_config=DataLoaderConfig(data_path="~/project/processed_data"),window_size=window_size),
+            trading_env_config=TradingEnvConfig(data_loader_config=DataLoaderConfig(data_path="../../processed_data")),
             env_num=env_num,
         ),
         network=NetworkConfig(
@@ -55,7 +55,7 @@ if __name__ == "__main__":
             
             # 为128维观察空间设计的ResMLP配置
             ResMLP_final=ResMLPConfig(
-                hidden_dims=[1024, 1024, 1024],  # 适中的网络深度
+                hidden_dims=[768,768,768,768,768],  # 适中的网络深度
                 add_initial_embedding_layer=True,
                 residual_strategy=ResidualStrategy.PROJECTION,
                 dropout_rate=0.0,  # LunarLander通常不需要dropout
