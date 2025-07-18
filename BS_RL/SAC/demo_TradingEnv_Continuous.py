@@ -13,12 +13,13 @@ from TradingEnv import TradingEnvConfig
 if __name__ == "__main__":
     env_id = "TradingEnv"
     window_size = 2
-    exp_name = f"window_{window_size}_{env_id}_SAC"
+    use_SGD = True
+    exp_name = f"window_{window_size}_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
     total_timesteps = int(200e6) 
     batch_size = 256
     env_num = 8  # SAC通常使用单环境
-    eval_env_num = 8
-    eval_episodes = 8
+    eval_env_num = 1
+    eval_episodes = 1
     
     is_test = total_timesteps == int(1e6)
     learning_starts = 10000 if not is_test else 1000
@@ -32,7 +33,7 @@ if __name__ == "__main__":
             exp_name=exp_name,
             save_model=True,
             ckpt_save_frequency=ckpt_save_frequency,
-            resume=True,  # 首次运行设为False
+            resume=False,  # 首次运行设为False
             save_dir=f"runs/SAC_{env_id}",
             async_vector_env=False,  # 单环境无需异步
         ),
@@ -77,7 +78,8 @@ if __name__ == "__main__":
             q_lr=3e-4,
             autotune=True,  # 自动调节熵系数
             target_entropy_scale=1.0,  # 连续动作的标准设置
-            adam_eps=1e-4
+            adam_eps=1e-4,
+            use_SGD=use_SGD
         ),
         wandb=WandbConfig(
             track=True,
