@@ -12,11 +12,11 @@ from TradingEnv import TradingEnvConfig
 
 if __name__ == "__main__":
     env_id = "TradingEnv"
-    window_size = 1
+    window_size = 2
     exp_name = f"window_{window_size}_{env_id}_SAC"
     total_timesteps = int(200e6) 
     batch_size = 256
-    env_num = 1  # SAC通常使用单环境
+    env_num = 8  # SAC通常使用单环境
     eval_env_num = 8
     eval_episodes = 8
     
