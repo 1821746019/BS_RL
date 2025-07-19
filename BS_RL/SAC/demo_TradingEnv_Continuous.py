@@ -12,13 +12,13 @@ from TradingEnv import TradingEnvConfig
 
 if __name__ == "__main__":
     env_id = "TradingEnv"
-    window_size = 2
-    use_SGD = True
-    exp_name = f"window_{window_size}_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
+    window_size = 3
+    use_SGD = False
     total_timesteps = int(200e6) 
     batch_size = 256
-    env_num = 8  # SAC通常使用单环境
+    env_num = 1  # SAC通常使用单环境
     eval_env_num = 1
+    exp_name = f"env_num({env_num})_window({window_size})_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
     eval_episodes = 1
     
     is_test = total_timesteps == int(1e6)
