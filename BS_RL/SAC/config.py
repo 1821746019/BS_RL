@@ -127,6 +127,8 @@ class KLineEncoderConfig:
 @dataclass
 class NetworkConfig:
     shape_tickers_positions: Tuple[int, int]
+    actor_net_arch: List[int] = field(default_factory=lambda: [512, 512, 512])
+    critic_net_arch: List[int] = field(default_factory=lambda: [512, 512, 512, 512, 512])
     encoder_type: str = "resnet1d"  # "convnext", "cnn1d", "resnet1d", "kline"
     
     # Encoder configs

@@ -192,20 +192,34 @@ class TradingNetwork(nn.Module):
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
-
+class MLPResidualBlock(nn.Module):
+    scale_factor: int = 4
+    hidden_dim: int = 512
+    activation_fn: Callable = nn.gelu
+    @nn.compact
+    def __call__(self, x: jnp.ndarray):
+        residual = x
+        x = nn.LayerNorm()(x)
+        x = self.activation_fn(x)
+        x = nn.Dense(self.scale_factor * self.hidden_dim)(x)
+        x = nn.Dense(self.hidden_dim)(x)
+        x = residual + x
+        return x
+    
 class TradingActorContinuous(nn.Module):
     network_config: NetworkConfig
     action_dim: int
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
-        activation_fn = get_activation(self.network_config.activation)
-        features = TradingNetwork(network_config=self.network_config)(x, deterministic=deterministic)
-        features = nn.LayerNorm(name="final_norm")(features)
-        features = activation_fn(features)
-        
-        mean = nn.Dense(self.action_dim, name="mean")(features)
-        log_std = nn.Dense(self.action_dim, name="log_std")(features)
+        # 投影到嵌入维度
+        x = nn.Dense(self.network_config.actor_net_arch[0])(x)
+        for hidden_dim in self.network_config.actor_net_arch:
+            x = MLPResidualBlock(scale_factor=4, hidden_dim=hidden_dim)(x)
+        x = nn.LayerNorm()(x)
+        x = nn.gelu(x)
+        mean = nn.Dense(self.action_dim, name="mean")(x)
+        log_std = nn.Dense(self.action_dim, name="log_std")(x)
         log_std = jnp.clip(log_std, LOG_STD_MIN, LOG_STD_MAX)
         
         return mean, log_std
@@ -215,19 +229,14 @@ class TradingCriticContinuous(nn.Module):
     
     @nn.compact
     def __call__(self, x: jnp.ndarray, action: jnp.ndarray, deterministic: bool):
-        activation_fn = get_activation(self.network_config.activation)
-        features = TradingNetwork(network_config=self.network_config)(x, deterministic=deterministic)
-        
-        combined = jnp.concatenate([features, action], axis=-1)
-        
-        # Simple MLP for Q-value. use pre-activation
-        q = nn.Dense(256)(combined)
-        q = nn.LayerNorm()(q)
-        q = activation_fn(q)
-        q = nn.Dense(256)(q)
-        q = nn.LayerNorm()(q)
-        q = activation_fn(q)
-        q_value = nn.Dense(1)(q).squeeze(-1)
+        x = jnp.concatenate([x, action], axis=-1)
+        # 投影到嵌入维度
+        x = nn.Dense(self.network_config.critic_net_arch[0])(x)
+        for hidden_dim in self.network_config.critic_net_arch:
+            x = MLPResidualBlock(scale_factor=4, hidden_dim=hidden_dim)(x)
+        x = nn.LayerNorm()(x)
+        x = nn.gelu(x)
+        q_value = nn.Dense(1)(x).squeeze(-1)
         
         return q_value
 

@@ -14,7 +14,7 @@ if __name__ == "__main__":
     env_id = "TradingEnv"
     window_size = 3
     use_SGD = False
-    total_timesteps = int(200e6) 
+    total_timesteps = int(100e6) 
     batch_size = 256
     env_num = 1  # SAC通常使用单环境
     eval_env_num = 1
@@ -50,20 +50,11 @@ if __name__ == "__main__":
             env_num=env_num,
         ),
         network=NetworkConfig(
+            actor_net_arch=[512, 512, 512],
+            critic_net_arch=[512, 512, 512, 512, 512],
             # 不需要时间序列编码器，直接用MLP
             shape_tickers_positions=(0, 0),  # 不使用
             encoder_type="none",  # 标记为不使用编码器
-            
-            # 为128维观察空间设计的ResMLP配置
-            ResMLP_final=ResMLPConfig(
-                hidden_dims=[768,768,768,768,768],  # 适中的网络深度
-                add_initial_embedding_layer=True,
-                residual_strategy=ResidualStrategy.PROJECTION,
-                dropout_rate=0.0,  # LunarLander通常不需要dropout
-                use_highway=False,
-                name="ResMLP_final",
-                description="特征处理网络"
-            ),
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
