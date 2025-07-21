@@ -372,11 +372,11 @@ class SACAgentContinuous(SACAgentBase):
             norm_limit=1.0
         )
 
-    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls, critic_model_cls):
+    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls: nn.Module, critic_model_cls: nn.Module):
         dummy_action = jnp.zeros((1, self.action_dim), dtype=jnp.float32)
         
         # Actor setup
-        self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
+        self.actor_model: nn.Module = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
         actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, self.dummy_obs, deterministic=True)['params']
         actor_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
@@ -389,7 +389,7 @@ class SACAgentContinuous(SACAgentBase):
         )
 
         # Critic setup
-        self.critic_model = critic_model_cls(network_config=self.network_config)
+        self.critic_model: nn.Module = critic_model_cls(network_config=self.network_config)
         critic_optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
             optax.sgd(learning_rate=self.algo_config.q_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.q_lr, eps=self.algo_config.adam_eps),
