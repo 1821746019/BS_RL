@@ -1,4 +1,5 @@
 import os
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache" # 设置缓存目录才会启用编译缓存，需在导入jax前设置
 from dataclasses import dataclass, field
 from typing import Optional, Union, Tuple, List
 from TradingEnv import TradingEnvConfig as TradingEnvConfig

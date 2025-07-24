@@ -96,10 +96,10 @@ if __name__ == "__main__":
     
     args = Args(
         train=TrainConfig(
-            exp_name="LunarLanderContinuous-SAC",
+            exp_name="LunarLanderContinuous-SAC_transformerFFN瓶颈中间用LN",
             save_model=True,
             ckpt_save_frequency=ckpt_save_frequency,
-            resume=True,  # 首次运行设为False
+            resume=False,  # 首次运行设为False
             save_dir=f"runs/LunarLanderContinuous_SAC",
             async_vector_env=False,  # 单环境无需异步
         ),
@@ -120,17 +120,8 @@ if __name__ == "__main__":
             # LunarLander不需要时间序列编码器，直接用MLP
             shape_tickers_positions=(0, 0),  # 不使用
             encoder_type="none",  # 标记为不使用编码器
-            
-            # 为8维观察空间设计的ResMLP配置
-            ResMLP_final=ResMLPConfig(
-                hidden_dims=[256, 256, 256],  # 适中的网络深度
-                add_initial_embedding_layer=True,
-                residual_strategy=ResidualStrategy.PROJECTION,
-                dropout_rate=0.0,  # LunarLander通常不需要dropout
-                use_highway=False,
-                name="lunar_lander_mlp",
-                description="LunarLanderContinuous特征处理网络"
-            ),
+            actor_net_arch=[64, 64],
+            critic_net_arch=[64, 64],
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
