@@ -5,14 +5,19 @@ import flax.linen as nn
 from flax.training.train_state import TrainState
 import optax
 from functools import partial
-from typing import Union
+from typing import Union, Optional
 import tensorflow_probability.substrates.jax.distributions as tfd
 
 from .config import AlgoConfig, NetworkConfig
 from .networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
 
+class TrainStateWithBatchStats(TrainState):
+    batch_stats: Optional[flax.core.FrozenDict] = None
+
 class CriticTrainState(TrainState):
     target_params: flax.core.FrozenDict
+    batch_stats: Optional[flax.core.FrozenDict] = None
+    target_batch_stats: Optional[flax.core.FrozenDict] = None
 
 class SACAgentBase:
     def __init__(self,
@@ -63,6 +68,20 @@ class SACAgentBase:
         else:
             self.current_alpha = jnp.array(algo_config.alpha, dtype=jnp.float32)
 
+    def _init_model_with_batch_stats(self, model, key, *args, **kwargs):
+        """Helper method to initialize model and extract params and batch_stats"""
+        variables = model.init({'params': key, 'dropout': key}, *args, **kwargs)
+        params = variables['params']
+        batch_stats = variables.get('batch_stats')
+        return params, batch_stats
+
+    def _apply_model_with_batch_stats(self, model, variables, *args, deterministic=True, mutable=None, **kwargs):
+        """Helper method to apply model with proper batch_stats handling"""
+        if mutable:
+            return model.apply(variables, *args, deterministic=deterministic, mutable=mutable, **kwargs)
+        else:
+            return model.apply(variables, *args, deterministic=deterministic, **kwargs)
+
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls, critic_model_cls) -> optax.GradientTransformation:
         raise NotImplementedError
 
@@ -71,7 +90,8 @@ class SACAgentBase:
 
     @partial(jax.jit, static_argnums=(0, 4))
     def select_action(self, actor_params: flax.core.FrozenDict, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
-        raise NotImplementedError
+        # 这个方法需要接收actor_state而不仅仅是params，以便获取batch_stats
+        raise NotImplementedError("This method should be implemented in subclasses")
 
     @partial(jax.jit, static_argnums=(0,))
     def _update_critic(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
@@ -86,9 +106,19 @@ class SACAgentBase:
         qf1_state_new = qf1_state.replace(
             target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, self.algo_config.tau)
         )
+        if qf1_state.batch_stats is not None:
+            qf1_state_new = qf1_state_new.replace(
+                target_batch_stats=optax.incremental_update(qf1_state.batch_stats, qf1_state.target_batch_stats, self.algo_config.tau)
+            )
+        
         qf2_state_new = qf2_state.replace(
             target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, self.algo_config.tau)
         )
+        if qf2_state.batch_stats is not None:
+            qf2_state_new = qf2_state_new.replace(
+                target_batch_stats=optax.incremental_update(qf2_state.batch_stats, qf2_state.target_batch_stats, self.algo_config.tau)
+            )
+        
         return qf1_state_new, qf2_state_new
 
     # Combined update function
@@ -147,29 +177,41 @@ class SACAgentDiscrete(SACAgentBase):
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls, critic_model_cls):
         # Actor setup
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, self.dummy_obs, deterministic=True)['params']
-        self.actor_state = TrainState.create(
+        actor_params, actor_batch_stats = self._init_model_with_batch_stats(
+            self.actor_model, key_actor, self.dummy_obs, deterministic=True
+        )
+    
+        self.actor_state = TrainStateWithBatchStats.create(
             apply_fn=self.actor_model.apply,
             params=actor_params,
+            batch_stats=actor_batch_stats,
             tx=self.actor_optimizer
         )
 
         # Critic setup
         self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
 
-        qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, self.dummy_obs, deterministic=True)['params']
+        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(
+            self.critic_model, key_qf1, self.dummy_obs, deterministic=True
+        )
         self.qf1_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf1_params,
+            batch_stats=qf1_batch_stats,
             target_params=qf1_params,
+            target_batch_stats=qf1_batch_stats,
             tx=self.critic_optimizer
         )
 
-        qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, self.dummy_obs, deterministic=True)['params']
+        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(
+            self.critic_model, key_qf2, self.dummy_obs, deterministic=True
+        )
         self.qf2_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf2_params,
+            batch_stats=qf2_batch_stats,
             target_params=qf2_params,
+            target_batch_stats=qf2_batch_stats,
             tx=self.critic_optimizer
         )
     
@@ -183,11 +225,14 @@ class SACAgentDiscrete(SACAgentBase):
         )
 
     @partial(jax.jit, static_argnums=(0, 4))
-    def select_action(self, actor_params: flax.core.FrozenDict, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
+    def select_action(self, actor_state: TrainStateWithBatchStats, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
         key_dropout, key_sample = jax.random.split(key)
-        logits = self.actor_model.apply(
-            {'params': actor_params}, obs,
-            deterministic=deterministic,
+        # For action selection, we don't update batch_stats, so use deterministic=True for RSNorm
+        logits = self._apply_model_with_batch_stats(
+            self.actor_model,
+            {'params': actor_state.params, 'batch_stats': actor_state.batch_stats},
+            obs,
+            deterministic=True,  # Don't update batch_stats during inference
             rngs={'dropout': key_dropout}
         )
         if deterministic:
@@ -198,7 +243,7 @@ class SACAgentDiscrete(SACAgentBase):
 
     @partial(jax.jit, static_argnums=(0,))
     def _update_critic(self,
-                       actor_state: TrainState,
+                       actor_state: TrainStateWithBatchStats,
                        qf1_state: CriticTrainState,
                        qf2_state: CriticTrainState,
                        log_alpha_input: Union[flax.core.FrozenDict, jnp.ndarray],
@@ -211,21 +256,34 @@ class SACAgentDiscrete(SACAgentBase):
             current_alpha = log_alpha_input
 
         key_next_logits, key_q_target = jax.random.split(key, 2)
-        next_logits = self.actor_model.apply(
-            {'params': actor_state.params}, data['next_observations'],
-            deterministic=False, # Use dropout for stochasticity in target
+        
+        # Get next action logits with batch_stats update
+        next_logits, _ = self._apply_model_with_batch_stats(
+            self.actor_model,
+            {'params': actor_state.params, 'batch_stats': actor_state.batch_stats},
+            data['next_observations'],
+            deterministic=False,
+            mutable=['batch_stats'],
             rngs={'dropout': key_next_logits}
         )
+        
         next_action_probs = nn.softmax(next_logits, axis=-1)
         next_action_log_probs = nn.log_softmax(next_logits, axis=-1)
 
-        qf1_next_target_values = self.critic_model.apply(
-            {'params': qf1_state.target_params}, data['next_observations'],
-            deterministic=True, rngs={'dropout': key_q_target}
+        # Use target networks without updating their batch_stats
+        qf1_next_target_values = self._apply_model_with_batch_stats(
+            self.critic_model,
+            {'params': qf1_state.target_params, 'batch_stats': qf1_state.target_batch_stats},
+            data['next_observations'],
+            deterministic=True,
+            rngs={'dropout': key_q_target}
         )
-        qf2_next_target_values = self.critic_model.apply(
-            {'params': qf2_state.target_params}, data['next_observations'],
-            deterministic=True, rngs={'dropout': key_q_target}
+        qf2_next_target_values = self._apply_model_with_batch_stats(
+            self.critic_model,
+            {'params': qf2_state.target_params, 'batch_stats': qf2_state.target_batch_stats},
+            data['next_observations'],
+            deterministic=True,
+            rngs={'dropout': key_q_target}
         )
         min_qf_next_target = jnp.minimum(qf1_next_target_values, qf2_next_target_values)
         
@@ -236,32 +294,42 @@ class SACAgentDiscrete(SACAgentBase):
         target_q_values = jax.lax.stop_gradient(target_q_values)
 
         def qf1_loss_fn(params):
-            qf1_all_actions = self.critic_model.apply(
-                {'params': params}, data['observations'],
-                deterministic=True, rngs={'dropout': key}
+            qf1_all_actions, new_qf1_vars = self._apply_model_with_batch_stats(
+                self.critic_model,
+                {'params': params, 'batch_stats': qf1_state.batch_stats},
+                data['observations'],
+                deterministic=False,
+                mutable=['batch_stats'],
+                rngs={'dropout': key}
             )
             qf1_taken_action = jnp.take_along_axis(qf1_all_actions, data['actions'], axis=1).squeeze(-1)
             loss = ((qf1_taken_action - target_q_values) ** 2).mean()
-            return loss, qf1_taken_action.mean()
-        (qf1_loss_val, qf1_values_mean), qf1_grads = jax.value_and_grad(qf1_loss_fn, has_aux=True)(qf1_state.params)
+            return loss, (qf1_taken_action.mean(), new_qf1_vars)
+            
+        (qf1_loss_val, (qf1_values_mean, new_qf1_vars)), qf1_grads = jax.value_and_grad(qf1_loss_fn, has_aux=True)(qf1_state.params)
         qf1_grads = jax.lax.pmean(qf1_grads, axis_name='batch')
         qf1_loss_val = jax.lax.pmean(qf1_loss_val, axis_name='batch')
         qf1_values_mean = jax.lax.pmean(qf1_values_mean, axis_name='batch')
-        qf1_state_new = qf1_state.apply_gradients(grads=qf1_grads)
+        qf1_state_new = qf1_state.apply_gradients(grads=qf1_grads).replace(batch_stats=new_qf1_vars['batch_stats'])
         
         def qf2_loss_fn(params):
-            qf2_all_actions = self.critic_model.apply(
-                {'params': params}, data['observations'],
-                deterministic=True, rngs={'dropout': key}
+            qf2_all_actions, new_qf2_vars = self._apply_model_with_batch_stats(
+                self.critic_model,
+                {'params': params, 'batch_stats': qf2_state.batch_stats},
+                data['observations'],
+                deterministic=False,
+                mutable=['batch_stats'],
+                rngs={'dropout': key}
             )
             qf2_taken_action = jnp.take_along_axis(qf2_all_actions, data['actions'], axis=1).squeeze(-1)
             loss = ((qf2_taken_action - target_q_values) ** 2).mean()
-            return loss, qf2_taken_action.mean()
-        (qf2_loss_val, qf2_values_mean), qf2_grads = jax.value_and_grad(qf2_loss_fn, has_aux=True)(qf2_state.params)
+            return loss, (qf2_taken_action.mean(), new_qf2_vars)
+            
+        (qf2_loss_val, (qf2_values_mean, new_qf2_vars)), qf2_grads = jax.value_and_grad(qf2_loss_fn, has_aux=True)(qf2_state.params)
         qf2_grads = jax.lax.pmean(qf2_grads, axis_name='batch')
         qf2_loss_val = jax.lax.pmean(qf2_loss_val, axis_name='batch')
         qf2_values_mean = jax.lax.pmean(qf2_values_mean, axis_name='batch')
-        qf2_state_new = qf2_state.apply_gradients(grads=qf2_grads)
+        qf2_state_new = qf2_state.apply_gradients(grads=qf2_grads).replace(batch_stats=new_qf2_vars['batch_stats'])
 
         critic_loss = (qf1_loss_val + qf2_loss_val) / 2.0
         critic_loss = jax.lax.pmean(critic_loss, axis_name='batch')
@@ -272,7 +340,7 @@ class SACAgentDiscrete(SACAgentBase):
 
     @partial(jax.jit, static_argnums=(0,))
     def _update_actor_and_alpha(self,
-                                actor_state: TrainState,
+                                actor_state: TrainStateWithBatchStats,
                                 qf1_state: CriticTrainState,
                                 qf2_state: CriticTrainState,
                                 log_alpha_input: Union[TrainState, jnp.ndarray],
@@ -287,20 +355,30 @@ class SACAgentDiscrete(SACAgentBase):
             actor_effective_alpha = log_alpha_input
 
         def actor_loss_fn(actor_params):
-            logits = self.actor_model.apply(
-                {'params': actor_params}, data['observations'],
-                deterministic=False, rngs={'dropout': key_actor}
+            logits, new_actor_vars = self._apply_model_with_batch_stats(
+                self.actor_model,
+                {'params': actor_params, 'batch_stats': actor_state.batch_stats},
+                data['observations'],
+                deterministic=False,
+                mutable=['batch_stats'],
+                rngs={'dropout': key_actor}
             )
             action_probs = nn.softmax(logits, axis=-1)
             action_log_probs = nn.log_softmax(logits, axis=-1)
 
-            qf1_all_actions = self.critic_model.apply(
-                {'params': qf1_state.params}, data['observations'],
-                deterministic=True, rngs={'dropout': key_actor}
+            qf1_all_actions = self._apply_model_with_batch_stats(
+                self.critic_model,
+                {'params': qf1_state.params, 'batch_stats': qf1_state.batch_stats},
+                data['observations'],
+                deterministic=True,
+                rngs={'dropout': key_actor}
             )
-            qf2_all_actions = self.critic_model.apply(
-                {'params': qf2_state.params}, data['observations'],
-                deterministic=True, rngs={'dropout': key_actor}
+            qf2_all_actions = self._apply_model_with_batch_stats(
+                self.critic_model,
+                {'params': qf2_state.params, 'batch_stats': qf2_state.batch_stats},
+                data['observations'],
+                deterministic=True,
+                rngs={'dropout': key_actor}
             )
             min_qf_values = jnp.minimum(qf1_all_actions, qf2_all_actions)
             min_qf_values = jax.lax.stop_gradient(min_qf_values)
@@ -310,13 +388,13 @@ class SACAgentDiscrete(SACAgentBase):
             
             # Add a small epsilon to action_probs for numerical stability.
             entropy = -jnp.sum((action_probs + 1e-8) * action_log_probs, axis=1).mean()
-            return loss, entropy
+            return loss, (entropy, new_actor_vars)
 
-        (actor_loss_val, entropy_val), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
+        (actor_loss_val, (entropy_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
         actor_grads = jax.lax.pmean(actor_grads, axis_name='batch')
         actor_loss_val = jax.lax.pmean(actor_loss_val, axis_name='batch')
         entropy_val = jax.lax.pmean(entropy_val, axis_name='batch')
-        actor_state_new = actor_state.apply_gradients(grads=actor_grads)
+        actor_state_new = actor_state.apply_gradients(grads=actor_grads).replace(batch_stats=new_actor_vars['batch_stats'])
 
         alpha_loss_val = 0.0
         log_alpha_state_to_return = log_alpha_input
@@ -324,9 +402,12 @@ class SACAgentDiscrete(SACAgentBase):
 
         if self.algo_config.autotune:
             def alpha_loss_fn(log_alpha_params_dict):
-                logits_old_actor = self.actor_model.apply(
-                    {'params': actor_state.params}, data['observations'],
-                    deterministic=True, rngs={'dropout': key_alpha}
+                logits_old_actor = self._apply_model_with_batch_stats(
+                    self.actor_model,
+                    {'params': actor_state.params, 'batch_stats': actor_state.batch_stats},
+                    data['observations'],
+                    deterministic=True,
+                    rngs={'dropout': key_alpha}
                 )
                 action_log_probs_old_actor = nn.log_softmax(logits_old_actor, axis=-1)
                 detached_log_probs = jax.lax.stop_gradient(action_log_probs_old_actor)
@@ -379,29 +460,40 @@ class SACAgentContinuous(SACAgentBase):
         
         # Actor setup
         self.actor_model: nn.Module = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, self.dummy_obs, deterministic=True)['params']
-        self.actor_state = TrainState.create(
+        actor_params, actor_batch_stats = self._init_model_with_batch_stats(
+            self.actor_model, key_actor, self.dummy_obs, deterministic=True
+        )
+        self.actor_state = TrainStateWithBatchStats.create(
             apply_fn=self.actor_model.apply,
             params=actor_params,
+            batch_stats=actor_batch_stats,
             tx=self.actor_optimizer
         )
 
         # Critic setup
         self.critic_model: nn.Module = critic_model_cls(network_config=self.network_config)
 
-        qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, self.dummy_obs, dummy_action, deterministic=True)['params']
+        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(
+            self.critic_model, key_qf1, self.dummy_obs, dummy_action, deterministic=True
+        )
         self.qf1_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf1_params,
+            batch_stats=qf1_batch_stats,
             target_params=qf1_params,
+            target_batch_stats=qf1_batch_stats,
             tx=self.critic_optimizer
         )
 
-        qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, self.dummy_obs, dummy_action, deterministic=True)['params']
+        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(
+            self.critic_model, key_qf2, self.dummy_obs, dummy_action, deterministic=True
+        )
         self.qf2_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf2_params,
+            batch_stats=qf2_batch_stats,
             target_params=qf2_params,
+            target_batch_stats=qf2_batch_stats,
             tx=self.critic_optimizer
         )
 
@@ -414,14 +506,28 @@ class SACAgentContinuous(SACAgentBase):
             tx=self.alpha_optimizer
         )
 
-    def _get_action_dist(self, actor_params, obs, key_dropout, deterministic):
-        mean, log_std = self.actor_model.apply(
-            {'params': actor_params}, obs,
-            deterministic=deterministic,
-            rngs={'dropout': key_dropout}
-        )
-        dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
-        return dist
+    def _get_action_dist(self, actor_params, actor_batch_stats, obs, key_dropout, deterministic, mutable=False):
+        variables = {'params': actor_params}
+        if actor_batch_stats is not None:
+            variables['batch_stats'] = actor_batch_stats
+            
+        if mutable and actor_batch_stats is not None:
+            apply_output = self._apply_model_with_batch_stats(
+                self.actor_model, variables, obs,
+                deterministic=deterministic, mutable=['batch_stats'],
+                rngs={'dropout': key_dropout}
+            )
+            (mean, log_std), new_vars = apply_output
+            dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
+            return dist, new_vars
+        else:
+            mean, log_std = self._apply_model_with_batch_stats(
+                self.actor_model, variables, obs,
+                deterministic=deterministic,
+                rngs={'dropout': key_dropout}
+            )
+            dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
+            return dist
     
     def _sample_action(self, dist, key_sample, deterministic):
         if deterministic:
@@ -433,9 +539,9 @@ class SACAgentContinuous(SACAgentBase):
         return squashed_action, action
 
     @partial(jax.jit, static_argnums=(0, 4))
-    def select_action(self, actor_params: flax.core.FrozenDict, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
+    def select_action(self, actor_state: TrainStateWithBatchStats, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
         key_dropout, key_sample = jax.random.split(key)
-        dist = self._get_action_dist(actor_params, obs, key_dropout, deterministic)
+        dist = self._get_action_dist(actor_state.params, actor_state.batch_stats, obs, key_dropout, deterministic=True)  # Use deterministic=True for inference
         squashed_action, _ = self._sample_action(dist, key_sample, deterministic)
         return squashed_action
 
@@ -447,18 +553,27 @@ class SACAgentContinuous(SACAgentBase):
             current_alpha = log_alpha_input
 
         key_dropout, key_sample, key_q_target = jax.random.split(key, 3)
-        next_dist = self._get_action_dist(actor_state.params, data['next_observations'], key_dropout, deterministic=False)
+        
+        next_dist, _ = self._get_action_dist(
+            actor_state.params, actor_state.batch_stats, 
+            data['next_observations'], key_dropout, 
+            deterministic=False, mutable=True
+        )
         next_squashed_action, next_action = self._sample_action(next_dist, key_sample, deterministic=False)
         
         next_log_prob = next_dist.log_prob(next_action)
         next_log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(next_action)**2 + 1e-6), axis=1)
 
-        qf1_next_target = self.critic_model.apply(
-            {'params': qf1_state.target_params}, data['next_observations'], next_squashed_action,
+        qf1_next_target = self._apply_model_with_batch_stats(
+            self.critic_model,
+            {'params': qf1_state.target_params, 'batch_stats': qf1_state.target_batch_stats},
+            data['next_observations'], next_squashed_action,
             deterministic=True, rngs={'dropout': key_q_target}
         )
-        qf2_next_target = self.critic_model.apply(
-            {'params': qf2_state.target_params}, data['next_observations'], next_squashed_action,
+        qf2_next_target = self._apply_model_with_batch_stats(
+            self.critic_model,
+            {'params': qf2_state.target_params, 'batch_stats': qf2_state.target_batch_stats},
+            data['next_observations'], next_squashed_action,
             deterministic=True, rngs={'dropout': key_q_target}
         )
         min_qf_next_target = jnp.minimum(qf1_next_target, qf2_next_target)
@@ -467,23 +582,26 @@ class SACAgentContinuous(SACAgentBase):
         target_q_value = data['rewards'] + (1.0 - data['dones']) * self.algo_config.gamma * next_q_value
         target_q_value = jax.lax.stop_gradient(target_q_value)
 
-        def qf_loss_fn(params, key_dropout):
-            q_val = self.critic_model.apply(
-                {'params': params}, data['observations'], data['actions'],
-                deterministic=True, rngs={'dropout': key_dropout}
+        def qf_loss_fn(params, batch_stats, key_dropout):
+            q_val, new_vars = self._apply_model_with_batch_stats(
+                self.critic_model,
+                {'params': params, 'batch_stats': batch_stats},
+                data['observations'], data['actions'],
+                deterministic=False, mutable=['batch_stats'],
+                rngs={'dropout': key_dropout}
             )
             loss = ((q_val - target_q_value) ** 2).mean()
-            return loss, q_val.mean()
+            return loss, (q_val.mean(), new_vars)
 
-        (qf1_loss_val, qf1_values_mean), qf1_grads = jax.value_and_grad(qf_loss_fn, has_aux=True)(qf1_state.params, key)
+        (qf1_loss_val, (qf1_values_mean, new_qf1_vars)), qf1_grads = jax.value_and_grad(qf_loss_fn, has_aux=True)(qf1_state.params, qf1_state.batch_stats, key)
         qf1_grads = jax.lax.pmean(qf1_grads, axis_name='batch')
         qf1_loss_val = jax.lax.pmean(qf1_loss_val, axis_name='batch')
-        qf1_state_new = qf1_state.apply_gradients(grads=qf1_grads)
+        qf1_state_new = qf1_state.apply_gradients(grads=qf1_grads).replace(batch_stats=new_qf1_vars['batch_stats'])
         
-        (qf2_loss_val, qf2_values_mean), qf2_grads = jax.value_and_grad(qf_loss_fn, has_aux=True)(qf2_state.params, key)
+        (qf2_loss_val, (qf2_values_mean, new_qf2_vars)), qf2_grads = jax.value_and_grad(qf_loss_fn, has_aux=True)(qf2_state.params, qf2_state.batch_stats, key)
         qf2_grads = jax.lax.pmean(qf2_grads, axis_name='batch')
         qf2_loss_val = jax.lax.pmean(qf2_loss_val, axis_name='batch')
-        qf2_state_new = qf2_state.apply_gradients(grads=qf2_grads)
+        qf2_state_new = qf2_state.apply_gradients(grads=qf2_grads).replace(batch_stats=new_qf2_vars['batch_stats'])
 
         critic_loss = (qf1_loss_val + qf2_loss_val) / 2.0
         
@@ -502,23 +620,36 @@ class SACAgentContinuous(SACAgentBase):
             actor_effective_alpha = log_alpha_input
             
         def actor_loss_fn(actor_params):
-            dist = self._get_action_dist(actor_params, data['observations'], key_actor, deterministic=False)
+            dist, new_actor_vars = self._get_action_dist(
+                actor_params, actor_state.batch_stats, data['observations'], 
+                key_actor, deterministic=False, mutable=True
+            )
             squashed_action, action = self._sample_action(dist, key_sample, deterministic=False)
             
             log_prob = dist.log_prob(action)
             log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(action)**2 + 1e-6), axis=1)
             entropy = -log_prob.mean()
 
-            qf1_pi = self.critic_model.apply({'params': qf1_state.params}, data['observations'], squashed_action, deterministic=True, rngs={'dropout': key_actor})
-            qf2_pi = self.critic_model.apply({'params': qf2_state.params}, data['observations'], squashed_action, deterministic=True, rngs={'dropout': key_actor})
+            qf1_pi = self._apply_model_with_batch_stats(
+                self.critic_model,
+                {'params': qf1_state.params, 'batch_stats': qf1_state.batch_stats},
+                data['observations'], squashed_action,
+                deterministic=True, rngs={'dropout': key_actor}
+            )
+            qf2_pi = self._apply_model_with_batch_stats(
+                self.critic_model,
+                {'params': qf2_state.params, 'batch_stats': qf2_state.batch_stats},
+                data['observations'], squashed_action,
+                deterministic=True, rngs={'dropout': key_actor}
+            )
             min_qf_pi = jnp.minimum(qf1_pi, qf2_pi)
             
             actor_loss = (actor_effective_alpha * log_prob - min_qf_pi).mean()
-            return actor_loss, (entropy, log_prob)
+            return actor_loss, (entropy, log_prob, new_actor_vars)
 
-        (actor_loss_val, (entropy_val, log_prob_val)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
+        (actor_loss_val, (entropy_val, log_prob_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
         actor_grads = jax.lax.pmean(actor_grads, axis_name='batch')
-        actor_state_new = actor_state.apply_gradients(grads=actor_grads)
+        actor_state_new = actor_state.apply_gradients(grads=actor_grads).replace(batch_stats=new_actor_vars['batch_stats'])
         
         alpha_loss_val = 0.0
         log_alpha_state_to_return = log_alpha_input

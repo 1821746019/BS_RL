@@ -20,7 +20,26 @@ class SimbaMLPResidualBlock(nn.Module):
         x = nn.Dense(self.hidden_dim)(x)
         x = residual + x
         return x
-    
+    # gemini推荐的、参考transformer的更合理的写法(倒置瓶颈中间无LN)
+    # @nn.compact
+    # def __call__(self, x: jnp.ndarray, deterministic: bool = True):
+    #     residual = x
+
+    #     # 1. Pre-Normalization
+    #     x = nn.LayerNorm()(x)
+
+    #     # 2. MLP: Linear -> Activation -> Linear
+    #     x = nn.Dense(self.scale_factor * self.hidden_dim)(x)
+    #     x = self.activation_fn(x)
+    #     x = nn.Dense(self.hidden_dim)(x)
+
+    #     # 3. Dropout for regularization
+    #     # x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
+
+    #     # 4. Residual Connection
+    #     output = residual + x
+
+    #     return output
     
 class RSNorm(nn.Module):
     epsilon: float = 1e-8

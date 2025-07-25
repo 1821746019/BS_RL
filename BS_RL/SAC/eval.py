@@ -50,7 +50,7 @@ class Evaluator:
             ]
         )
 
-    def evaluate(self, actor_params_eval: flax.core.FrozenDict, current_train_step: int):
+    def evaluate(self, actor_state_eval, current_train_step: int):
         num_episodes = self.eval_config.eval_episodes
         print(f"\nStarting evaluation for {num_episodes} episodes with seed {self.eval_config.seed} at step {current_train_step}...")
 
@@ -69,7 +69,7 @@ class Evaluator:
             key_eval_actions, key_step = jax.random.split(key_eval_actions)
             
             actions_jax = self.agent.select_action(
-                actor_params_eval, 
+                actor_state_eval, 
                 jnp.asarray(obs), 
                 key_step, 
                 deterministic=self.eval_config.greedy_actions

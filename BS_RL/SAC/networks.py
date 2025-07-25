@@ -22,8 +22,6 @@ class Backbone(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
-        # 对x(obs)应用RSNorm
-        # x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
         # 投影到嵌入维度
         x = nn.Dense(self.network_config.actor_net_arch[0])(x)
         for hidden_dim in self.network_config.actor_net_arch:
@@ -39,6 +37,8 @@ class TradingActorContinuous(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
+        # 对x(obs)应用RSNorm
+        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
         x = Backbone(network_config=self.network_config)(x, deterministic=deterministic)
         x = nn.LayerNorm()(x)
         x = nn.gelu(x)
@@ -54,6 +54,7 @@ class TradingCriticContinuous(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, action: jnp.ndarray, deterministic: bool):
         # 对x(obs)应用RSNorm
+        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
         x = jnp.concatenate([x, action], axis=-1)
         x = Backbone(network_config=self.network_config)(x, deterministic=deterministic)
         x = nn.LayerNorm()(x)
@@ -69,6 +70,8 @@ class TradingActorDiscrete(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         activation_fn = get_activation(self.network_config.activation)
+        # 对x(obs)应用RSNorm
+        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
         features = Backbone(network_config=self.network_config)(x, deterministic=deterministic)
         features = nn.LayerNorm(name="final_norm")(features)
         features = activation_fn(features)
@@ -82,6 +85,8 @@ class TradingCriticDiscrete(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         activation_fn = get_activation(self.network_config.activation)
+        # 对x(obs)应用RSNorm
+        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
         features = Backbone(network_config=self.network_config)(x, deterministic=deterministic)
         features = nn.LayerNorm(name="final_norm")(features)
         features = activation_fn(features)

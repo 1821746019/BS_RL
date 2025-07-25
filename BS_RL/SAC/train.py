@@ -26,7 +26,7 @@ import joblib
 from .config import Args
 from .common import train_env_maker, MetricLogger, StatsAggregator
 from .networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
-from .agent import SACAgentDiscrete, SACAgentContinuous
+from .agent import SACAgentDiscrete, SACAgentContinuous, TrainStateWithBatchStats, CriticTrainState
 from .eval import Evaluator
 from TradingEnv import DataLoader
 import wandb
@@ -50,9 +50,9 @@ class Trainer:
         self.envs: AsyncVectorEnv| SyncVectorEnv
         self.agent = None
         self.rb = None
-        self.actor_state = None
-        self.qf1_state = None
-        self.qf2_state = None
+        self.actor_state: TrainStateWithBatchStats = None
+        self.qf1_state: CriticTrainState = None
+        self.qf2_state: CriticTrainState = None
         self.log_alpha_state = None
         self.current_alpha = None
         self.p_update_all = None
@@ -249,12 +249,17 @@ class Trainer:
                 restore_target = {
                     'actor_params': actor_state_single.params,
                     'actor_opt_state': actor_state_single.opt_state,
+                    'actor_batch_stats': actor_state_single.batch_stats,
                     'qf1_params': qf1_state_single.params,
                     'qf1_opt_state': qf1_state_single.opt_state,
+                    'qf1_batch_stats': qf1_state_single.batch_stats,
                     'qf1_target_params': qf1_state_single.target_params,
+                    'qf1_target_batch_stats': qf1_state_single.target_batch_stats,
                     'qf2_params': qf2_state_single.params,
                     'qf2_opt_state': qf2_state_single.opt_state,
+                    'qf2_batch_stats': qf2_state_single.batch_stats,
                     'qf2_target_params': qf2_state_single.target_params,
+                    'qf2_target_batch_stats': qf2_state_single.target_batch_stats,
                 }
                 if self.args.algo.autotune:
                     restore_target['log_alpha_params'] = log_alpha_state_single.params
@@ -270,17 +275,22 @@ class Trainer:
                 # Manually update the TrainState objects with the loaded contents.
                 actor_state_single = actor_state_single.replace(
                     params=loaded_contents['actor_params'],
-                    opt_state=loaded_contents['actor_opt_state']
+                    opt_state=loaded_contents['actor_opt_state'],
+                    batch_stats=loaded_contents['actor_batch_stats']
                 )
                 qf1_state_single = qf1_state_single.replace(
                     params=loaded_contents['qf1_params'],
                     opt_state=loaded_contents['qf1_opt_state'],
-                    target_params=loaded_contents['qf1_target_params']
+                    batch_stats=loaded_contents['qf1_batch_stats'],
+                    target_params=loaded_contents['qf1_target_params'],
+                    target_batch_stats=loaded_contents['qf1_target_batch_stats']
                 )
                 qf2_state_single = qf2_state_single.replace(
                     params=loaded_contents['qf2_params'],
                     opt_state=loaded_contents['qf2_opt_state'],
-                    target_params=loaded_contents['qf2_target_params']
+                    batch_stats=loaded_contents['qf2_batch_stats'],
+                    target_params=loaded_contents['qf2_target_params'],
+                    target_batch_stats=loaded_contents['qf2_target_batch_stats']
                 )
                 if self.args.algo.autotune and 'log_alpha_params' in loaded_contents:
                     log_alpha_state_single = log_alpha_state_single.replace(
@@ -415,8 +425,8 @@ class Trainer:
             actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)])
         else:
             jax_obs = jnp.asarray(obs)
-            unreplicated_actor_params = flax.jax_utils.unreplicate(self.actor_state.params)
-            actions_jax = self.agent.select_action(unreplicated_actor_params, jax_obs, key_actions_step, deterministic=False)
+            unreplicated_actor_state = flax.jax_utils.unreplicate(self.actor_state)
+            actions_jax = self.agent.select_action(unreplicated_actor_state, jax_obs, key_actions_step, deterministic=False)
             actions = np.array(jax.device_get(actions_jax))
 
         next_obs, rewards, terminations, truncations, infos = self.envs.step(actions)
@@ -477,7 +487,7 @@ class Trainer:
         tqdm.write(f"--- Evaluation Triggered at step {current_step} (effective eval step: {eval_trigger_step}) ---")
         
         eval_metrics = self.evaluator.evaluate(
-            actor_params_eval=flax.jax_utils.unreplicate(self.actor_state.params),
+            actor_state_eval=flax.jax_utils.unreplicate(self.actor_state),
             current_train_step=current_step
         )
         
@@ -499,12 +509,17 @@ class Trainer:
             save_target = {
                 'actor_params': flax.jax_utils.unreplicate(self.actor_state.params),
                 'actor_opt_state': flax.jax_utils.unreplicate(self.actor_state.opt_state),
+                'actor_batch_stats': flax.jax_utils.unreplicate(self.actor_state.batch_stats),
                 'qf1_params': flax.jax_utils.unreplicate(self.qf1_state.params),
                 'qf1_opt_state': flax.jax_utils.unreplicate(self.qf1_state.opt_state),
+                'qf1_batch_stats': flax.jax_utils.unreplicate(self.qf1_state.batch_stats),
                 'qf1_target_params': flax.jax_utils.unreplicate(self.qf1_state.target_params),
+                'qf1_target_batch_stats': flax.jax_utils.unreplicate(self.qf1_state.target_batch_stats),
                 'qf2_params': flax.jax_utils.unreplicate(self.qf2_state.params),
                 'qf2_opt_state': flax.jax_utils.unreplicate(self.qf2_state.opt_state),
+                'qf2_batch_stats': flax.jax_utils.unreplicate(self.qf2_state.batch_stats),
                 'qf2_target_params': flax.jax_utils.unreplicate(self.qf2_state.target_params),
+                'qf2_target_batch_stats': flax.jax_utils.unreplicate(self.qf2_state.target_batch_stats),
             }
             if self.args.algo.autotune and self.log_alpha_state:
                 save_target['log_alpha_params'] = flax.jax_utils.unreplicate(self.log_alpha_state.params)
