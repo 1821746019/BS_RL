@@ -32,13 +32,24 @@ class SACAgentBase:
         self.norm_limit = norm_limit
         key_actor, key_qf1, key_qf2, key_log_alpha = jax.random.split(key, 4)
         self.key_buffer = key
+        
+        # We can define separate optimizers for actor, critic, and alpha,
+        # even if they share the same configuration. This makes the code's intent clearer.
+        # 优化器对象只定义了更新规则，是无状态的，所以可以共用。优化器的状态其实被保存在各自的TrainState中
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(self.norm_limit),
+            optax.sgd(learning_rate=self.algo_config.policy_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.policy_lr, eps=self.algo_config.adam_eps),
+        )
+        self.actor_optimizer = optimizer
+        self.critic_optimizer = optimizer
+        self.alpha_optimizer = optimizer
 
         if len(observation_space_shape) == 3:
             self.dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
         else:
             self.dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
 
-        critic_optimizer = self._create_models_and_states(
+        self._create_models_and_states(
             key_actor, key_qf1, key_qf2,
             actor_model_cls, critic_model_cls
         )
@@ -47,7 +58,7 @@ class SACAgentBase:
         self.target_entropy = 0.0
 
         if algo_config.autotune:
-            self._setup_autotune(key_log_alpha, critic_optimizer)
+            self._setup_autotune(key_log_alpha)
             self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
         else:
             self.current_alpha = jnp.array(algo_config.alpha, dtype=jnp.float32)
@@ -55,7 +66,7 @@ class SACAgentBase:
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls, critic_model_cls) -> optax.GradientTransformation:
         raise NotImplementedError
 
-    def _setup_autotune(self, key_log_alpha, critic_optimizer: optax.GradientTransformation):
+    def _setup_autotune(self, key_log_alpha):
         raise NotImplementedError
 
     @partial(jax.jit, static_argnums=(0, 4))
@@ -137,29 +148,21 @@ class SACAgentDiscrete(SACAgentBase):
         # Actor setup
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
         actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, self.dummy_obs, deterministic=True)['params']
-        actor_optimizer = optax.chain(
-            optax.clip_by_global_norm(self.norm_limit),
-            optax.sgd(learning_rate=self.algo_config.policy_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.policy_lr, eps=self.algo_config.adam_eps),
-        )
         self.actor_state = TrainState.create(
             apply_fn=self.actor_model.apply,
             params=actor_params,
-            tx=actor_optimizer
+            tx=self.actor_optimizer
         )
 
         # Critic setup
         self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        critic_optimizer = optax.chain(
-            optax.clip_by_global_norm(self.norm_limit),
-            optax.sgd(learning_rate=self.algo_config.q_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.q_lr, eps=self.algo_config.adam_eps),
-        )
 
         qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, self.dummy_obs, deterministic=True)['params']
         self.qf1_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf1_params,
             target_params=qf1_params,
-            tx=critic_optimizer
+            tx=self.critic_optimizer
         )
 
         qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, self.dummy_obs, deterministic=True)['params']
@@ -167,17 +170,16 @@ class SACAgentDiscrete(SACAgentBase):
             apply_fn=self.critic_model.apply,
             params=qf2_params,
             target_params=qf2_params,
-            tx=critic_optimizer
+            tx=self.critic_optimizer
         )
-        return critic_optimizer
     
-    def _setup_autotune(self, key_log_alpha, critic_optimizer: optax.GradientTransformation):
+    def _setup_autotune(self, key_log_alpha):
         self.target_entropy = -self.algo_config.target_entropy_scale * jnp.log(1.0 / self.action_dim)
         log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
         self.log_alpha_state = TrainState.create(
             apply_fn=None,
             params=log_alpha_params,
-            tx=critic_optimizer
+            tx=self.alpha_optimizer
         )
 
     @partial(jax.jit, static_argnums=(0, 4))
@@ -378,29 +380,21 @@ class SACAgentContinuous(SACAgentBase):
         # Actor setup
         self.actor_model: nn.Module = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
         actor_params = self.actor_model.init({'params': key_actor, 'dropout': key_actor}, self.dummy_obs, deterministic=True)['params']
-        actor_optimizer = optax.chain(
-            optax.clip_by_global_norm(self.norm_limit),
-            optax.sgd(learning_rate=self.algo_config.policy_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.policy_lr, eps=self.algo_config.adam_eps),
-        )
         self.actor_state = TrainState.create(
             apply_fn=self.actor_model.apply,
             params=actor_params,
-            tx=actor_optimizer
+            tx=self.actor_optimizer
         )
 
         # Critic setup
         self.critic_model: nn.Module = critic_model_cls(network_config=self.network_config)
-        critic_optimizer = optax.chain(
-            optax.clip_by_global_norm(self.norm_limit),
-            optax.sgd(learning_rate=self.algo_config.q_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.q_lr, eps=self.algo_config.adam_eps),
-        )
 
         qf1_params = self.critic_model.init({'params': key_qf1, 'dropout': key_qf1}, self.dummy_obs, dummy_action, deterministic=True)['params']
         self.qf1_state = CriticTrainState.create(
             apply_fn=self.critic_model.apply,
             params=qf1_params,
             target_params=qf1_params,
-            tx=critic_optimizer
+            tx=self.critic_optimizer
         )
 
         qf2_params = self.critic_model.init({'params': key_qf2, 'dropout': key_qf2}, self.dummy_obs, dummy_action, deterministic=True)['params']
@@ -408,17 +402,16 @@ class SACAgentContinuous(SACAgentBase):
             apply_fn=self.critic_model.apply,
             params=qf2_params,
             target_params=qf2_params,
-            tx=critic_optimizer
+            tx=self.critic_optimizer
         )
-        return critic_optimizer
 
-    def _setup_autotune(self, key_log_alpha, critic_optimizer: optax.GradientTransformation):
+    def _setup_autotune(self, key_log_alpha):
         self.target_entropy = -float(self.action_dim)
         log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
         self.log_alpha_state = TrainState.create(
             apply_fn=None,
             params=log_alpha_params,
-            tx=critic_optimizer
+            tx=self.alpha_optimizer
         )
 
     def _get_action_dist(self, actor_params, obs, key_dropout, deterministic):
