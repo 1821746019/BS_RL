@@ -6,39 +6,21 @@ class SimbaMLPResidualBlock(nn.Module):
     scale_factor: int = 4
     hidden_dim: int = 512
     activation_fn: Callable = nn.gelu
-    # @nn.compact
-    # def __call__(self, x: jnp.ndarray):
-    #     residual = x
-    #     x = nn.LayerNorm()(x)
-    #     x = self.activation_fn(x)
-    #     x = nn.Dense(self.scale_factor * self.hidden_dim)(x)
-    #     # x = nn.LayerNorm()(x)
-    #     x = self.activation_fn(x)
-    #     x = nn.Dense(self.hidden_dim)(x)
-    #     x = residual + x
-    #     return x
-    
-    # gemini推荐的、参考transformer的更合理的写法
     @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool = True):
+    def __call__(self, x: jnp.ndarray):
+        """通过lunarLander实验，我的写法(LN -> GELU -> Dense -> GELU -> Dense -> +)
+        才是最优的，性能提升最快。中间的Dense后跟LN的排名第二
+        比gemini推荐的transformerFFN写法更优"""
         residual = x
-
-        # 1. Pre-Normalization
-        x = nn.LayerNorm()(x)
-
-        # 2. MLP: Linear -> Activation -> Linear
-        x = nn.Dense(self.scale_factor * self.hidden_dim)(x)
         x = nn.LayerNorm()(x)
         x = self.activation_fn(x)
+        x = nn.Dense(self.scale_factor * self.hidden_dim)(x)
+        # x = nn.LayerNorm()(x)
+        x = self.activation_fn(x)
         x = nn.Dense(self.hidden_dim)(x)
-
-        # 3. Dropout for regularization
-        # x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
-
-        # 4. Residual Connection
-        output = residual + x
-
-        return output
+        x = residual + x
+        return x
+    
     
 class RSNorm(nn.Module):
     epsilon: float = 1e-8

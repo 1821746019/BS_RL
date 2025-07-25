@@ -31,6 +31,7 @@ readme = "README.md"
 
 dependencies = [
     'jax[tpu]',
+    "equinox",
     "flax",
     "optax",
     "stable_baselines3",

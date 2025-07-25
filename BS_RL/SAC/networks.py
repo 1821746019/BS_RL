@@ -3,7 +3,6 @@ import jax
 import jax.numpy as jnp
 from typing import List, Callable, Sequence
 from .config import NetworkConfig, ConvNextConfig, Cnn1DConfig, ResNet1DConfig
-from .nn.KlineEncoder import KLineEncoder
 from .nn.ResMLP import UnifiedResMLP, ResMLPConfig
 from .nn.ResNet1DEncoder import ResNet1DEncoder
 from .nn.Simba import SimbaMLPResidualBlock, RSNorm
