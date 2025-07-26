@@ -1,13 +1,14 @@
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Callable
+from typing import Callable, List
 
 class SimbaMLPResidualBlock(nn.Module):
     scale_factor: int = 4
     hidden_dim: int = 512
     activation_fn: Callable = nn.gelu
+    dropout_rate: float = 0.1
     @nn.compact
-    def __call__(self, x: jnp.ndarray):
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True):
         """通过lunarLander实验，我的写法(LN -> GELU -> Dense -> GELU -> Dense -> +)
         才是最优的，性能提升最快。中间的Dense后跟LN的排名第二
         比gemini推荐的transformerFFN写法更优"""
@@ -18,6 +19,8 @@ class SimbaMLPResidualBlock(nn.Module):
         # x = nn.LayerNorm()(x)
         x = self.activation_fn(x)
         x = nn.Dense(self.hidden_dim)(x)
+        if self.dropout_rate > 0:
+            x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
         x = residual + x
         return x
     # gemini推荐的、参考transformer的更合理的写法(倒置瓶颈中间无LN)
@@ -40,7 +43,18 @@ class SimbaMLPResidualBlock(nn.Module):
     #     output = residual + x
 
     #     return output
-    
+class SimbaMLP(nn.Module):
+    net_arch: List[int]
+    dropout_rate: float = 0.1
+    activation_fn: Callable = nn.gelu
+    first_projection: bool = True
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True):
+        if self.first_projection:
+            x = nn.Dense(self.net_arch[0])(x)
+        for i, hidden_dim in enumerate(self.net_arch):
+            x = SimbaMLPResidualBlock(scale_factor=4, hidden_dim=hidden_dim)(x, deterministic=deterministic)
+        return x
 class RSNorm(nn.Module):
     epsilon: float = 1e-8
     

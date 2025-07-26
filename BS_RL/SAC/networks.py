@@ -5,7 +5,7 @@ from typing import List, Callable, Sequence
 from .config import NetworkConfig, ConvNextConfig, Cnn1DConfig, ResNet1DConfig
 from .nn.ResMLP import UnifiedResMLP, ResMLPConfig
 from .nn.ResNet1DEncoder import ResNet1DEncoder
-from .nn.Simba import SimbaMLPResidualBlock, RSNorm
+from .nn.Simba import SimbaMLPResidualBlock, RSNorm, SimbaMLP
 
 def get_activation(name: str) -> Callable:
     if name == "relu":
@@ -17,15 +17,14 @@ def get_activation(name: str) -> Callable:
     else:
         raise ValueError(f"Unknown activation: {name}")
 
-class Backbone(nn.Module):
+class FeatExtractor(nn.Module):
     network_config: NetworkConfig
-
+    dropout_rate: float = 0.1
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
-        # 投影到嵌入维度
-        x = nn.Dense(self.network_config.actor_net_arch[0])(x)
-        for hidden_dim in self.network_config.actor_net_arch:
-            x = SimbaMLPResidualBlock(scale_factor=4, hidden_dim=hidden_dim)(x)
+        # 对x(obs)应用RSNorm
+        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
+        x = SimbaMLP(net_arch=self.network_config.actor_net_arch, dropout_rate=self.dropout_rate)(x, deterministic=deterministic)
         return x
 
 LOG_STD_MAX = 2
@@ -37,9 +36,7 @@ class TradingActorContinuous(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
-        # 对x(obs)应用RSNorm
-        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
-        x = Backbone(network_config=self.network_config)(x, deterministic=deterministic)
+        x = FeatExtractor(network_config=self.network_config, dropout_rate=self.network_config.actor_dropout_rate)(x, deterministic=deterministic)
         x = nn.LayerNorm()(x)
         x = nn.gelu(x)
         mean = nn.Dense(self.action_dim, name="mean")(x)
@@ -53,10 +50,12 @@ class TradingCriticContinuous(nn.Module):
     
     @nn.compact
     def __call__(self, x: jnp.ndarray, action: jnp.ndarray, deterministic: bool):
-        # 对x(obs)应用RSNorm
-        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
+        x = FeatExtractor(network_config=self.network_config, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
+        x = nn.LayerNorm()(x)
+        x = nn.gelu(x)
         x = jnp.concatenate([x, action], axis=-1)
-        x = Backbone(network_config=self.network_config)(x, deterministic=deterministic)
+        # 将市场账户仓位特征和action拼接后，多用一层处理，
+        x = SimbaMLP(net_arch=[self.network_config.actor_net_arch[0]], dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
         x = nn.LayerNorm()(x)
         x = nn.gelu(x)
         q_value = nn.Dense(1)(x).squeeze(-1)
@@ -70,9 +69,7 @@ class TradingActorDiscrete(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         activation_fn = get_activation(self.network_config.activation)
-        # 对x(obs)应用RSNorm
-        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
-        features = Backbone(network_config=self.network_config)(x, deterministic=deterministic)
+        features = FeatExtractor(network_config=self.network_config, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
         features = nn.LayerNorm(name="final_norm")(features)
         features = activation_fn(features)
         logits = nn.Dense(self.action_dim)(features)
@@ -85,9 +82,7 @@ class TradingCriticDiscrete(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         activation_fn = get_activation(self.network_config.activation)
-        # 对x(obs)应用RSNorm
-        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
-        features = Backbone(network_config=self.network_config)(x, deterministic=deterministic)
+        features = FeatExtractor(network_config=self.network_config, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
         features = nn.LayerNorm(name="final_norm")(features)
         features = activation_fn(features)
         q_values = nn.Dense(self.action_dim)(features)
