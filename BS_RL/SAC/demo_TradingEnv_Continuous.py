@@ -51,7 +51,7 @@ if __name__ == "__main__":
         ),
         network=NetworkConfig(
             actor_net_arch=[512, 512, 512],
-            critic_net_arch=[512, 512, 512, 512, 512],
+            critic_net_arch=[512, 512, 512],
             # 不需要时间序列编码器，直接用MLP
             shape_tickers_positions=(0, 0),  # 不使用
             encoder_type="none",  # 标记为不使用编码器

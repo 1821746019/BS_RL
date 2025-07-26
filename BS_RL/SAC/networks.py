@@ -18,13 +18,13 @@ def get_activation(name: str) -> Callable:
         raise ValueError(f"Unknown activation: {name}")
 
 class FeatExtractor(nn.Module):
-    network_config: NetworkConfig
+    net_arch: List[int]
     dropout_rate: float = 0.1
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         # 对x(obs)应用RSNorm
         x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
-        x = SimbaMLP(net_arch=self.network_config.actor_net_arch, dropout_rate=self.dropout_rate)(x, deterministic=deterministic)
+        x = SimbaMLP(net_arch=self.net_arch, dropout_rate=self.dropout_rate)(x, deterministic=deterministic)
         return x
 
 LOG_STD_MAX = 2
@@ -36,7 +36,7 @@ class TradingActorContinuous(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
-        x = FeatExtractor(network_config=self.network_config, dropout_rate=self.network_config.actor_dropout_rate)(x, deterministic=deterministic)
+        x = FeatExtractor(net_arch=self.network_config.actor_net_arch, dropout_rate=self.network_config.actor_dropout_rate)(x, deterministic=deterministic)
         x = nn.LayerNorm()(x)
         x = nn.gelu(x)
         mean = nn.Dense(self.action_dim, name="mean")(x)
@@ -50,7 +50,7 @@ class TradingCriticContinuous(nn.Module):
     
     @nn.compact
     def __call__(self, x: jnp.ndarray, action: jnp.ndarray, deterministic: bool):
-        x = FeatExtractor(network_config=self.network_config, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
+        x = FeatExtractor(net_arch=self.network_config.actor_net_arch, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
         x = nn.LayerNorm()(x)
         x = nn.gelu(x)
         x = jnp.concatenate([x, action], axis=-1)
@@ -69,7 +69,7 @@ class TradingActorDiscrete(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         activation_fn = get_activation(self.network_config.activation)
-        features = FeatExtractor(network_config=self.network_config, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
+        features = FeatExtractor(net_arch=self.network_config.actor_net_arch, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
         features = nn.LayerNorm(name="final_norm")(features)
         features = activation_fn(features)
         logits = nn.Dense(self.action_dim)(features)
@@ -82,7 +82,7 @@ class TradingCriticDiscrete(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         activation_fn = get_activation(self.network_config.activation)
-        features = FeatExtractor(network_config=self.network_config, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
+        features = FeatExtractor(net_arch=self.network_config.actor_net_arch, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
         features = nn.LayerNorm(name="final_norm")(features)
         features = activation_fn(features)
         q_values = nn.Dense(self.action_dim)(features)
