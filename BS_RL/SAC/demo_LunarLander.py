@@ -96,7 +96,7 @@ if __name__ == "__main__":
     
     args = Args(
         train=TrainConfig(
-            exp_name="LunarLanderContinuous-SAC_transformerFFN瓶颈中间用LN",
+            exp_name="LunarLanderContinuous-SAC",
             save_model=True,
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,  # 首次运行设为False
@@ -122,6 +122,8 @@ if __name__ == "__main__":
             encoder_type="none",  # 标记为不使用编码器
             actor_net_arch=[64, 64],
             critic_net_arch=[64, 64],
+            actor_dropout_rate=0.0,
+            critic_dropout_rate=0.0,
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,

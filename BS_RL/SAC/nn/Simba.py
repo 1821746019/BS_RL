@@ -58,7 +58,7 @@ class SimbaMLP(nn.Module):
         if self.first_projection:
             x = nn.Dense(self.net_arch[0])(x)
         for i, hidden_dim in enumerate(self.net_arch):
-            x = SimbaMLPResidualBlock(scale_factor=4, hidden_dim=hidden_dim)(x, deterministic=deterministic)
+            x = SimbaMLPResidualBlock(scale_factor=4, hidden_dim=hidden_dim, dropout_rate=self.dropout_rate)(x, deterministic=deterministic)
         return x
 class RSNorm(nn.Module):
     epsilon: float = 1e-8

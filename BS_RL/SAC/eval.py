@@ -4,14 +4,14 @@ import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
-from .agent import SACAgentBase
+from .agent import SACAgent
 from .common import eval_env_maker, MetricLogger, StatsAggregator
 from .config import EnvConfig, EvalConfig
 from TradingEnv import DataLoader, DataLoaderConfig, TradingEnvConfig
 
 class Evaluator:
     def __init__(self,
-                 agent: SACAgentBase,
+                 agent: SACAgent,
                  env_config: EnvConfig,
                  eval_config: EvalConfig,
                  run_name_suffix: str,

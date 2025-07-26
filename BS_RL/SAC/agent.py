@@ -5,7 +5,7 @@ import flax.linen as nn
 from flax.training.train_state import TrainState
 import optax
 from functools import partial
-from typing import Union, Optional
+from typing import Union, Optional, TypeVar
 import tensorflow_probability.substrates.jax.distributions as tfd
 
 from .config import AlgoConfig, NetworkConfig
@@ -89,7 +89,7 @@ class SACAgentBase:
         raise NotImplementedError
 
     @partial(jax.jit, static_argnums=(0, 4))
-    def select_action(self, actor_params: flax.core.FrozenDict, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
+    def select_action(self, actor_state: TrainStateWithBatchStats, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
         # 这个方法需要接收actor_state而不仅仅是params，以便获取batch_stats
         raise NotImplementedError("This method should be implemented in subclasses")
 
@@ -672,3 +672,5 @@ class SACAgentContinuous(SACAgentBase):
         actor_metrics = {'actor_loss': actor_loss_val, 'alpha_loss': alpha_loss_val, 'alpha': current_alpha_to_return, 'entropy': entropy_val}
         
         return actor_state_new, log_alpha_state_to_return, current_alpha_to_return, actor_loss_val, actor_metrics
+
+SACAgent = Union[SACAgentDiscrete, SACAgentContinuous]
