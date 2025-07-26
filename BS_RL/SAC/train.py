@@ -79,7 +79,7 @@ class Trainer:
         run_name_suffix = f"{self.args.train.exp_name}__{self.args.env.seed}__{int(time.time())}"
         if self.args.train.save_dir:
             self.base_output_dir = Path(self.args.train.save_dir)
-            self.wandb_run_name = f"{self.base_output_dir.name}__{run_name_suffix}" if self.base_output_dir.name else run_name_suffix
+            self.wandb_run_name = f"{run_name_suffix}__{self.base_output_dir.name}" if self.base_output_dir.name else run_name_suffix
         else:
             self.base_output_dir = Path(f"runs/{run_name_suffix}")
             self.wandb_run_name = run_name_suffix

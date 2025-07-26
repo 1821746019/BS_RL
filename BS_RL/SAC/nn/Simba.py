@@ -11,12 +11,17 @@ class SimbaMLPResidualBlock(nn.Module):
     def __call__(self, x: jnp.ndarray, deterministic: bool = True):
         """通过lunarLander实验，我的写法(LN -> GELU -> Dense -> GELU -> Dense -> +)
         才是最优的，性能提升最快。中间的Dense后跟LN的排名第二
-        比gemini推荐的transformerFFN写法更优"""
+        比gemini推荐的transformerFFN写法更优
+        注意，用同一套参数，用tpu和cpu训练的结果是不同的!需控制变量，经过实验
+        在应用RSNorm后情况发生了变化，中间有LN的性能提升更快，无LN的性能提升缓慢。
+        还是保持用我最开始的想法：一致地使用LN，参考ResNetV2的写法，
+        ... -> BN -> ReLU -> Conv -> BN -> ReLU -> Conv -> Add -> ...
+        """
         residual = x
         x = nn.LayerNorm()(x)
         x = self.activation_fn(x)
         x = nn.Dense(self.scale_factor * self.hidden_dim)(x)
-        # x = nn.LayerNorm()(x)
+        x = nn.LayerNorm()(x)
         x = self.activation_fn(x)
         x = nn.Dense(self.hidden_dim)(x)
         if self.dropout_rate > 0:
