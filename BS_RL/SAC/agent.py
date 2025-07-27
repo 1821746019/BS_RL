@@ -258,12 +258,11 @@ class SACAgentDiscrete(SACAgentBase):
         key_next_logits, key_q_target = jax.random.split(key, 2)
         
         # Get next action logits with batch_stats update
-        next_logits, _ = self._apply_model_with_batch_stats(
+        next_logits = self._apply_model_with_batch_stats(
             self.actor_model,
             {'params': actor_state.params, 'batch_stats': actor_state.batch_stats},
             data['next_observations'],
-            deterministic=False,
-            mutable=['batch_stats'],
+            deterministic=True, # Use deterministic=True, no batch_stats update needed here
             rngs={'dropout': key_next_logits}
         )
         
@@ -527,7 +526,7 @@ class SACAgentContinuous(SACAgentBase):
                 rngs={'dropout': key_dropout}
             )
             dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
-            return dist
+            return dist, None
     
     def _sample_action(self, dist, key_sample, deterministic):
         if deterministic:
@@ -541,7 +540,7 @@ class SACAgentContinuous(SACAgentBase):
     @partial(jax.jit, static_argnums=(0, 4))
     def select_action(self, actor_state: TrainStateWithBatchStats, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
         key_dropout, key_sample = jax.random.split(key)
-        dist = self._get_action_dist(actor_state.params, actor_state.batch_stats, obs, key_dropout, deterministic=True)  # Use deterministic=True for inference
+        dist, _ = self._get_action_dist(actor_state.params, actor_state.batch_stats, obs, key_dropout, deterministic=True)  # Use deterministic=True for inference
         squashed_action, _ = self._sample_action(dist, key_sample, deterministic)
         return squashed_action
 
@@ -557,7 +556,7 @@ class SACAgentContinuous(SACAgentBase):
         next_dist, _ = self._get_action_dist(
             actor_state.params, actor_state.batch_stats, 
             data['next_observations'], key_dropout, 
-            deterministic=False, mutable=True
+            deterministic=True, mutable=False # Use deterministic=True, no batch_stats update needed here
         )
         next_squashed_action, next_action = self._sample_action(next_dist, key_sample, deterministic=False)
         
