@@ -1,3 +1,5 @@
+from BS_RL.SAC.common import Profiler
+
 import os
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
@@ -21,12 +23,11 @@ from flax.training import checkpoints
 import flax.jax_utils
 from tqdm.auto import tqdm
 import joblib
-
-from .config import Args
-from .common import train_env_maker, MetricLogger, StatsAggregator
-from .networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
-from .agent import SACAgentDiscrete, SACAgentContinuous, TrainStateWithBatchStats, CriticTrainState
-from .eval import Evaluator
+from BS_RL.SAC.config import Args
+from BS_RL.SAC.common import profile, train_env_maker, MetricLogger, StatsAggregator
+from BS_RL.SAC.networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
+from BS_RL.SAC.agent import SACAgentDiscrete, SACAgentContinuous, TrainStateWithBatchStats, CriticTrainState
+from BS_RL.SAC.eval import Evaluator
 from TradingEnv import DataLoader
 import wandb
 
@@ -36,7 +37,7 @@ def count_params(params):
 class Trainer:
     def __init__(self, args: Args):
         self.args = args
-        self.num_devices = jax.local_device_count()
+        self.num_devices = 1
 
         self.run_name_suffix = None
         self.wandb_run_name = None
@@ -54,8 +55,8 @@ class Trainer:
         self.qf2_state: CriticTrainState = None
         self.log_alpha_state = None
         self.current_alpha = None
-        self.p_update_all = None
-        self.p_update_target_networks = None
+        self.update_all = None
+        self.update_target_networks = None
         self.data_loader = None
         self.evaluator = None
         self.logger = None
@@ -89,11 +90,10 @@ class Trainer:
         print(f"Checkpoint directory: {self.ckpt_dir}")
 
     def _setup_jax_devices(self):
-        print(f"Found {self.num_devices} JAX devices: {jax.devices()}")
-        if self.args.algo.batch_size % self.num_devices != 0:
-            raise ValueError(f"Global batch size {self.args.algo.batch_size} must be divisible by number of devices {self.num_devices}")
-        self.batch_size_per_device = self.args.algo.batch_size // self.num_devices
-        print(f"Using global batch size: {self.args.algo.batch_size}, per-device batch size: {self.batch_size_per_device}")
+        print(f"JAX running on: {jax.devices()}")
+        # Simplified: no multi-device logic. We assume single device usage.
+        self.batch_size_per_device = self.args.algo.batch_size # Not really per-device anymore
+        print(f"Using global batch size: {self.args.algo.batch_size}")
 
     def _handle_resume_and_directory_setup(self):
         restored_ckpt_path = None
@@ -222,47 +222,45 @@ class Trainer:
         
         self._initialize_or_restore_agent_states()
 
-        actor_p_count = count_params(self.actor_state_single.params) / 1e6
-        critic_p_count = count_params(self.qf1_state_single.params) / 1e6
+        actor_p_count = count_params(self.actor_state.params) / 1e6
+        critic_p_count = count_params(self.qf1_state.params) / 1e6
         print(f"Actor params: {actor_p_count:.2f}M")
         print(f"Critic params: {critic_p_count:.2f}M (x2 networks)")
         if self.args.wandb.track:
             wandb.summary['actor_params_m'] = actor_p_count
             wandb.summary['critic_params_m'] = critic_p_count
 
-        self._replicate_states()
-
-        self.p_update_all = jax.pmap(self.agent.update_all, axis_name='batch')
-        self.p_update_target_networks = jax.pmap(self.agent.update_target_networks)
+        self.update_all = self.agent.update_all
+        self.update_target_networks = self.agent.update_target_networks
 
     def _initialize_or_restore_agent_states(self):
-        actor_state_single = self.agent.actor_state
-        qf1_state_single = self.agent.qf1_state
-        qf2_state_single = self.agent.qf2_state
-        log_alpha_state_single = self.agent.log_alpha_state if self.args.algo.autotune else None
+        actor_state = self.agent.actor_state
+        qf1_state = self.agent.qf1_state
+        qf2_state = self.agent.qf2_state
+        log_alpha_state = self.agent.log_alpha_state if self.args.algo.autotune else None
         
         if self.restored_ckpt_path:
             try:
                 # Define the structure for restoration using placeholder values from the initial states.
                 # This structure must match what was saved in _save_checkpoint.
                 restore_target = {
-                    'actor_params': actor_state_single.params,
-                    'actor_opt_state': actor_state_single.opt_state,
-                    'actor_batch_stats': actor_state_single.batch_stats,
-                    'qf1_params': qf1_state_single.params,
-                    'qf1_opt_state': qf1_state_single.opt_state,
-                    'qf1_batch_stats': qf1_state_single.batch_stats,
-                    'qf1_target_params': qf1_state_single.target_params,
-                    'qf1_target_batch_stats': qf1_state_single.target_batch_stats,
-                    'qf2_params': qf2_state_single.params,
-                    'qf2_opt_state': qf2_state_single.opt_state,
-                    'qf2_batch_stats': qf2_state_single.batch_stats,
-                    'qf2_target_params': qf2_state_single.target_params,
-                    'qf2_target_batch_stats': qf2_state_single.target_batch_stats,
+                    'actor_params': actor_state.params,
+                    'actor_opt_state': actor_state.opt_state,
+                    'actor_batch_stats': actor_state.batch_stats,
+                    'qf1_params': qf1_state.params,
+                    'qf1_opt_state': qf1_state.opt_state,
+                    'qf1_batch_stats': qf1_state.batch_stats,
+                    'qf1_target_params': qf1_state.target_params,
+                    'qf1_target_batch_stats': qf1_state.target_batch_stats,
+                    'qf2_params': qf2_state.params,
+                    'qf2_opt_state': qf2_state.opt_state,
+                    'qf2_batch_stats': qf2_state.batch_stats,
+                    'qf2_target_params': qf2_state.target_params,
+                    'qf2_target_batch_stats': qf2_state.target_batch_stats,
                 }
                 if self.args.algo.autotune:
-                    restore_target['log_alpha_params'] = log_alpha_state_single.params
-                    restore_target['log_alpha_opt_state'] = log_alpha_state_single.opt_state
+                    restore_target['log_alpha_params'] = log_alpha_state.params
+                    restore_target['log_alpha_opt_state'] = log_alpha_state.opt_state
 
                 # Restore the raw arrays and optimizer states.
                 # latest_checkpoint provides the full path to the specific checkpoint directory.
@@ -272,19 +270,19 @@ class Trainer:
                 )
                 
                 # Manually update the TrainState objects with the loaded contents.
-                actor_state_single = actor_state_single.replace(
+                actor_state = actor_state.replace(
                     params=loaded_contents['actor_params'],
                     opt_state=loaded_contents['actor_opt_state'],
                     batch_stats=loaded_contents['actor_batch_stats']
                 )
-                qf1_state_single = qf1_state_single.replace(
+                qf1_state = qf1_state.replace(
                     params=loaded_contents['qf1_params'],
                     opt_state=loaded_contents['qf1_opt_state'],
                     batch_stats=loaded_contents['qf1_batch_stats'],
                     target_params=loaded_contents['qf1_target_params'],
                     target_batch_stats=loaded_contents['qf1_target_batch_stats']
                 )
-                qf2_state_single = qf2_state_single.replace(
+                qf2_state = qf2_state.replace(
                     params=loaded_contents['qf2_params'],
                     opt_state=loaded_contents['qf2_opt_state'],
                     batch_stats=loaded_contents['qf2_batch_stats'],
@@ -292,7 +290,7 @@ class Trainer:
                     target_batch_stats=loaded_contents['qf2_target_batch_stats']
                 )
                 if self.args.algo.autotune and 'log_alpha_params' in loaded_contents:
-                    log_alpha_state_single = log_alpha_state_single.replace(
+                    log_alpha_state = log_alpha_state.replace(
                         params=loaded_contents['log_alpha_params'],
                         opt_state=loaded_contents['log_alpha_opt_state']
                     )
@@ -301,23 +299,13 @@ class Trainer:
                 print(f"Error restoring agent states: {e}. Starting with fresh states.")
                 self.initial_global_step = 0
         
-        self.actor_state_single = actor_state_single
-        self.qf1_state_single = qf1_state_single
-        self.qf2_state_single = qf2_state_single
-        self.log_alpha_state_single = log_alpha_state_single
-        self.current_alpha_single = jnp.exp(log_alpha_state_single.params['log_alpha']) if self.args.algo.autotune and log_alpha_state_single else jnp.array(self.args.algo.alpha)
+        self.actor_state = actor_state
+        self.qf1_state = qf1_state
+        self.qf2_state = qf2_state
+        self.log_alpha_state = log_alpha_state
+        self.current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.args.algo.autotune and log_alpha_state else jnp.array(self.args.algo.alpha)
 
         self.restored_ckpt_path = self.restored_ckpt_path
-
-    def _replicate_states(self):
-        self.actor_state = flax.jax_utils.replicate(self.actor_state_single)
-        self.qf1_state = flax.jax_utils.replicate(self.qf1_state_single)
-        self.qf2_state = flax.jax_utils.replicate(self.qf2_state_single)
-        if self.args.algo.autotune:
-            self.log_alpha_state = flax.jax_utils.replicate(self.log_alpha_state_single)
-        else:
-            self.log_alpha_state = None
-        self.current_alpha = flax.jax_utils.replicate(self.current_alpha_single)
 
     def _setup_replay_buffer(self):
         loaded_rb = False
@@ -365,7 +353,8 @@ class Trainer:
 
         total_iterations = self.args.algo.total_timesteps // self.args.env.env_num
         start_iteration = self.initial_global_step // self.args.env.env_num
-        
+        profiler = Profiler()
+        profiler.start()
         with tqdm(initial=start_iteration, total=total_iterations, desc="Training") as pbar:
             for loop_iter in range(start_iteration, total_iterations):
                 current_step = loop_iter * self.args.env.env_num
@@ -411,7 +400,8 @@ class Trainer:
 
                 pbar.set_postfix(pbar_postfix)
                 pbar.update(1)
-        
+        profiler.stop()
+        profiler.print()
         self._save_final_model()
         self.cleanup()
 
@@ -421,8 +411,7 @@ class Trainer:
             actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)])
         else:
             jax_obs = jnp.asarray(obs)
-            unreplicated_actor_state = flax.jax_utils.unreplicate(self.actor_state)
-            actions_jax = self.agent.select_action(unreplicated_actor_state, jax_obs, key_actions_step, deterministic=False)
+            actions_jax = self.agent.select_action(self.actor_state, jax_obs, key_actions_step, deterministic=False)
             actions = np.array(jax.device_get(actions_jax))
 
         next_obs, rewards, terminations, truncations, infos = self.envs.step(actions)
@@ -435,6 +424,7 @@ class Trainer:
         self.rb.add(obs, real_next_obs, actions, rewards.astype(np.float32), terminations.astype(np.float32), infos)
         return next_obs, infos
 
+    @profile
     def _agent_update(self, current_step):
         self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
         data = self.rb.sample(self.args.algo.batch_size)
@@ -450,24 +440,21 @@ class Trainer:
             'rewards': data.rewards.numpy().flatten(),
             'dones': data.dones.numpy().flatten()
         }
-        sharded_data = {k: v.reshape(self.num_devices, self.batch_size_per_device, *v.shape[1:]) for k, v in data_numpy.items()}
-        sharded_key = jax.random.split(key_update_step, self.num_devices)
         
         log_alpha_arg = self.log_alpha_state if self.args.algo.autotune else self.current_alpha
 
-        self.actor_state, self.qf1_state, self.qf2_state, returned_log_alpha, self.current_alpha, metrics_sharded = self.p_update_all(
-            self.actor_state, self.qf1_state, self.qf2_state, log_alpha_arg, sharded_data, sharded_key
+        self.actor_state, self.qf1_state, self.qf2_state, returned_log_alpha, self.current_alpha, metrics = self.update_all(
+            self.actor_state, self.qf1_state, self.qf2_state, log_alpha_arg, data_numpy, key_update_step
         )
         if self.args.algo.autotune:
             self.log_alpha_state = returned_log_alpha
         
         if current_step % (self.args.algo.update_frequency * 100) == 0:
-            metrics = flax.jax_utils.unreplicate(metrics_sharded)
             return {f"{k}": v for k, v in metrics.items()}
         return None
 
     def _update_target_networks(self):
-        self.qf1_state, self.qf2_state = self.p_update_target_networks(self.qf1_state, self.qf2_state)
+        self.qf1_state, self.qf2_state = self.update_target_networks(self.qf1_state, self.qf2_state)
 
     def _run_evaluation(self, current_step, next_step):
         if not self.evaluator: return
@@ -483,7 +470,7 @@ class Trainer:
         tqdm.write(f"--- Evaluation Triggered at step {current_step} (effective eval step: {eval_trigger_step}) ---")
         
         eval_metrics = self.evaluator.evaluate(
-            actor_state_eval=flax.jax_utils.unreplicate(self.actor_state),
+            actor_state_eval=self.actor_state,
             current_train_step=current_step
         )
         
@@ -503,23 +490,23 @@ class Trainer:
 
         try:
             save_target = {
-                'actor_params': flax.jax_utils.unreplicate(self.actor_state.params),
-                'actor_opt_state': flax.jax_utils.unreplicate(self.actor_state.opt_state),
-                'actor_batch_stats': flax.jax_utils.unreplicate(self.actor_state.batch_stats),
-                'qf1_params': flax.jax_utils.unreplicate(self.qf1_state.params),
-                'qf1_opt_state': flax.jax_utils.unreplicate(self.qf1_state.opt_state),
-                'qf1_batch_stats': flax.jax_utils.unreplicate(self.qf1_state.batch_stats),
-                'qf1_target_params': flax.jax_utils.unreplicate(self.qf1_state.target_params),
-                'qf1_target_batch_stats': flax.jax_utils.unreplicate(self.qf1_state.target_batch_stats),
-                'qf2_params': flax.jax_utils.unreplicate(self.qf2_state.params),
-                'qf2_opt_state': flax.jax_utils.unreplicate(self.qf2_state.opt_state),
-                'qf2_batch_stats': flax.jax_utils.unreplicate(self.qf2_state.batch_stats),
-                'qf2_target_params': flax.jax_utils.unreplicate(self.qf2_state.target_params),
-                'qf2_target_batch_stats': flax.jax_utils.unreplicate(self.qf2_state.target_batch_stats),
+                'actor_params': self.actor_state.params,
+                'actor_opt_state': self.actor_state.opt_state,
+                'actor_batch_stats': self.actor_state.batch_stats,
+                'qf1_params': self.qf1_state.params,
+                'qf1_opt_state': self.qf1_state.opt_state,
+                'qf1_batch_stats': self.qf1_state.batch_stats,
+                'qf1_target_params': self.qf1_state.target_params,
+                'qf1_target_batch_stats': self.qf1_state.target_batch_stats,
+                'qf2_params': self.qf2_state.params,
+                'qf2_opt_state': self.qf2_state.opt_state,
+                'qf2_batch_stats': self.qf2_state.batch_stats,
+                'qf2_target_params': self.qf2_state.target_params,
+                'qf2_target_batch_stats': self.qf2_state.target_batch_stats,
             }
             if self.args.algo.autotune and self.log_alpha_state:
-                save_target['log_alpha_params'] = flax.jax_utils.unreplicate(self.log_alpha_state.params)
-                save_target['log_alpha_opt_state'] = flax.jax_utils.unreplicate(self.log_alpha_state.opt_state)
+                save_target['log_alpha_params'] = self.log_alpha_state.params
+                save_target['log_alpha_opt_state'] = self.log_alpha_state.opt_state
 
             checkpoints.save_checkpoint(
                 ckpt_dir=os.path.abspath(self.ckpt_dir), target=save_target, step=step_for_ckpt,

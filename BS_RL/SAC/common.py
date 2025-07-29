@@ -6,7 +6,26 @@ import collections
 import numpy as np
 import wandb
 import gymnasium
+from BS_RL.SAC.config import ENABLE_PROFILE
+try:
+    import line_profiler
+    profile: Callable = line_profiler.profile
+except:
+    profile = lambda x: x
 
+if ENABLE_PROFILE:
+    from pyinstrument import Profiler
+else:
+    class Profiler:
+        def __init__(self):
+            print("pyinstrument Profiler is disabled")
+        def start(self):
+            pass
+        def stop(self):
+            pass
+        def print(self):
+            pass
+    
 class StatsAggregator:
     """A helper class to aggregate episode statistics."""
     def __init__(self, maxlen: Optional[int] =  64):

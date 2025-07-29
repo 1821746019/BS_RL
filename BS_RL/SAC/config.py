@@ -6,6 +6,8 @@ from TradingEnv import TradingEnvConfig as TradingEnvConfig
 from .nn.ResMLP import ResMLPConfig, ResidualStrategy, ActivationPosition, ResMLPPresets
 from .nn.ResNet1DEncoder import ResNet1DConfig, ResidualBlock1D
 import jax
+ENABLE_PROFILE = True
+
 @dataclass
 class EnvConfig:
     trading_env_config: TradingEnvConfig = field(default_factory=TradingEnvConfig)
@@ -84,8 +86,8 @@ class TrainConfig:
     def __post_init__(self):
         if self.jax_platform_name is None:
             # 自动选择可用后端
-            # os.environ['JAX_PLATFORMS'] = ''
-            jax.config.update('jax_platforms', '')
+            self.jax_platform_name = ""
+        jax.config.update('jax_platforms', self.jax_platform_name)
 @dataclass
 class EvalConfig:
     eval_frequency: Union[float, int] = 0.01
@@ -136,8 +138,8 @@ class NetworkConfig:
     shape_tickers_positions: Tuple[int, int] = field(default_factory=lambda: (0, 0))
     actor_net_arch: List[int] = field(default_factory=lambda: [512, 512, 512])
     critic_net_arch: List[int] = field(default_factory=lambda: [512, 512, 512])
-    actor_dropout_rate: float = 0.1
-    critic_dropout_rate: float = 0.2
+    actor_dropout_rate: float = 0
+    critic_dropout_rate: float = 0
     encoder_type: str = "resnet1d"  # "convnext", "cnn1d", "resnet1d", "kline"
     
     # Encoder configs

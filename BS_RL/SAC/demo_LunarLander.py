@@ -1,10 +1,10 @@
 import numpy as np
 import tyro
 import gymnasium as gym
-from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
-from .nn.ResMLP import ResMLPConfig, ResidualStrategy
-from .train import Trainer
-from .common import gym_train_env_maker, gym_eval_env_maker
+from BS_RL.SAC.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
+from BS_RL.SAC.nn.ResMLP import ResMLPConfig, ResidualStrategy
+from BS_RL.SAC.train import Trainer
+from BS_RL.SAC.common import gym_train_env_maker, gym_eval_env_maker
 import os
 from TradingEnv import TradingEnvConfig
 
@@ -38,7 +38,7 @@ class GymTrainer(Trainer):
             return
         print("设置评估器（gym模式）...")
         
-        from .eval import Evaluator
+        from BS_RL.SAC.eval import Evaluator
         
         # 创建一个修改版的评估器
         class GymEvaluator(Evaluator):
@@ -86,9 +86,9 @@ if __name__ == "__main__":
     eval_episodes = 10
     
     is_test = total_timesteps != int(1e6)
-    learning_starts = 10000 if not is_test else 1000
-    ckpt_save_frequency = 0.1 if not is_test else None  # 每10%保存一次
-    eval_frequency = 0.05 if not is_test else None  # 每5%评估一次
+    learning_starts = 10000 if not is_test else batch_size
+    ckpt_save_frequency = 0
+    eval_frequency = 0.1
     
     # 针对LunarLanderContinuous优化的网络配置
     # 观察空间: 8维向量 (位置、速度、角度、角速度、腿接触等)
@@ -96,6 +96,7 @@ if __name__ == "__main__":
     
     args = Args(
         train=TrainConfig(
+            jax_platform_name="tpu", # 使用cpu训练
             exp_name="LunarLanderContinuous-SAC",
             save_model=True,
             ckpt_save_frequency=ckpt_save_frequency,

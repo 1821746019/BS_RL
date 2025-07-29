@@ -7,7 +7,7 @@ import optax
 from functools import partial
 from typing import Union, Optional, TypeVar
 import tensorflow_probability.substrates.jax.distributions as tfd
-
+from .common import profile
 from .config import AlgoConfig, NetworkConfig
 from .networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
 
@@ -30,7 +30,8 @@ class SACAgentBase:
                  critic_model_cls,
                  norm_limit: float
                  ):
-
+        self.actor_model: nn.Module
+        self.critic_model: nn.Module
         self.algo_config = algo_config
         self.action_dim = action_dim
         self.network_config = network_config
@@ -75,7 +76,7 @@ class SACAgentBase:
         batch_stats = variables.get('batch_stats')
         return params, batch_stats
 
-    def _apply_model_with_batch_stats(self, model, variables, *args, deterministic=True, mutable=None, **kwargs):
+    def _apply_model_with_batch_stats(self, model: nn.Module, variables, *args, deterministic=True, mutable=None, **kwargs):
         """Helper method to apply model with proper batch_stats handling"""
         if mutable:
             return model.apply(variables, *args, deterministic=deterministic, mutable=mutable, **kwargs)
@@ -93,15 +94,13 @@ class SACAgentBase:
         # 这个方法需要接收actor_state而不仅仅是params，以便获取batch_stats
         raise NotImplementedError("This method should be implemented in subclasses")
 
-    @partial(jax.jit, static_argnums=(0,))
     def _update_critic(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
         raise NotImplementedError
 
-    @partial(jax.jit, static_argnums=(0,))
     def _update_actor_and_alpha(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
         raise NotImplementedError
-
     @partial(jax.jit, static_argnums=(0,))
+    @profile
     def update_target_networks(self, qf1_state: CriticTrainState, qf2_state: CriticTrainState):
         qf1_state_new = qf1_state.replace(
             target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, self.algo_config.tau)
@@ -123,6 +122,7 @@ class SACAgentBase:
 
     # Combined update function
     @partial(jax.jit, static_argnums=(0,))
+    @profile
     def update_all(self,
                    actor_state: TrainState,
                    qf1_state: CriticTrainState,
@@ -306,9 +306,6 @@ class SACAgentDiscrete(SACAgentBase):
             return loss, (qf1_taken_action.mean(), new_qf1_vars)
             
         (qf1_loss_val, (qf1_values_mean, new_qf1_vars)), qf1_grads = jax.value_and_grad(qf1_loss_fn, has_aux=True)(qf1_state.params)
-        qf1_grads = jax.lax.pmean(qf1_grads, axis_name='batch')
-        qf1_loss_val = jax.lax.pmean(qf1_loss_val, axis_name='batch')
-        qf1_values_mean = jax.lax.pmean(qf1_values_mean, axis_name='batch')
         qf1_state_new = qf1_state.apply_gradients(grads=qf1_grads).replace(batch_stats=new_qf1_vars['batch_stats'])
         
         def qf2_loss_fn(params):
@@ -325,13 +322,9 @@ class SACAgentDiscrete(SACAgentBase):
             return loss, (qf2_taken_action.mean(), new_qf2_vars)
             
         (qf2_loss_val, (qf2_values_mean, new_qf2_vars)), qf2_grads = jax.value_and_grad(qf2_loss_fn, has_aux=True)(qf2_state.params)
-        qf2_grads = jax.lax.pmean(qf2_grads, axis_name='batch')
-        qf2_loss_val = jax.lax.pmean(qf2_loss_val, axis_name='batch')
-        qf2_values_mean = jax.lax.pmean(qf2_values_mean, axis_name='batch')
         qf2_state_new = qf2_state.apply_gradients(grads=qf2_grads).replace(batch_stats=new_qf2_vars['batch_stats'])
 
         critic_loss = (qf1_loss_val + qf2_loss_val) / 2.0
-        critic_loss = jax.lax.pmean(critic_loss, axis_name='batch')
         
         return qf1_state_new, qf2_state_new, critic_loss, \
                {'qf1_loss': qf1_loss_val, 'qf2_loss': qf2_loss_val,
@@ -390,9 +383,6 @@ class SACAgentDiscrete(SACAgentBase):
             return loss, (entropy, new_actor_vars)
 
         (actor_loss_val, (entropy_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
-        actor_grads = jax.lax.pmean(actor_grads, axis_name='batch')
-        actor_loss_val = jax.lax.pmean(actor_loss_val, axis_name='batch')
-        entropy_val = jax.lax.pmean(entropy_val, axis_name='batch')
         actor_state_new = actor_state.apply_gradients(grads=actor_grads).replace(batch_stats=new_actor_vars['batch_stats'])
 
         alpha_loss_val = 0.0
@@ -420,9 +410,7 @@ class SACAgentDiscrete(SACAgentBase):
                 loss = jnp.sum(alpha_loss_components, axis=1).mean()
                 return loss
 
-            alpha_loss_val_scalar, alpha_grads_dict = jax.value_and_grad(alpha_loss_fn)(log_alpha_input.params)
-            alpha_grads_dict = jax.lax.pmean(alpha_grads_dict, axis_name='batch')
-            alpha_loss_val = jax.lax.pmean(alpha_loss_val_scalar, axis_name='batch')
+            alpha_loss_val, alpha_grads_dict = jax.value_and_grad(alpha_loss_fn)(log_alpha_input.params)
             
             log_alpha_state_updated = log_alpha_input.apply_gradients(grads=alpha_grads_dict)
             log_alpha_state_to_return = log_alpha_state_updated
@@ -504,7 +492,7 @@ class SACAgentContinuous(SACAgentBase):
             params=log_alpha_params,
             tx=self.alpha_optimizer
         )
-
+    @profile
     def _get_action_dist(self, actor_params, actor_batch_stats, obs, key_dropout, deterministic, mutable=False):
         variables = {'params': actor_params}
         if actor_batch_stats is not None:
@@ -527,7 +515,7 @@ class SACAgentContinuous(SACAgentBase):
             )
             dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
             return dist, None
-    
+    @profile
     def _sample_action(self, dist, key_sample, deterministic):
         if deterministic:
             action = dist.mean()
@@ -545,7 +533,8 @@ class SACAgentContinuous(SACAgentBase):
         return squashed_action
 
     @partial(jax.jit, static_argnums=(0,))
-    def _update_critic(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
+    @profile
+    def _update_critic(self, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, log_alpha_input: Union[TrainState, jnp.ndarray], data: dict, key: jax.random.PRNGKey):
         if self.algo_config.autotune:
             current_alpha = jnp.exp(log_alpha_input['log_alpha'])
         else:
@@ -593,13 +582,9 @@ class SACAgentContinuous(SACAgentBase):
             return loss, (q_val.mean(), new_vars)
 
         (qf1_loss_val, (qf1_values_mean, new_qf1_vars)), qf1_grads = jax.value_and_grad(qf_loss_fn, has_aux=True)(qf1_state.params, qf1_state.batch_stats, key)
-        qf1_grads = jax.lax.pmean(qf1_grads, axis_name='batch')
-        qf1_loss_val = jax.lax.pmean(qf1_loss_val, axis_name='batch')
         qf1_state_new = qf1_state.apply_gradients(grads=qf1_grads).replace(batch_stats=new_qf1_vars['batch_stats'])
         
         (qf2_loss_val, (qf2_values_mean, new_qf2_vars)), qf2_grads = jax.value_and_grad(qf_loss_fn, has_aux=True)(qf2_state.params, qf2_state.batch_stats, key)
-        qf2_grads = jax.lax.pmean(qf2_grads, axis_name='batch')
-        qf2_loss_val = jax.lax.pmean(qf2_loss_val, axis_name='batch')
         qf2_state_new = qf2_state.apply_gradients(grads=qf2_grads).replace(batch_stats=new_qf2_vars['batch_stats'])
 
         critic_loss = (qf1_loss_val + qf2_loss_val) / 2.0
@@ -610,6 +595,7 @@ class SACAgentContinuous(SACAgentBase):
         }
 
     @partial(jax.jit, static_argnums=(0,))
+    @profile
     def _update_actor_and_alpha(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
         key_actor, key_alpha, key_sample = jax.random.split(key, 3)
         
@@ -647,7 +633,6 @@ class SACAgentContinuous(SACAgentBase):
             return actor_loss, (entropy, log_prob, new_actor_vars)
 
         (actor_loss_val, (entropy_val, log_prob_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
-        actor_grads = jax.lax.pmean(actor_grads, axis_name='batch')
         actor_state_new = actor_state.apply_gradients(grads=actor_grads).replace(batch_stats=new_actor_vars['batch_stats'])
         
         alpha_loss_val = 0.0
@@ -660,9 +645,7 @@ class SACAgentContinuous(SACAgentBase):
                 alpha_loss = (-jnp.exp(log_alpha_params_dict['log_alpha']) * (detached_log_prob + self.target_entropy)).mean()
                 return alpha_loss
 
-            alpha_loss_val_scalar, alpha_grads_dict = jax.value_and_grad(alpha_loss_fn)(log_alpha_input.params)
-            alpha_grads_dict = jax.lax.pmean(alpha_grads_dict, axis_name='batch')
-            alpha_loss_val = jax.lax.pmean(alpha_loss_val_scalar, axis_name='batch')
+            alpha_loss_val, alpha_grads_dict = jax.value_and_grad(alpha_loss_fn)(log_alpha_input.params)
             
             log_alpha_state_updated = log_alpha_input.apply_gradients(grads=alpha_grads_dict)
             log_alpha_state_to_return = log_alpha_state_updated

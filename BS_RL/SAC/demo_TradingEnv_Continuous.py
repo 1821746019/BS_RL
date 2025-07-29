@@ -2,17 +2,17 @@ from TradingEnv.Config import DataLoaderConfig
 import numpy as np
 import tyro
 import gymnasium as gym
-from .config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
-from .nn.ResMLP import ResMLPConfig, ResidualStrategy
-from .train import train
-from .common import gym_train_env_maker, gym_eval_env_maker
+from BS_RL.SAC.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
+from BS_RL.SAC.nn.ResMLP import ResMLPConfig, ResidualStrategy
+from BS_RL.SAC.train import train
+from BS_RL.SAC.common import gym_train_env_maker, gym_eval_env_maker
 import os
 from TradingEnv import TradingEnvConfig
 
 
 if __name__ == "__main__":
     env_id = "TradingEnv"
-    window_size = 3
+    window_size = 1 # 防止过拟合，用1
     use_SGD = False
     total_timesteps = int(100e6) 
     batch_size = 256
@@ -50,8 +50,8 @@ if __name__ == "__main__":
             env_num=env_num,
         ),
         network=NetworkConfig(
-            actor_net_arch=[512, 512, 512],
-            critic_net_arch=[512, 512, 512],
+            actor_net_arch=[128, 128, 128],
+            critic_net_arch=[128, 128, 128],
             # 不需要时间序列编码器，直接用MLP
             shape_tickers_positions=(0, 0),  # 不使用
             encoder_type="none",  # 标记为不使用编码器

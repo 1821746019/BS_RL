@@ -34,6 +34,7 @@ dependencies = [
     "equinox",
     "flax",
     "optax",
+    "distrax",
     "stable_baselines3",
     "torch",#SB3依赖，必须显式安装，否则会装GPU版
     # "envpool",
@@ -43,6 +44,7 @@ dependencies = [
     "pygame",
     "gymnasium[atari,accept-rom-license,other]",
     "joblib",
+    "pyinstrument",
 ]
 # 可选依赖 - 只需要CPU版本
 [project.optional-dependencies]
@@ -53,5 +55,7 @@ cpu = [
     # "torchaudio", 
 ]
 
-
+box2d = [
+    "gymnasium[box2d]",
+]
 
