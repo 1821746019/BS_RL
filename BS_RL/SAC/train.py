@@ -359,10 +359,7 @@ class Trainer:
         )
 
     def train(self):
-        start_time = time.time()
         obs, _ = self.envs.reset(seed=self.args.env.seed + self.initial_global_step)
-        
-        
         train_stats_aggregator = StatsAggregator()
         pbar_postfix = collections.OrderedDict()
 
@@ -386,7 +383,7 @@ class Trainer:
                     if current_step % self.args.algo.update_frequency == 0:
                         metrics_from_update = self._agent_update(current_step)
                         if metrics_from_update:
-                            sps = int((current_step - self.initial_global_step) / (time.time() - start_time + 1e-9))
+                            sps = int(pbar.format_dict['rate'] * self.args.env.env_num) # iter/s * env_num = step/s
                             pbar_postfix["SPS"] = sps
                             
                             log_data = {}
