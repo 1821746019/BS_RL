@@ -6,7 +6,7 @@ from TradingEnv import TradingEnvConfig as TradingEnvConfig
 from .nn.ResMLP import ResMLPConfig, ResidualStrategy, ActivationPosition, ResMLPPresets
 from .nn.ResNet1DEncoder import ResNet1DConfig, ResidualBlock1D
 import jax
-ENABLE_PROFILE = True
+ENABLE_PROFILE = __name__.split(".")[0] in os.getenv("PROFILE_PACKAGES", "").split(",") # 如果PROFILE_PACKAGES中包含当前包名，则进行profile
 
 @dataclass
 class EnvConfig:
@@ -63,8 +63,6 @@ class WandbConfig:
 class TrainConfig:
     exp_name: str = os.path.basename(__file__)[: -len(".py")] # Adjusted in train.py
     """the name of this experiment"""
-    save_model: bool = False # This will be implicitly True if checkpointing is frequent
-    """whether to save model into the `runs/{run_name}` folder (deprecated by save_dir and ckpt logic)"""
     # JAX specific
     jax_platform_name: Optional[str] = None # "cpu", "gpu", "tpu". None means JAX default.
     """The platform to run JAX on"""
@@ -221,12 +219,4 @@ class Args:
         
         if self.eval.eval_frequency_abs_steps is None or self.eval.eval_frequency_abs_steps <= 0:
             self.eval.eval_frequency_abs_steps = self.algo.total_timesteps + 1
-        
-        # Deprecate save_model if periodic checkpointing is active
-        if self.train.save_model and self.train.ckpt_save_frequency_abs_steps is not None and self.train.ckpt_save_frequency_abs_steps <= self.algo.total_timesteps:
-            print("Warning: `train.save_model` is True, but periodic checkpointing is active. Only periodic checkpoints will be saved. The final model will be one of these periodic checkpoints.")
-        # self.train.save_model = False # Optionally force it False
-        
-        # If save_dir is not set, construct the default one here or in train.py.
-        # For now, train.py will handle the default path construction if save_dir is None.
         pass

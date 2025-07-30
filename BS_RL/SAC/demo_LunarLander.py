@@ -79,16 +79,16 @@ class GymTrainer(Trainer):
 
 if __name__ == "__main__":
     # LunarLanderContinuous参数配置
-    total_timesteps = int(1e6)  # 100万步，足够测试收敛性
+    total_timesteps = int(1e5)  # 100万步，足够测试收敛性
     batch_size = 256
     env_num = 1  # SAC通常使用单环境
     eval_env_num = 10
     eval_episodes = 10
     
     is_test = total_timesteps != int(1e6)
-    learning_starts = 10000 if not is_test else batch_size
+    learning_starts = batch_size if is_test else 10000
     ckpt_save_frequency = 0
-    eval_frequency = 0.1
+    eval_frequency = 0 if is_test else 0.1
     
     # 针对LunarLanderContinuous优化的网络配置
     # 观察空间: 8维向量 (位置、速度、角度、角速度、腿接触等)
@@ -98,7 +98,6 @@ if __name__ == "__main__":
         train=TrainConfig(
             jax_platform_name="tpu", # 使用cpu训练
             exp_name="LunarLanderContinuous-SAC",
-            save_model=True,
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,  # 首次运行设为False
             save_dir=f"runs/LunarLanderContinuous_SAC",
@@ -142,7 +141,7 @@ if __name__ == "__main__":
             adam_eps=1e-4
         ),
         wandb=WandbConfig(
-            track=True,
+            track=os.getenv("USE_WANDB", "true").lower() == "true",
             project_name="SAC-Continuous_LunarLander",
             entity=None
         )

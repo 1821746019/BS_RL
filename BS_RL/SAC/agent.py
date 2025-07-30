@@ -99,8 +99,7 @@ class SACAgentBase:
 
     def _update_actor_and_alpha(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
         raise NotImplementedError
-    @partial(jax.jit, static_argnums=(0,))
-    @profile
+    
     def update_target_networks(self, qf1_state: CriticTrainState, qf2_state: CriticTrainState):
         qf1_state_new = qf1_state.replace(
             target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, self.algo_config.tau)
@@ -121,8 +120,6 @@ class SACAgentBase:
         return qf1_state_new, qf2_state_new
 
     # Combined update function
-    @partial(jax.jit, static_argnums=(0,))
-    @profile
     def update_all(self,
                    actor_state: TrainState,
                    qf1_state: CriticTrainState,
@@ -152,6 +149,28 @@ class SACAgentBase:
         all_metrics = {**critic_metrics, **actor_alpha_metrics, 'critic_loss_combined': critic_loss}
         return actor_state, qf1_state, qf2_state, returned_log_alpha_state, returned_current_alpha, all_metrics
 
+    @partial(jax.jit, static_argnums=(0, 6))
+    def _update_train_step(self,
+                           actor_state: TrainState,
+                           qf1_state: CriticTrainState,
+                           qf2_state: CriticTrainState,
+                           log_alpha_input: Union[TrainState, flax.core.FrozenDict, jnp.ndarray],
+                           data: dict,
+                           do_target_update: bool,
+                           key: jax.random.PRNGKey):
+        
+        actor_state, qf1_state, qf2_state, returned_log_alpha, current_alpha, metrics = self.update_all(
+            actor_state, qf1_state, qf2_state, log_alpha_input, data, key
+        )
+
+        qf1_state_new, qf2_state_new = jax.lax.cond(
+            do_target_update,
+            self.update_target_networks,
+            lambda q1, q2: (q1, q2),
+            qf1_state, qf2_state
+        )
+
+        return actor_state, qf1_state_new, qf2_state_new, returned_log_alpha, current_alpha, metrics
 
 class SACAgentDiscrete(SACAgentBase):
     def __init__(self,
@@ -533,7 +552,6 @@ class SACAgentContinuous(SACAgentBase):
         return squashed_action
 
     @partial(jax.jit, static_argnums=(0,))
-    @profile
     def _update_critic(self, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, log_alpha_input: Union[TrainState, jnp.ndarray], data: dict, key: jax.random.PRNGKey):
         if self.algo_config.autotune:
             current_alpha = jnp.exp(log_alpha_input['log_alpha'])
@@ -595,7 +613,6 @@ class SACAgentContinuous(SACAgentBase):
         }
 
     @partial(jax.jit, static_argnums=(0,))
-    @profile
     def _update_actor_and_alpha(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
         key_actor, key_alpha, key_sample = jax.random.split(key, 3)
         

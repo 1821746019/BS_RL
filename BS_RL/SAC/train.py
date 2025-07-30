@@ -230,8 +230,6 @@ class Trainer:
             wandb.summary['actor_params_m'] = actor_p_count
             wandb.summary['critic_params_m'] = critic_p_count
 
-        self.update_all = self.agent.update_all
-        self.update_target_networks = self.agent.update_target_networks
 
     def _initialize_or_restore_agent_states(self):
         actor_state = self.agent.actor_state
@@ -305,7 +303,6 @@ class Trainer:
         self.log_alpha_state = log_alpha_state
         self.current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.args.algo.autotune and log_alpha_state else jnp.array(self.args.algo.alpha)
 
-        self.restored_ckpt_path = self.restored_ckpt_path
 
     def _setup_replay_buffer(self):
         loaded_rb = False
@@ -354,9 +351,12 @@ class Trainer:
         total_iterations = self.args.algo.total_timesteps // self.args.env.env_num
         start_iteration = self.initial_global_step // self.args.env.env_num
         profiler = Profiler()
-        profiler.start()
+        # jax.profiler.start_trace(self.base_output_dir / "trace")
+        update_cnt = 0
         with tqdm(initial=start_iteration, total=total_iterations, desc="Training") as pbar:
             for loop_iter in range(start_iteration, total_iterations):
+                if update_cnt == 1:
+                    profiler.start() # 首次更新，tpu预热完毕，开始profile
                 current_step = loop_iter * self.args.env.env_num
                 
                 obs, infos = self._environment_step(obs, current_step)
@@ -370,6 +370,7 @@ class Trainer:
 
                 if current_step > self.args.algo.learning_starts:
                     if current_step % self.args.algo.update_frequency == 0:
+                        update_cnt += 1
                         metrics_from_update = self._agent_update(current_step)
                         if metrics_from_update:
                             sps = int(pbar.format_dict['rate'] * self.args.env.env_num) # iter/s * env_num = step/s
@@ -391,18 +392,18 @@ class Trainer:
                             if self.args.wandb.track:
                                 wandb.log(log_data, step=current_step)
 
-                    if current_step % self.args.algo.target_network_frequency == 0:
-                        self._update_target_networks()
+                    # if current_step % self.args.algo.target_network_frequency == 0:
+                    #     self._update_target_networks()
                 
                 next_step = (loop_iter + 1) * self.args.env.env_num
                 self._run_evaluation(current_step, next_step)
                 self._save_checkpoint(current_step, next_step)
 
-                pbar.set_postfix(pbar_postfix)
+                pbar.set_postfix(pbar_postfix, refresh=False) #不立即刷新提升性能 4.73/37.15
                 pbar.update(1)
+        # jax.profiler.stop_trace()
         profiler.stop()
         profiler.print()
-        self._save_final_model()
         self.cleanup()
 
     def _environment_step(self, obs, current_step):
@@ -443,8 +444,10 @@ class Trainer:
         
         log_alpha_arg = self.log_alpha_state if self.args.algo.autotune else self.current_alpha
 
-        self.actor_state, self.qf1_state, self.qf2_state, returned_log_alpha, self.current_alpha, metrics = self.update_all(
-            self.actor_state, self.qf1_state, self.qf2_state, log_alpha_arg, data_numpy, key_update_step
+        do_target_update = (current_step // self.args.algo.update_frequency) % (self.args.algo.target_network_frequency // self.args.algo.update_frequency) == 0
+
+        self.actor_state, self.qf1_state, self.qf2_state, returned_log_alpha, self.current_alpha, metrics = self.agent._update_train_step(
+            self.actor_state, self.qf1_state, self.qf2_state, log_alpha_arg, data_numpy, do_target_update, key_update_step
         )
         if self.args.algo.autotune:
             self.log_alpha_state = returned_log_alpha
@@ -452,9 +455,6 @@ class Trainer:
         if current_step % (self.args.algo.update_frequency * 100) == 0:
             return {f"{k}": v for k, v in metrics.items()}
         return None
-
-    def _update_target_networks(self):
-        self.qf1_state, self.qf2_state = self.update_target_networks(self.qf1_state, self.qf2_state)
 
     def _run_evaluation(self, current_step, next_step):
         if not self.evaluator: return
@@ -478,15 +478,11 @@ class Trainer:
 
     def _save_checkpoint(self, current_step, next_step, is_final=False):
         step_for_ckpt: int
-        if is_final:
-            step_for_ckpt = current_step
-            print(f"--- Saving final model at step {step_for_ckpt} ---")
-        else:
-            ckpt_freq = self.args.train.ckpt_save_frequency_abs_steps
-            if not ckpt_freq or next_step < ckpt_freq or (current_step // ckpt_freq) >= (next_step // ckpt_freq):
-                return
-            step_for_ckpt = current_step
-            print(f"--- Saving checkpoint at step {step_for_ckpt} ---")
+        ckpt_freq = self.args.train.ckpt_save_frequency_abs_steps
+        if not ckpt_freq or next_step < ckpt_freq or (current_step // ckpt_freq) >= (next_step // ckpt_freq):
+            return
+        step_for_ckpt = current_step
+        print(f"--- Saving checkpoint at step {step_for_ckpt} ---")
 
         try:
             save_target = {
@@ -545,10 +541,6 @@ class Trainer:
         except Exception as e:
             print(f"Error saving checkpoint at step {step_for_ckpt}: {e}")
             
-    def _save_final_model(self):
-        final_step = (self.args.algo.total_timesteps // self.args.env.env_num) * self.args.env.env_num
-        self._save_checkpoint(final_step, final_step + 1, is_final=True)
-
     def cleanup(self):
         self.envs.close()
         if self.evaluator:
