@@ -30,7 +30,6 @@ description = "Add your description here"
 readme = "README.md"
 
 dependencies = [
-    'jax[tpu]==0.4.*', # 保持flax的版本近乎不变(0.10.4 -> 0.10.4)，代码完全不变 SPS 120->140 说明0.4版本的性能更好!
     "flax",
     "optax",
     "distrax",
@@ -59,7 +58,12 @@ cpu = [
     # "torchvision",
     # "torchaudio", 
 ]
-
+tpu = [
+    'jax[tpu]==0.4.*', # 保持flax的版本近乎不变(0.10.4 -> 0.10.4)，代码完全不变 SPS 120->140 说明0.4版本的性能更好!
+]
+gpu = [
+    'jax[cuda12]',
+]
 box2d = [
     "gymnasium[box2d]",
 ]
