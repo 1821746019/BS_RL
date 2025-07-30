@@ -64,7 +64,7 @@ class TrainConfig:
     exp_name: str = os.path.basename(__file__)[: -len(".py")] # Adjusted in train.py
     """the name of this experiment"""
     # JAX specific
-    jax_platform_name: Optional[str] = None # "cpu", "gpu", "tpu". None means JAX default.
+    jax_platform_name: Optional[str] = None # "cpu", "cuda", "tpu". None means JAX default. 填gpu似乎会被jax识别为要用amd的gpu，用cuda才能正确用nvidia的gpu
     """The platform to run JAX on"""
 
     # parameters for save directories, resume, checkpointing, and evaluation

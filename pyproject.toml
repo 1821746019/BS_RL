@@ -62,7 +62,8 @@ tpu = [
     'jax[tpu]==0.4.*', # 保持flax的版本近乎不变(0.10.4 -> 0.10.4)，代码完全不变 SPS 120->140 说明0.4版本的性能更好!
 ]
 gpu = [
-    'jax[cuda12]',
+    'jax[cuda12]==0.4.26', # 0.4.26对应cuDNN 9(kaggle镜像安装的版本)，系统cuda和jax所使用的cuda需保持一致。不知道jax的cuda版本是多少的看用下面的命令可以看，需注意不能用uv pip，它似乎不能正确检索
+    # pip install "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 ]
 box2d = [
     "gymnasium[box2d]",
