@@ -30,8 +30,7 @@ description = "Add your description here"
 readme = "README.md"
 
 dependencies = [
-    'jax[tpu]',
-    "equinox",
+    'jax[tpu]==0.4.*', # 保持flax的版本近乎不变(0.10.4 -> 0.10.4)，代码完全不变 SPS 120->140 说明0.4版本的性能更好!
     "flax",
     "optax",
     "distrax",
@@ -45,6 +44,11 @@ dependencies = [
     "gymnasium[atari,accept-rom-license,other]",
     "joblib",
     "pyinstrument",
+    # "tf-keras",
+    # "tensorflow==2.18",
+    # "tensorboard==2.18",
+    # "tensorboard-plugin-profile==2.18",
+    # "cloud-tpu-profiler>=2.3.0",
 ]
 # 可选依赖 - 只需要CPU版本
 [project.optional-dependencies]
