@@ -44,6 +44,7 @@ dependencies = [
     "gymnasium[atari,accept-rom-license,other]",
     "joblib",
     "pyinstrument",
+    "xprof",
     # "tf-keras",
     # "tensorflow==2.18",
     # "tensorboard==2.18",

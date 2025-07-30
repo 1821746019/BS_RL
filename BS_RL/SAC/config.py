@@ -7,7 +7,7 @@ from .nn.ResMLP import ResMLPConfig, ResidualStrategy, ActivationPosition, ResML
 from .nn.ResNet1DEncoder import ResNet1DConfig, ResidualBlock1D
 import jax
 ENABLE_PROFILE = __name__.split(".")[0] in os.getenv("PROFILE_PACKAGES", "").split(",") # 如果PROFILE_PACKAGES中包含当前包名，则进行profile
-
+USE_JAX_PROFILER = os.getenv("USE_JAX_PROFILER", "false").lower() == "true"
 @dataclass
 class EnvConfig:
     trading_env_config: TradingEnvConfig = field(default_factory=TradingEnvConfig)

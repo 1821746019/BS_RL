@@ -24,7 +24,7 @@ import flax.jax_utils
 from tqdm.auto import tqdm
 import joblib
 from BS_RL.SAC.config import Args
-from BS_RL.SAC.common import profile, train_env_maker, MetricLogger, StatsAggregator
+from BS_RL.SAC.common import profile, train_env_maker, MetricLogger, StatsAggregator, jax_profiler
 from BS_RL.SAC.networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
 from BS_RL.SAC.agent import SACAgentDiscrete, SACAgentContinuous, TrainStateWithBatchStats, CriticTrainState
 from BS_RL.SAC.eval import Evaluator
@@ -351,7 +351,7 @@ class Trainer:
         total_iterations = self.args.algo.total_timesteps // self.args.env.env_num
         start_iteration = self.initial_global_step // self.args.env.env_num
         profiler = Profiler()
-        # jax.profiler.start_trace(self.base_output_dir / "trace")
+        jax_profiler.start_trace(self.base_output_dir / "trace", True, True)
         update_cnt = 0
         with tqdm(initial=start_iteration, total=total_iterations, desc="Training") as pbar:
             for loop_iter in range(start_iteration, total_iterations):
@@ -401,9 +401,9 @@ class Trainer:
 
                 pbar.set_postfix(pbar_postfix, refresh=False) #不立即刷新提升性能 4.73/37.15
                 pbar.update(1)
-        # jax.profiler.stop_trace()
         profiler.stop()
         profiler.print()
+        jax_profiler.stop_trace()
         self.cleanup()
 
     def _environment_step(self, obs, current_step):

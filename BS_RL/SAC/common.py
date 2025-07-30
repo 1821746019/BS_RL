@@ -3,10 +3,11 @@ from typing import Callable, Deque, List, Dict, Any, Optional, Iterable
 from TradingEnv import TradingEnv, TradingEnvConfig , DataLoader, Account
 from TradingEnv import wrappers, StartMode
 import collections
+import jax
 import numpy as np
 import wandb
 import gymnasium
-from BS_RL.SAC.config import ENABLE_PROFILE
+from BS_RL.SAC.config import ENABLE_PROFILE, USE_JAX_PROFILER
 try:
     import line_profiler
     profile: Callable = line_profiler.profile
@@ -25,6 +26,16 @@ else:
             pass
         def print(self):
             pass
+jax_profiler = jax.profiler
+if  not USE_JAX_PROFILER:
+    class JaxProfiler:
+        def __init__(self):
+            print("jax.profiler is disabled")
+        def start_trace(self, *args, **kwargs):
+            pass
+        def stop_trace(self, *args, **kwargs):
+            pass
+    jax_profiler: type[jax.profiler] = JaxProfiler() # type: ignore
     
 class StatsAggregator:
     """A helper class to aggregate episode statistics."""
