@@ -49,6 +49,14 @@ class AlgoConfig:
     adam_eps: float = 1e-4 # CleanRL used 1e-4 for PyTorch Adam, default optax Adam is 1e-8.
     use_SGD: bool = True
     """whether to use SGD instead of Adam"""
+    
+    # RSAC-share specific
+    num_bptt: int = 64
+    """Truncated BPTT sequence length (T)."""
+    max_episode_len: int = 2048
+    """Maximum episode length to buffer; longer episodes are cut into segments when stored."""
+    segment_sample: bool = True
+    """If True, sample random segments of length T from episodes; otherwise pad/trim to full episodes."""
 
 @dataclass
 class WandbConfig:
@@ -180,6 +188,20 @@ class NetworkConfig:
             name="time_series+account_state_fusion",
             description="时间序列+账户状态特征融合配置"
     ))
+
+    # RSAC-share specific
+    market_feature_dim: int = 0
+    """Dimension of market features fed into the LSTM summarizer (set 0 to use all)."""
+    agent_feature_dim: int = 0
+    """Dimension of agent-specific features concatenated after summarizer (remaining dims if market_feature_dim>0)."""
+    lstm_hidden_dim: int = 256
+    """Hidden size of LSTM summarizer."""
+    lstm_num_layers: int = 1
+    """Number of stacked LSTM layers."""
+    use_pretrained_summarizer_path: Optional[str] = None
+    """Path to a pretrained summarizer params (Flax serialization). If None, train from scratch."""
+    train_summarizer: bool = False
+    """Whether to update summarizer during training. If False and pretrained path is provided, summarizer is frozen."""
 @dataclass
 class Args:
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -198,7 +220,7 @@ class Args:
                     self.train.ckpt_save_frequency_abs_steps = None # Or raise error
             elif self.train.ckpt_save_frequency > 1 and isinstance(self.train.ckpt_save_frequency, int):
                 self.train.ckpt_save_frequency_abs_steps = int(self.train.ckpt_save_frequency)
-            else: # 0 or negative, effectively disabling scheduled ckpting based on this param
+            else:  # 0 or negative, effectively disabling scheduled ckpting based on this param
                 self.train.ckpt_save_frequency_abs_steps = None
         
         # Ensure a very large number if None, to effectively disable if not set through percentage or direct steps

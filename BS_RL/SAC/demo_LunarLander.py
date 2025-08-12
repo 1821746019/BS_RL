@@ -40,7 +40,6 @@ class GymTrainer(Trainer):
         
         from BS_RL.SAC.eval import Evaluator
         
-        # 创建一个修改版的评估器
         class GymEvaluator(Evaluator):
             def __init__(self, agent, env_config, eval_config, run_name_suffix, logger, env_id):
                 self.agent = agent
@@ -96,12 +95,12 @@ if __name__ == "__main__":
     
     args = Args(
         train=TrainConfig(
-            jax_platform_name="tpu", # 使用cpu训练
-            exp_name="LunarLanderContinuous-SAC",
+            jax_platform_name="",
+            exp_name="LunarLanderContinuous-RSAC",
             ckpt_save_frequency=ckpt_save_frequency,
-            resume=False,  # 首次运行设为False
-            save_dir=f"runs/LunarLanderContinuous_SAC",
-            async_vector_env=False,  # 单环境无需异步
+            resume=False,
+            save_dir=f"runs/LunarLanderContinuous_RSAC",
+            async_vector_env=False,
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,
@@ -117,23 +116,30 @@ if __name__ == "__main__":
             env_num=env_num,
         ),
         network=NetworkConfig(
-            # LunarLander不需要时间序列编码器，直接用MLP
-            shape_tickers_positions=(0, 0),  # 不使用
-            encoder_type="none",  # 标记为不使用编码器
+            # summarizer输入就是原观察（本demo使用向量），不使用额外编码器
+            shape_tickers_positions=(0, 0),
+            encoder_type="none",
             actor_net_arch=[64, 64],
             critic_net_arch=[64, 64],
             actor_dropout_rate=0.0,
             critic_dropout_rate=0.0,
+            # RSAC-share
+            market_feature_dim=8,  # LunarLander obs dim
+            agent_feature_dim=0,
+            lstm_hidden_dim=128,
+            lstm_num_layers=1,
+            use_pretrained_summarizer_path=None,
+            train_summarizer=True,
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
-            buffer_size=int(1e6),  # 大缓冲区有助于稳定训练
+            buffer_size=int(5e3),
             learning_starts=learning_starts,
             batch_size=batch_size,
             update_frequency=1,  # 每步都更新
             target_network_frequency=1,  # 软更新，每步更新
             gamma=0.99,
-            tau=0.005,  # 连续动作通常用软更新
+            tau=0.005,  # 连续动作用软更新，官方推荐的超参
             policy_lr=3e-4,
             q_lr=3e-4,
             autotune=True,  # 自动调节熵系数
@@ -142,12 +148,12 @@ if __name__ == "__main__":
         ),
         wandb=WandbConfig(
             track=os.getenv("USE_WANDB", "true").lower() == "true",
-            project_name="SAC-Continuous_LunarLander",
+            project_name="RSAC-Continuous_LunarLander",
             entity=None
         )
     )
     
-    print("开始训练SAC在LunarLanderContinuous环境...")
+    print("开始训练RSAC-share在LunarLanderContinuous环境...")
     print(f"总步数: {total_timesteps:,}")
     print(f"批次大小: {batch_size}")
     print(f"学习开始步数: {learning_starts:,}")

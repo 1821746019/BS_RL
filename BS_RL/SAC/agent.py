@@ -3,9 +3,10 @@ import jax.numpy as jnp
 import flax
 import flax.linen as nn
 from flax.training.train_state import TrainState
+from flax.training import checkpoints
 import optax
 from functools import partial
-from typing import Union, Optional, TypeVar
+from typing import Union, Optional, Tuple
 import tensorflow_probability.substrates.jax.distributions as tfd
 from .common import profile
 from .config import AlgoConfig, NetworkConfig
@@ -19,7 +20,71 @@ class CriticTrainState(TrainState):
     batch_stats: Optional[flax.core.FrozenDict] = None
     target_batch_stats: Optional[flax.core.FrozenDict] = None
 
-class SACAgentBase:
+class SimpleTrainState(TrainState):
+    pass
+
+class _LSTMStackStep(nn.Module):
+    hidden_dim: int
+    num_layers: int
+
+    @nn.compact
+    def __call__(self, carry: Tuple[jnp.ndarray, jnp.ndarray], x_t: jnp.ndarray):
+        # carry: (h_layers, c_layers) with shape [L,B,H]
+        h_layers, c_layers = carry
+        cur = x_t  # [B,H]
+        new_h_layers = []
+        new_c_layers = []
+        for li in range(self.num_layers):
+            cell = nn.OptimizedLSTMCell(features=self.hidden_dim, name=f"lstm_{li}")
+            (h_new, c_new), cur = cell((h_layers[li], c_layers[li]), cur)
+            new_h_layers.append(h_new)
+            new_c_layers.append(c_new)
+        new_h = jnp.stack(new_h_layers, axis=0)
+        new_c = jnp.stack(new_c_layers, axis=0)
+        summary_t = new_h_layers[-1]  # [B,H]
+        return (new_h, new_c), summary_t
+
+class LSTMSummarizer(nn.Module):
+    hidden_dim: int
+    num_layers: int = 1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, initial_state: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None):
+        """
+        x: [B, T, D]
+        Returns:
+          outputs: [B, T+1, H] (includes initial top-layer hidden as t=0)
+          final_state: (h, c) with shapes [L,B,H]
+        """
+        B, T, _ = x.shape
+        H = self.hidden_dim
+        L = self.num_layers
+        x_proj = nn.Dense(H, name="in_proj")(x)  # [B,T,H]
+
+        def init_state(bs):
+            h0 = jnp.zeros((L, bs, H), dtype=jnp.float32)
+            c0 = jnp.zeros((L, bs, H), dtype=jnp.float32)
+            return (h0, c0)
+
+        if initial_state is None:
+            h, c = init_state(B)
+        else:
+            h, c = initial_state
+
+        # Create a scanned module over time
+        Scanned = nn.scan(
+            _LSTMStackStep,
+            variable_broadcast="params",
+            split_rngs={"params": False},
+            in_axes=1,
+            out_axes=1,
+        )
+        time_scan = Scanned(hidden_dim=H, num_layers=L, name="time_scan")
+        (final_h, final_c), ys = time_scan((h, c), x_proj)  # ys: [B,T,H]
+        outputs = jnp.concatenate([h[-1][:, None, :], ys], axis=1)  # [B,T+1,H]
+        return outputs, (final_h, final_c)
+
+class RSACAgentBase:
     def __init__(self,
                  action_dim: int,
                  observation_space_shape,
@@ -28,20 +93,17 @@ class SACAgentBase:
                  algo_config: AlgoConfig,
                  actor_model_cls,
                  critic_model_cls,
-                 norm_limit: float
-                 ):
+                 is_discrete: bool,
+                 norm_limit: float):
         self.actor_model: nn.Module
         self.critic_model: nn.Module
         self.algo_config = algo_config
         self.action_dim = action_dim
         self.network_config = network_config
         self.norm_limit = norm_limit
-        key_actor, key_qf1, key_qf2, key_log_alpha = jax.random.split(key, 4)
-        self.key_buffer = key
-        
-        # We can define separate optimizers for actor, critic, and alpha,
-        # even if they share the same configuration. This makes the code's intent clearer.
-        # 优化器对象只定义了更新规则，是无状态的，所以可以共用。优化器的状态其实被保存在各自的TrainState中
+        self.is_discrete = is_discrete
+        key_actor, key_qf1, key_qf2, key_summarizer, key_log_alpha = jax.random.split(key, 5)
+
         optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
             optax.sgd(learning_rate=self.algo_config.policy_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.policy_lr, eps=self.algo_config.adam_eps),
@@ -49,20 +111,19 @@ class SACAgentBase:
         self.actor_optimizer = optimizer
         self.critic_optimizer = optimizer
         self.alpha_optimizer = optimizer
+        self.summarizer_optimizer = optimizer
 
-        if len(observation_space_shape) == 3:
-            self.dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
-        else:
-            self.dummy_obs = jnp.zeros((1, *observation_space_shape), dtype=jnp.float32)
+        self.obs_dim = int(jnp.prod(jnp.array(observation_space_shape))) if len(observation_space_shape) == 1 else observation_space_shape[-1]
+        self.market_feature_dim = self.network_config.market_feature_dim if self.network_config.market_feature_dim > 0 else self.obs_dim - self.network_config.agent_feature_dim
+        self.agent_feature_dim = self.network_config.agent_feature_dim
+        if self.market_feature_dim + self.agent_feature_dim != self.obs_dim:
+            self.market_feature_dim = self.obs_dim
+            self.agent_feature_dim = 0
 
-        self._create_models_and_states(
-            key_actor, key_qf1, key_qf2,
-            actor_model_cls, critic_model_cls
-        )
-        
+        self._create_models_and_states(key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls)
+
         self.log_alpha_state = None
         self.target_entropy = 0.0
-
         if algo_config.autotune:
             self._setup_autotune(key_log_alpha)
             self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
@@ -70,377 +131,218 @@ class SACAgentBase:
             self.current_alpha = jnp.array(algo_config.alpha, dtype=jnp.float32)
 
     def _init_model_with_batch_stats(self, model, key, *args, **kwargs):
-        """Helper method to initialize model and extract params and batch_stats"""
         variables = model.init({'params': key, 'dropout': key}, *args, **kwargs)
         params = variables['params']
         batch_stats = variables.get('batch_stats')
         return params, batch_stats
 
     def _apply_model_with_batch_stats(self, model: nn.Module, variables, *args, deterministic=True, mutable=None, **kwargs):
-        """Helper method to apply model with proper batch_stats handling"""
         if mutable:
             return model.apply(variables, *args, deterministic=deterministic, mutable=mutable, **kwargs)
         else:
             return model.apply(variables, *args, deterministic=deterministic, **kwargs)
 
-    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls, critic_model_cls) -> optax.GradientTransformation:
+    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls):
         raise NotImplementedError
 
     def _setup_autotune(self, key_log_alpha):
+        log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
+        self.log_alpha_state = TrainState.create(apply_fn=None, params=log_alpha_params, tx=self.alpha_optimizer)
+
+    def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
+                      obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
+                      key: jax.random.PRNGKey, deterministic: bool = False):
         raise NotImplementedError
 
-    @partial(jax.jit, static_argnums=(0, 4))
-    def select_action(self, actor_state: TrainStateWithBatchStats, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
-        # 这个方法需要接收actor_state而不仅仅是params，以便获取batch_stats
-        raise NotImplementedError("This method should be implemented in subclasses")
-
-    def _update_critic(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
+    def _update(self, states, batch, key):
         raise NotImplementedError
 
-    def _update_actor_and_alpha(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
-        raise NotImplementedError
-    
-    def update_target_networks(self, qf1_state: CriticTrainState, qf2_state: CriticTrainState):
-        qf1_state_new = qf1_state.replace(
-            target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, self.algo_config.tau)
-        )
-        if qf1_state.batch_stats is not None:
-            qf1_state_new = qf1_state_new.replace(
-                target_batch_stats=optax.incremental_update(qf1_state.batch_stats, qf1_state.target_batch_stats, self.algo_config.tau)
-            )
-        
-        qf2_state_new = qf2_state.replace(
-            target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, self.algo_config.tau)
-        )
-        if qf2_state.batch_stats is not None:
-            qf2_state_new = qf2_state_new.replace(
-                target_batch_stats=optax.incremental_update(qf2_state.batch_stats, qf2_state.target_batch_stats, self.algo_config.tau)
-            )
-        
-        return qf1_state_new, qf2_state_new
-
-    # Combined update function
-    def update_all(self,
-                   actor_state: TrainState,
-                   qf1_state: CriticTrainState,
-                   qf2_state: CriticTrainState,
-                   log_alpha_input: Union[TrainState, flax.core.FrozenDict, jnp.ndarray],
-                   data: dict,
-                   key: jax.random.PRNGKey
-                   ):
-
-        key_critic, key_actor = jax.random.split(key)
-
-        alpha_arg_for_critic = log_alpha_input.params if self.algo_config.autotune and hasattr(log_alpha_input, 'params') else log_alpha_input
-        
-        qf1_state, qf2_state, critic_loss, critic_metrics = self._update_critic(
-            actor_state, qf1_state, qf2_state, 
-            alpha_arg_for_critic, 
-            data, key_critic
-        )
-        
-        actor_state, returned_log_alpha_state, returned_current_alpha, actor_loss, actor_alpha_metrics = self._update_actor_and_alpha(
-            actor_state, qf1_state, qf2_state, 
-            log_alpha_input, 
-            data,
-            key_actor
-        )
-        
-        all_metrics = {**critic_metrics, **actor_alpha_metrics, 'critic_loss_combined': critic_loss}
-        return actor_state, qf1_state, qf2_state, returned_log_alpha_state, returned_current_alpha, all_metrics
-
-    @partial(jax.jit, static_argnums=(0, 6))
-    def _update_train_step(self,
-                           actor_state: TrainState,
-                           qf1_state: CriticTrainState,
-                           qf2_state: CriticTrainState,
-                           log_alpha_input: Union[TrainState, flax.core.FrozenDict, jnp.ndarray],
-                           data: dict,
-                           do_target_update: bool,
-                           key: jax.random.PRNGKey):
-        
-        actor_state, qf1_state, qf2_state, returned_log_alpha, current_alpha, metrics = self.update_all(
-            actor_state, qf1_state, qf2_state, log_alpha_input, data, key
-        )
-
-        qf1_state_new, qf2_state_new = jax.lax.cond(
-            do_target_update,
-            self.update_target_networks,
-            lambda q1, q2: (q1, q2),
-            qf1_state, qf2_state
-        )
-
-        return actor_state, qf1_state_new, qf2_state_new, returned_log_alpha, current_alpha, metrics
-
-class SACAgentDiscrete(SACAgentBase):
+class RSACAgentDiscrete(RSACAgentBase):
     def __init__(self,
                  action_dim: int,
                  observation_space_shape,
                  key: jax.random.PRNGKey,
                  network_config: NetworkConfig,
                  algo_config: AlgoConfig,
-                 actor_model_cls,
-                 critic_model_cls
-                 ):
-        super().__init__(
-            action_dim=action_dim,
-            observation_space_shape=observation_space_shape,
-            key=key,
-            network_config=network_config,
-            algo_config=algo_config,
-            actor_model_cls=actor_model_cls,
-            critic_model_cls=critic_model_cls,
-            norm_limit=0.6
-        )
+                 actor_model_cls=TradingActorDiscrete,
+                 critic_model_cls=TradingCriticDiscrete):
+        super().__init__(action_dim, observation_space_shape, key, network_config, algo_config, actor_model_cls, critic_model_cls, True, norm_limit=0.6)
 
-    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls, critic_model_cls):
-        # Actor setup
+    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls):
+        # Shared summarizer and target summarizer
+        self.summarizer = LSTMSummarizer(hidden_dim=self.network_config.lstm_hidden_dim, num_layers=self.network_config.lstm_num_layers)
+        dummy_seq = jnp.zeros((1, 1, self.market_feature_dim), dtype=jnp.float32)
+        summarizer_params, _ = self._init_model_with_batch_stats(self.summarizer, key_summarizer, dummy_seq)
+        # Load pretrained summarizer if configured
+        if self.network_config.use_pretrained_summarizer_path:
+            try:
+                loaded = checkpoints.restore_checkpoint(self.network_config.use_pretrained_summarizer_path, target={'summarizer_params': summarizer_params})
+                summarizer_params = loaded.get('summarizer_params', summarizer_params)
+                print(f"Loaded pretrained summarizer from {self.network_config.use_pretrained_summarizer_path}")
+            except Exception as e:
+                print(f"Warning: failed to load pretrained summarizer: {e}")
+        self.summarizer_state = SimpleTrainState.create(apply_fn=self.summarizer.apply, params=summarizer_params, tx=self.summarizer_optimizer)
+        self.summarizer_target_params = summarizer_params
+
+        # Actor head
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        actor_params, actor_batch_stats = self._init_model_with_batch_stats(
-            self.actor_model, key_actor, self.dummy_obs, deterministic=True
-        )
-    
-        self.actor_state = TrainStateWithBatchStats.create(
-            apply_fn=self.actor_model.apply,
-            params=actor_params,
-            batch_stats=actor_batch_stats,
-            tx=self.actor_optimizer
-        )
+        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), deterministic=True)
+        self.actor_state = TrainStateWithBatchStats.create(apply_fn=self.actor_model.apply, params=actor_params, batch_stats=actor_batch_stats, tx=self.actor_optimizer)
 
-        # Critic setup
+        # Critic heads (two critics)
         self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
+        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), deterministic=True)
+        self.qf1_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf1_params, batch_stats=qf1_batch_stats, target_params=qf1_params, target_batch_stats=qf1_batch_stats, tx=self.critic_optimizer)
+        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), deterministic=True)
+        self.qf2_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf2_params, batch_stats=qf2_batch_stats, target_params=qf2_params, target_batch_stats=qf2_batch_stats, tx=self.critic_optimizer)
 
-        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(
-            self.critic_model, key_qf1, self.dummy_obs, deterministic=True
-        )
-        self.qf1_state = CriticTrainState.create(
-            apply_fn=self.critic_model.apply,
-            params=qf1_params,
-            batch_stats=qf1_batch_stats,
-            target_params=qf1_params,
-            target_batch_stats=qf1_batch_stats,
-            tx=self.critic_optimizer
-        )
+        # Freeze summarizer if not training
+        self.train_summarizer = bool(self.network_config.train_summarizer)
 
-        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(
-            self.critic_model, key_qf2, self.dummy_obs, deterministic=True
-        )
-        self.qf2_state = CriticTrainState.create(
-            apply_fn=self.critic_model.apply,
-            params=qf2_params,
-            batch_stats=qf2_batch_stats,
-            target_params=qf2_params,
-            target_batch_stats=qf2_batch_stats,
-            tx=self.critic_optimizer
-        )
-    
-    def _setup_autotune(self, key_log_alpha):
+        # target entropy for discrete
         self.target_entropy = -self.algo_config.target_entropy_scale * jnp.log(1.0 / self.action_dim)
-        log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
-        self.log_alpha_state = TrainState.create(
-            apply_fn=None,
-            params=log_alpha_params,
-            tx=self.alpha_optimizer
-        )
 
-    @partial(jax.jit, static_argnums=(0, 4))
-    def select_action(self, actor_state: TrainStateWithBatchStats, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
-        key_dropout, key_sample = jax.random.split(key)
-        # For action selection, we don't update batch_stats, so use deterministic=True for RSNorm
-        logits = self._apply_model_with_batch_stats(
-            self.actor_model,
-            {'params': actor_state.params, 'batch_stats': actor_state.batch_stats},
-            obs,
-            deterministic=True,  # Don't update batch_stats during inference
-            rngs={'dropout': key_dropout}
-        )
+    @partial(jax.jit, static_argnums=(0, 7))
+    def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
+                      obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
+                      key: jax.random.PRNGKey, deterministic: bool = False):
+        market = obs[..., :self.market_feature_dim]
+        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0), dtype=obs.dtype)
+        seq = market[:, None, :]
+        outputs, (new_h, new_c) = self.summarizer.apply({'params': summarizer_params}, seq, (hidden_h, hidden_c))
+        summary_t = outputs[:, -1, :]
+        x = jnp.concatenate([summary_t, agent_feat], axis=-1)
+        logits = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x, deterministic=True)
         if deterministic:
             actions = jnp.argmax(logits, axis=-1)
         else:
-            actions = jax.random.categorical(key_sample, logits, axis=-1)
-        return actions
+            actions = jax.random.categorical(key, logits, axis=-1)
+        return actions, new_h, new_c
+
+    def _split_obs(self, o_seq: jnp.ndarray):
+        market = o_seq[..., :self.market_feature_dim]
+        agent_feat = o_seq[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros(o_seq.shape[:-1] + (0,), dtype=o_seq.dtype)
+        return market, agent_feat
 
     @partial(jax.jit, static_argnums=(0,))
-    def _update_critic(self,
-                       actor_state: TrainStateWithBatchStats,
-                       qf1_state: CriticTrainState,
-                       qf2_state: CriticTrainState,
-                       log_alpha_input: Union[flax.core.FrozenDict, jnp.ndarray],
-                       data: dict,
-                       key: jax.random.PRNGKey):
+    def _update(self,
+                actor_state: TrainStateWithBatchStats,
+                qf1_state: CriticTrainState,
+                qf2_state: CriticTrainState,
+                summarizer_state: SimpleTrainState,
+                summarizer_target_params: flax.core.FrozenDict,
+                log_alpha_state: Optional[TrainState],
+                batch: dict,
+                key: jax.random.PRNGKey):
+        o = batch['o']
+        a = batch['a']
+        r = batch['r']
+        d = batch['d']
+        m = batch['m']
+        B, T = a.shape[0], a.shape[1]
+        market_o, agent_o = self._split_obs(o)
+
+        summaries, _ = self.summarizer.apply({'params': summarizer_state.params}, market_o)
+        summaries_t = summaries[:, 1:-1, :]
+        summaries_tp1_targ, _ = self.summarizer.apply({'params': summarizer_target_params}, market_o)
+        summaries_tp1 = summaries_tp1_targ[:, 2:, :]
+
+        actor_input_t = jnp.concatenate([summaries_t, agent_o[:, :-1, :]], axis=-1)
+        actor_input_tp1 = jnp.concatenate([summaries_tp1, agent_o[:, 1:, :]], axis=-1)
 
         if self.algo_config.autotune:
-            current_alpha = jnp.exp(log_alpha_input['log_alpha'])
+            current_alpha = jnp.exp(log_alpha_state.params['log_alpha'])
         else:
-            current_alpha = log_alpha_input
+            current_alpha = self.current_alpha
 
-        key_next_logits, key_q_target = jax.random.split(key, 2)
-        
-        # Get next action logits with batch_stats update
-        next_logits = self._apply_model_with_batch_stats(
-            self.actor_model,
-            {'params': actor_state.params, 'batch_stats': actor_state.batch_stats},
-            data['next_observations'],
-            deterministic=True, # Use deterministic=True, no batch_stats update needed here
-            rngs={'dropout': key_next_logits}
-        )
-        
-        next_action_probs = nn.softmax(next_logits, axis=-1)
-        next_action_log_probs = nn.log_softmax(next_logits, axis=-1)
+        def critic_loss_fn(q1_params, q1_bs, q2_params, q2_bs, summarizer_params):
+            next_logits = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, actor_input_tp1.reshape(-1, actor_input_tp1.shape[-1]), deterministic=True)
+            next_logits = next_logits.reshape(B, T, -1)
+            next_probs = nn.softmax(next_logits, axis=-1)
+            next_log_probs = nn.log_softmax(next_logits, axis=-1)
 
-        # Use target networks without updating their batch_stats
-        qf1_next_target_values = self._apply_model_with_batch_stats(
-            self.critic_model,
-            {'params': qf1_state.target_params, 'batch_stats': qf1_state.target_batch_stats},
-            data['next_observations'],
-            deterministic=True,
-            rngs={'dropout': key_q_target}
-        )
-        qf2_next_target_values = self._apply_model_with_batch_stats(
-            self.critic_model,
-            {'params': qf2_state.target_params, 'batch_stats': qf2_state.target_batch_stats},
-            data['next_observations'],
-            deterministic=True,
-            rngs={'dropout': key_q_target}
-        )
-        min_qf_next_target = jnp.minimum(qf1_next_target_values, qf2_next_target_values)
-        
-        next_q_value_components = next_action_probs * (min_qf_next_target - current_alpha * next_action_log_probs)
-        next_q_value = jnp.sum(next_q_value_components, axis=1)
-        
-        target_q_values = data['rewards'] + (1.0 - data['dones']) * self.algo_config.gamma * next_q_value
-        target_q_values = jax.lax.stop_gradient(target_q_values)
+            q1_next = self.critic_model.apply({'params': qf1_state.target_params, 'batch_stats': qf1_state.target_batch_stats}, actor_input_tp1.reshape(-1, actor_input_tp1.shape[-1]), deterministic=True).reshape(B, T, -1)
+            q2_next = self.critic_model.apply({'params': qf2_state.target_params, 'batch_stats': qf2_state.target_batch_stats}, actor_input_tp1.reshape(-1, actor_input_tp1.shape[-1]), deterministic=True).reshape(B, T, -1)
+            min_q_next = jnp.minimum(q1_next, q2_next)
+            v_next = jnp.sum(next_probs * (min_q_next - current_alpha * next_log_probs), axis=-1)
+            target = r + (1.0 - d) * self.algo_config.gamma * v_next
 
-        def qf1_loss_fn(params):
-            qf1_all_actions, new_qf1_vars = self._apply_model_with_batch_stats(
-                self.critic_model,
-                {'params': params, 'batch_stats': qf1_state.batch_stats},
-                data['observations'],
-                deterministic=False,
-                mutable=['batch_stats'],
-                rngs={'dropout': key}
-            )
-            qf1_taken_action = jnp.take_along_axis(qf1_all_actions, data['actions'], axis=1).squeeze(-1)
-            loss = ((qf1_taken_action - target_q_values) ** 2).mean()
-            return loss, (qf1_taken_action.mean(), new_qf1_vars)
-            
-        (qf1_loss_val, (qf1_values_mean, new_qf1_vars)), qf1_grads = jax.value_and_grad(qf1_loss_fn, has_aux=True)(qf1_state.params)
-        qf1_state_new = qf1_state.apply_gradients(grads=qf1_grads).replace(batch_stats=new_qf1_vars['batch_stats'])
-        
-        def qf2_loss_fn(params):
-            qf2_all_actions, new_qf2_vars = self._apply_model_with_batch_stats(
-                self.critic_model,
-                {'params': params, 'batch_stats': qf2_state.batch_stats},
-                data['observations'],
-                deterministic=False,
-                mutable=['batch_stats'],
-                rngs={'dropout': key}
-            )
-            qf2_taken_action = jnp.take_along_axis(qf2_all_actions, data['actions'], axis=1).squeeze(-1)
-            loss = ((qf2_taken_action - target_q_values) ** 2).mean()
-            return loss, (qf2_taken_action.mean(), new_qf2_vars)
-            
-        (qf2_loss_val, (qf2_values_mean, new_qf2_vars)), qf2_grads = jax.value_and_grad(qf2_loss_fn, has_aux=True)(qf2_state.params)
-        qf2_state_new = qf2_state.apply_gradients(grads=qf2_grads).replace(batch_stats=new_qf2_vars['batch_stats'])
+            q1_all, new_q1_vars = self.critic_model.apply({'params': q1_params, 'batch_stats': q1_bs}, actor_input_t.reshape(-1, actor_input_t.shape[-1]), deterministic=False, mutable=['batch_stats'])
+            q2_all, new_q2_vars = self.critic_model.apply({'params': q2_params, 'batch_stats': q2_bs}, actor_input_t.reshape(-1, actor_input_t.shape[-1]), deterministic=False, mutable=['batch_stats'])
+            q1_all = q1_all.reshape(B, T, -1)
+            q2_all = q2_all.reshape(B, T, -1)
+            a_idx = a[..., None]
+            q1_taken = jnp.take_along_axis(q1_all, a_idx, axis=-1).squeeze(-1)
+            q2_taken = jnp.take_along_axis(q2_all, a_idx, axis=-1).squeeze(-1)
 
-        critic_loss = (qf1_loss_val + qf2_loss_val) / 2.0
-        
-        return qf1_state_new, qf2_state_new, critic_loss, \
-               {'qf1_loss': qf1_loss_val, 'qf2_loss': qf2_loss_val,
-                'qf1_values': qf1_values_mean, 'qf2_values': qf2_values_mean}
+            mse1 = (q1_taken - target) ** 2
+            mse2 = (q2_taken - target) ** 2
+            mse1 = (mse1 * m).sum() / (m.sum() + 1e-8)
+            mse2 = (mse2 * m).sum() / (m.sum() + 1e-8)
+            loss = 0.5 * (mse1 + mse2)
+            return loss, (new_q1_vars, new_q2_vars)
 
-    @partial(jax.jit, static_argnums=(0,))
-    def _update_actor_and_alpha(self,
-                                actor_state: TrainStateWithBatchStats,
-                                qf1_state: CriticTrainState,
-                                qf2_state: CriticTrainState,
-                                log_alpha_input: Union[TrainState, jnp.ndarray],
-                                data: dict,
-                                key: jax.random.PRNGKey):
-        
-        key_actor, key_alpha = jax.random.split(key)
-        
-        if self.algo_config.autotune:
-            actor_effective_alpha = jnp.exp(log_alpha_input.params['log_alpha'])
+        (critic_loss_val, (new_q1_vars, new_q2_vars)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1,2,3,4))(qf1_state.params, qf1_state.batch_stats, qf2_state.params, qf2_state.batch_stats, summarizer_state.params)
+        g_q1_params, g_q1_bs, g_q2_params, g_q2_bs, g_sum_params = critic_grads
+        qf1_state_new = qf1_state.apply_gradients(grads=g_q1_params).replace(batch_stats=new_q1_vars['batch_stats'])
+        qf2_state_new = qf2_state.apply_gradients(grads=g_q2_params).replace(batch_stats=new_q2_vars['batch_stats'])
+        if self.train_summarizer:
+            summarizer_state_new = summarizer_state.apply_gradients(grads=g_sum_params)
         else:
-            actor_effective_alpha = log_alpha_input
+            summarizer_state_new = summarizer_state
 
-        def actor_loss_fn(actor_params):
-            logits, new_actor_vars = self._apply_model_with_batch_stats(
-                self.actor_model,
-                {'params': actor_params, 'batch_stats': actor_state.batch_stats},
-                data['observations'],
+        summaries_t_detached = jax.lax.stop_gradient(summaries_t)
+        actor_input_t_detached = jnp.concatenate([summaries_t_detached, agent_o[:, :-1, :]], axis=-1)
+
+        def actor_loss_fn(actor_params, actor_bs):
+            outputs, new_actor_vars = self.actor_model.apply(
+                {'params': actor_params, 'batch_stats': actor_bs},
+                actor_input_t_detached.reshape(-1, actor_input_t_detached.shape[-1]),
                 deterministic=False,
-                mutable=['batch_stats'],
-                rngs={'dropout': key_actor}
+                mutable=['batch_stats']
             )
-            action_probs = nn.softmax(logits, axis=-1)
-            action_log_probs = nn.log_softmax(logits, axis=-1)
+            logits = outputs.reshape(B, T, -1)
+            probs = nn.softmax(logits, axis=-1)
+            log_probs = nn.log_softmax(logits, axis=-1)
+            q1_all = self.critic_model.apply({'params': qf1_state_new.params, 'batch_stats': qf1_state_new.batch_stats}, actor_input_t_detached.reshape(-1, actor_input_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
+            q2_all = self.critic_model.apply({'params': qf2_state_new.params, 'batch_stats': qf2_state_new.batch_stats}, actor_input_t_detached.reshape(-1, actor_input_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
+            min_q = jnp.minimum(q1_all, q2_all)
+            actor_loss_t = jnp.sum(probs * (current_alpha * log_probs - min_q), axis=-1)
+            actor_loss = (actor_loss_t * m).sum() / (m.sum() + 1e-8)
+            entropy = (-jnp.sum((probs + 1e-8) * log_probs, axis=-1) * m).sum() / (m.sum() + 1e-8)
+            return actor_loss, (entropy, new_actor_vars)
 
-            qf1_all_actions = self._apply_model_with_batch_stats(
-                self.critic_model,
-                {'params': qf1_state.params, 'batch_stats': qf1_state.batch_stats},
-                data['observations'],
-                deterministic=True,
-                rngs={'dropout': key_actor}
-            )
-            qf2_all_actions = self._apply_model_with_batch_stats(
-                self.critic_model,
-                {'params': qf2_state.params, 'batch_stats': qf2_state.batch_stats},
-                data['observations'],
-                deterministic=True,
-                rngs={'dropout': key_actor}
-            )
-            min_qf_values = jnp.minimum(qf1_all_actions, qf2_all_actions)
-            min_qf_values = jax.lax.stop_gradient(min_qf_values)
-
-            actor_loss_components = action_probs * (actor_effective_alpha * action_log_probs - min_qf_values)
-            loss = jnp.sum(actor_loss_components, axis=1).mean()
-            
-            # Add a small epsilon to action_probs for numerical stability.
-            entropy = -jnp.sum((action_probs + 1e-8) * action_log_probs, axis=1).mean()
-            return loss, (entropy, new_actor_vars)
-
-        (actor_loss_val, (entropy_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
+        (actor_loss_val, (entropy_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params, actor_state.batch_stats)
         actor_state_new = actor_state.apply_gradients(grads=actor_grads).replace(batch_stats=new_actor_vars['batch_stats'])
 
-        alpha_loss_val = 0.0
-        log_alpha_state_to_return = log_alpha_input
-        current_alpha_to_return = actor_effective_alpha
-
+        alpha_loss_val = jnp.array(0.0, dtype=jnp.float32)
+        log_alpha_state_to_return = log_alpha_state
+        current_alpha_to_return = current_alpha
         if self.algo_config.autotune:
-            def alpha_loss_fn(log_alpha_params_dict):
-                logits_old_actor = self._apply_model_with_batch_stats(
-                    self.actor_model,
-                    {'params': actor_state.params, 'batch_stats': actor_state.batch_stats},
-                    data['observations'],
-                    deterministic=True,
-                    rngs={'dropout': key_alpha}
-                )
-                action_log_probs_old_actor = nn.log_softmax(logits_old_actor, axis=-1)
-                detached_log_probs = jax.lax.stop_gradient(action_log_probs_old_actor)
-                
-                # We are using action probabilities for the expectation.
-                action_probs_old_actor = nn.softmax(logits_old_actor, axis=-1)
-                detached_probs = jax.lax.stop_gradient(action_probs_old_actor)
-                
-                alpha_loss_components = detached_probs * \
-                                        (-jnp.exp(log_alpha_params_dict['log_alpha']) * (detached_log_probs + self.target_entropy))
-                loss = jnp.sum(alpha_loss_components, axis=1).mean()
+            logits_det = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, actor_input_t_detached.reshape(-1, actor_input_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
+            log_probs_det = nn.log_softmax(logits_det, axis=-1)
+            probs_det = nn.softmax(logits_det, axis=-1)
+            def alpha_loss_fn(log_alpha_params):
+                lp = log_probs_det
+                pr = probs_det
+                loss_t = pr * (-jnp.exp(log_alpha_params['log_alpha']) * (lp + self.target_entropy))
+                loss = (jnp.sum(loss_t, axis=-1) * m).sum() / (m.sum() + 1e-8)
                 return loss
-
-            alpha_loss_val, alpha_grads_dict = jax.value_and_grad(alpha_loss_fn)(log_alpha_input.params)
-            
-            log_alpha_state_updated = log_alpha_input.apply_gradients(grads=alpha_grads_dict)
+            alpha_loss_val, alpha_grads = jax.value_and_grad(alpha_loss_fn)(log_alpha_state.params)
+            log_alpha_state_updated = log_alpha_state.apply_gradients(grads=alpha_grads)
             log_alpha_state_to_return = log_alpha_state_updated
             current_alpha_to_return = jnp.exp(log_alpha_state_updated.params['log_alpha'])
-        
-        actor_metrics = {'actor_loss': actor_loss_val, 'alpha_loss': alpha_loss_val, 
-                         'alpha': current_alpha_to_return, 'entropy': entropy_val}
-        
-        return actor_state_new, log_alpha_state_to_return, current_alpha_to_return, actor_loss_val, actor_metrics
 
-class SACAgentContinuous(SACAgentBase):
+        metrics = {
+            'critic_loss': critic_loss_val,
+            'actor_loss': actor_loss_val,
+            'alpha_loss': alpha_loss_val,
+            'alpha': current_alpha_to_return,
+            'entropy': entropy_val,
+        }
+        return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
+
+class RSACAgentContinuous(RSACAgentBase):
     def __init__(self,
                  action_dim: int,
                  observation_space_shape,
@@ -448,228 +350,185 @@ class SACAgentContinuous(SACAgentBase):
                  network_config: NetworkConfig,
                  algo_config: AlgoConfig,
                  actor_model_cls=TradingActorContinuous,
-                 critic_model_cls=TradingCriticContinuous
-                 ):
-        super().__init__(
-            action_dim=action_dim,
-            observation_space_shape=observation_space_shape,
-            key=key,
-            network_config=network_config,
-            algo_config=algo_config,
-            actor_model_cls=actor_model_cls,
-            critic_model_cls=critic_model_cls,
-            norm_limit=1.0
-        )
+                 critic_model_cls=TradingCriticContinuous):
+        super().__init__(action_dim, observation_space_shape, key, network_config, algo_config, actor_model_cls, critic_model_cls, False, norm_limit=1.0)
 
-    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, actor_model_cls: nn.Module, critic_model_cls: nn.Module):
+    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls):
+        self.summarizer = LSTMSummarizer(hidden_dim=self.network_config.lstm_hidden_dim, num_layers=self.network_config.lstm_num_layers)
+        dummy_seq = jnp.zeros((1, 1, self.market_feature_dim), dtype=jnp.float32)
+        summarizer_params, _ = self._init_model_with_batch_stats(self.summarizer, key_summarizer, dummy_seq)
+        if self.network_config.use_pretrained_summarizer_path:
+            try:
+                loaded = checkpoints.restore_checkpoint(self.network_config.use_pretrained_summarizer_path, target={'summarizer_params': summarizer_params})
+                summarizer_params = loaded.get('summarizer_params', summarizer_params)
+                print(f"Loaded pretrained summarizer from {self.network_config.use_pretrained_summarizer_path}")
+            except Exception as e:
+                print(f"Warning: failed to load pretrained summarizer: {e}")
+        self.summarizer_state = SimpleTrainState.create(apply_fn=self.summarizer.apply, params=summarizer_params, tx=self.summarizer_optimizer)
+        self.summarizer_target_params = summarizer_params
+
+        # Actor head
+        self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
+        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), deterministic=True)
+        self.actor_state = TrainStateWithBatchStats.create(apply_fn=self.actor_model.apply, params=actor_params, batch_stats=actor_batch_stats, tx=self.actor_optimizer)
+
+        # Critic heads (two critics)
+        self.critic_model = critic_model_cls(network_config=self.network_config)
         dummy_action = jnp.zeros((1, self.action_dim), dtype=jnp.float32)
-        
-        # Actor setup
-        self.actor_model: nn.Module = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        actor_params, actor_batch_stats = self._init_model_with_batch_stats(
-            self.actor_model, key_actor, self.dummy_obs, deterministic=True
-        )
-        self.actor_state = TrainStateWithBatchStats.create(
-            apply_fn=self.actor_model.apply,
-            params=actor_params,
-            batch_stats=actor_batch_stats,
-            tx=self.actor_optimizer
-        )
+        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), dummy_action, deterministic=True)
+        self.qf1_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf1_params, batch_stats=qf1_batch_stats, target_params=qf1_params, target_batch_stats=qf1_batch_stats, tx=self.critic_optimizer)
+        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), dummy_action, deterministic=True)
+        self.qf2_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf2_params, batch_stats=qf2_batch_stats, target_params=qf2_params, target_batch_stats=qf2_batch_stats, tx=self.critic_optimizer)
 
-        # Critic setup
-        self.critic_model: nn.Module = critic_model_cls(network_config=self.network_config)
-
-        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(
-            self.critic_model, key_qf1, self.dummy_obs, dummy_action, deterministic=True
-        )
-        self.qf1_state = CriticTrainState.create(
-            apply_fn=self.critic_model.apply,
-            params=qf1_params,
-            batch_stats=qf1_batch_stats,
-            target_params=qf1_params,
-            target_batch_stats=qf1_batch_stats,
-            tx=self.critic_optimizer
-        )
-
-        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(
-            self.critic_model, key_qf2, self.dummy_obs, dummy_action, deterministic=True
-        )
-        self.qf2_state = CriticTrainState.create(
-            apply_fn=self.critic_model.apply,
-            params=qf2_params,
-            batch_stats=qf2_batch_stats,
-            target_params=qf2_params,
-            target_batch_stats=qf2_batch_stats,
-            tx=self.critic_optimizer
-        )
-
-    def _setup_autotune(self, key_log_alpha):
+        if self.network_config.use_pretrained_summarizer_path:
+            pass
+        self.train_summarizer = bool(self.network_config.train_summarizer)
         self.target_entropy = -float(self.action_dim)
-        log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
-        self.log_alpha_state = TrainState.create(
-            apply_fn=None,
-            params=log_alpha_params,
-            tx=self.alpha_optimizer
-        )
-    @profile
-    def _get_action_dist(self, actor_params, actor_batch_stats, obs, key_dropout, deterministic, mutable=False):
-        variables = {'params': actor_params}
-        if actor_batch_stats is not None:
-            variables['batch_stats'] = actor_batch_stats
-            
-        if mutable and actor_batch_stats is not None:
-            apply_output = self._apply_model_with_batch_stats(
-                self.actor_model, variables, obs,
-                deterministic=deterministic, mutable=['batch_stats'],
-                rngs={'dropout': key_dropout}
-            )
-            (mean, log_std), new_vars = apply_output
-            dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
-            return dist, new_vars
-        else:
-            mean, log_std = self._apply_model_with_batch_stats(
-                self.actor_model, variables, obs,
-                deterministic=deterministic,
-                rngs={'dropout': key_dropout}
-            )
-            dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
-            return dist, None
-    @profile
-    def _sample_action(self, dist, key_sample, deterministic):
+
+    @partial(jax.jit, static_argnums=(0, 7))
+    def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
+                      obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
+                      key: jax.random.PRNGKey, deterministic: bool = False):
+        market = obs[..., :self.market_feature_dim]
+        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0), dtype=obs.dtype)
+        seq = market[:, None, :]
+        outputs, (new_h, new_c) = self.summarizer.apply({'params': summarizer_params}, seq, (hidden_h, hidden_c))
+        summary_t = outputs[:, -1, :]
+        x = jnp.concatenate([summary_t, agent_feat], axis=-1)
+        mean, log_std = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x, deterministic=True)
+        dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
         if deterministic:
             action = dist.mean()
         else:
-            action = dist.sample(seed=key_sample)
-        
-        squashed_action = jnp.tanh(action)
-        return squashed_action, action
+            action = dist.sample(seed=key)
+        squashed = jnp.tanh(action)
+        return squashed, new_h, new_c
 
-    @partial(jax.jit, static_argnums=(0, 4))
-    def select_action(self, actor_state: TrainStateWithBatchStats, obs: jnp.ndarray, key: jax.random.PRNGKey, deterministic: bool = False):
-        key_dropout, key_sample = jax.random.split(key)
-        dist, _ = self._get_action_dist(actor_state.params, actor_state.batch_stats, obs, key_dropout, deterministic=True)  # Use deterministic=True for inference
-        squashed_action, _ = self._sample_action(dist, key_sample, deterministic)
-        return squashed_action
+    def _split_obs(self, o_seq: jnp.ndarray):
+        market = o_seq[..., :self.market_feature_dim]
+        agent_feat = o_seq[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros(o_seq.shape[:-1] + (0,), dtype=o_seq.dtype)
+        return market, agent_feat
 
     @partial(jax.jit, static_argnums=(0,))
-    def _update_critic(self, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, log_alpha_input: Union[TrainState, jnp.ndarray], data: dict, key: jax.random.PRNGKey):
+    def _update(self,
+                actor_state: TrainStateWithBatchStats,
+                qf1_state: CriticTrainState,
+                qf2_state: CriticTrainState,
+                summarizer_state: SimpleTrainState,
+                summarizer_target_params: flax.core.FrozenDict,
+                log_alpha_state: Optional[TrainState],
+                batch: dict,
+                key: jax.random.PRNGKey):
+        o = batch['o']
+        a = batch['a']  # [B, T, A]
+        r = batch['r']
+        d = batch['d']
+        m = batch['m']
+        B, T = r.shape
+        market_o, agent_o = self._split_obs(o)
+
+        summaries, _ = self.summarizer.apply({'params': summarizer_state.params}, market_o)
+        s_t = summaries[:, 1:-1, :]
+        s_tp1_targ, _ = self.summarizer.apply({'params': summarizer_target_params}, market_o)
+        s_tp1 = s_tp1_targ[:, 2:, :]
+
+        x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
+        x_tp1 = jnp.concatenate([s_tp1, agent_o[:, 1:, :]], axis=-1)
+
         if self.algo_config.autotune:
-            current_alpha = jnp.exp(log_alpha_input['log_alpha'])
+            current_alpha = jnp.exp(log_alpha_state.params['log_alpha'])
         else:
-            current_alpha = log_alpha_input
+            current_alpha = self.current_alpha
 
-        key_dropout, key_sample, key_q_target = jax.random.split(key, 3)
-        
-        next_dist, _ = self._get_action_dist(
-            actor_state.params, actor_state.batch_stats, 
-            data['next_observations'], key_dropout, 
-            deterministic=True, mutable=False # Use deterministic=True, no batch_stats update needed here
-        )
-        next_squashed_action, next_action = self._sample_action(next_dist, key_sample, deterministic=False)
-        
-        next_log_prob = next_dist.log_prob(next_action)
-        next_log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(next_action)**2 + 1e-6), axis=1)
+        def critic_loss_fn(q1_params, q1_bs, q2_params, q2_bs, summarizer_params):
+            mean_tp1, log_std_tp1 = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
+            mean_tp1 = mean_tp1.reshape(B, T, -1)
+            log_std_tp1 = log_std_tp1.reshape(B, T, -1)
+            dist_tp1 = tfd.MultivariateNormalDiag(loc=mean_tp1, scale_diag=jnp.exp(log_std_tp1))
+            u = dist_tp1.sample(seed=key)
+            squashed_tp1 = jnp.tanh(u)
+            log_prob = dist_tp1.log_prob(u)
+            log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(u) ** 2 + 1e-6), axis=-1)
 
-        qf1_next_target = self._apply_model_with_batch_stats(
-            self.critic_model,
-            {'params': qf1_state.target_params, 'batch_stats': qf1_state.target_batch_stats},
-            data['next_observations'], next_squashed_action,
-            deterministic=True, rngs={'dropout': key_q_target}
-        )
-        qf2_next_target = self._apply_model_with_batch_stats(
-            self.critic_model,
-            {'params': qf2_state.target_params, 'batch_stats': qf2_state.target_batch_stats},
-            data['next_observations'], next_squashed_action,
-            deterministic=True, rngs={'dropout': key_q_target}
-        )
-        min_qf_next_target = jnp.minimum(qf1_next_target, qf2_next_target)
-        
-        next_q_value = min_qf_next_target - current_alpha * next_log_prob
-        target_q_value = data['rewards'] + (1.0 - data['dones']) * self.algo_config.gamma * next_q_value
-        target_q_value = jax.lax.stop_gradient(target_q_value)
+            q1_next = self.critic_model.apply({'params': qf1_state.target_params, 'batch_stats': qf1_state.target_batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(B, T)
+            q2_next = self.critic_model.apply({'params': qf2_state.target_params, 'batch_stats': qf2_state.target_batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(B, T)
+            min_q_next = jnp.minimum(q1_next, q2_next)
+            target = r + (1.0 - d) * self.algo_config.gamma * (min_q_next - current_alpha * log_prob)
 
-        def qf_loss_fn(params, batch_stats, key_dropout):
-            q_val, new_vars = self._apply_model_with_batch_stats(
-                self.critic_model,
-                {'params': params, 'batch_stats': batch_stats},
-                data['observations'], data['actions'],
-                deterministic=False, mutable=['batch_stats'],
-                rngs={'dropout': key_dropout}
-            )
-            loss = ((q_val - target_q_value) ** 2).mean()
-            return loss, (q_val.mean(), new_vars)
+            q1_cur, new_q1_vars = self.critic_model.apply({'params': q1_params, 'batch_stats': q1_bs}, x_t.reshape(-1, x_t.shape[-1]), a.reshape(-1, a.shape[-1]), deterministic=False, mutable=['batch_stats'])
+            q2_cur, new_q2_vars = self.critic_model.apply({'params': q2_params, 'batch_stats': q2_bs}, x_t.reshape(-1, x_t.shape[-1]), a.reshape(-1, a.shape[-1]), deterministic=False, mutable=['batch_stats'])
+            q1_cur = q1_cur.reshape(B, T)
+            q2_cur = q2_cur.reshape(B, T)
 
-        (qf1_loss_val, (qf1_values_mean, new_qf1_vars)), qf1_grads = jax.value_and_grad(qf_loss_fn, has_aux=True)(qf1_state.params, qf1_state.batch_stats, key)
-        qf1_state_new = qf1_state.apply_gradients(grads=qf1_grads).replace(batch_stats=new_qf1_vars['batch_stats'])
-        
-        (qf2_loss_val, (qf2_values_mean, new_qf2_vars)), qf2_grads = jax.value_and_grad(qf_loss_fn, has_aux=True)(qf2_state.params, qf2_state.batch_stats, key)
-        qf2_state_new = qf2_state.apply_gradients(grads=qf2_grads).replace(batch_stats=new_qf2_vars['batch_stats'])
+            mse1 = (q1_cur - target) ** 2
+            mse2 = (q2_cur - target) ** 2
+            mse1 = (mse1 * m).sum() / (m.sum() + 1e-8)
+            mse2 = (mse2 * m).sum() / (m.sum() + 1e-8)
+            loss = 0.5 * (mse1 + mse2)
+            return loss, (new_q1_vars, new_q2_vars)
 
-        critic_loss = (qf1_loss_val + qf2_loss_val) / 2.0
-        
-        return qf1_state_new, qf2_state_new, critic_loss, {
-            'qf1_loss': qf1_loss_val, 'qf2_loss': qf2_loss_val,
-            'qf1_values': qf1_values_mean, 'qf2_values': qf2_values_mean
-        }
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _update_actor_and_alpha(self, actor_state, qf1_state, qf2_state, log_alpha_input, data, key):
-        key_actor, key_alpha, key_sample = jax.random.split(key, 3)
-        
-        if self.algo_config.autotune:
-            actor_effective_alpha = jnp.exp(log_alpha_input.params['log_alpha'])
+        (critic_loss_val, (new_q1_vars, new_q2_vars)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1,2,3,4))(qf1_state.params, qf1_state.batch_stats, qf2_state.params, qf2_state.batch_stats, summarizer_state.params)
+        g_q1_params, g_q1_bs, g_q2_params, g_q2_bs, g_sum_params = critic_grads
+        qf1_state_new = qf1_state.apply_gradients(grads=g_q1_params).replace(batch_stats=new_q1_vars['batch_stats'])
+        qf2_state_new = qf2_state.apply_gradients(grads=g_q2_params).replace(batch_stats=new_q2_vars['batch_stats'])
+        if self.train_summarizer:
+            summarizer_state_new = summarizer_state.apply_gradients(grads=g_sum_params)
         else:
-            actor_effective_alpha = log_alpha_input
-            
-        def actor_loss_fn(actor_params):
-            dist, new_actor_vars = self._get_action_dist(
-                actor_params, actor_state.batch_stats, data['observations'], 
-                key_actor, deterministic=False, mutable=True
-            )
-            squashed_action, action = self._sample_action(dist, key_sample, deterministic=False)
-            
-            log_prob = dist.log_prob(action)
-            log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(action)**2 + 1e-6), axis=1)
-            entropy = -log_prob.mean()
+            summarizer_state_new = summarizer_state
 
-            qf1_pi = self._apply_model_with_batch_stats(
-                self.critic_model,
-                {'params': qf1_state.params, 'batch_stats': qf1_state.batch_stats},
-                data['observations'], squashed_action,
-                deterministic=True, rngs={'dropout': key_actor}
+        s_t_det = jax.lax.stop_gradient(s_t)
+        x_t_det = jnp.concatenate([s_t_det, agent_o[:, :-1, :]], axis=-1)
+        def actor_loss_fn(actor_params, actor_bs):
+            (mean, log_std), new_actor_vars = self.actor_model.apply(
+                {'params': actor_params, 'batch_stats': actor_bs},
+                x_t_det.reshape(-1, x_t_det.shape[-1]),
+                deterministic=False,
+                mutable=['batch_stats']
             )
-            qf2_pi = self._apply_model_with_batch_stats(
-                self.critic_model,
-                {'params': qf2_state.params, 'batch_stats': qf2_state.batch_stats},
-                data['observations'], squashed_action,
-                deterministic=True, rngs={'dropout': key_actor}
-            )
-            min_qf_pi = jnp.minimum(qf1_pi, qf2_pi)
-            
-            actor_loss = (actor_effective_alpha * log_prob - min_qf_pi).mean()
-            return actor_loss, (entropy, log_prob, new_actor_vars)
+            mean = mean.reshape(B, T, -1)
+            log_std = log_std.reshape(B, T, -1)
+            dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
+            u = dist.sample(seed=key)
+            squashed = jnp.tanh(u)
+            log_prob = dist.log_prob(u)
+            log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(u) ** 2 + 1e-6), axis=-1)
 
-        (actor_loss_val, (entropy_val, log_prob_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
+            q1_pi = self.critic_model.apply({'params': qf1_state_new.params, 'batch_stats': qf1_state_new.batch_stats}, x_t_det.reshape(-1, x_t_det.shape[-1]), squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(B, T)
+            q2_pi = self.critic_model.apply({'params': qf2_state_new.params, 'batch_stats': qf2_state_new.batch_stats}, x_t_det.reshape(-1, x_t_det.shape[-1]), squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(B, T)
+            min_q = jnp.minimum(q1_pi, q2_pi)
+            loss_t = (current_alpha * log_prob - min_q)
+            loss = (loss_t * m).sum() / (m.sum() + 1e-8)
+            entropy = (-(log_prob) * m).sum() / (m.sum() + 1e-8)
+            return loss, (entropy, new_actor_vars)
+
+        (actor_loss_val, (entropy_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params, actor_state.batch_stats)
         actor_state_new = actor_state.apply_gradients(grads=actor_grads).replace(batch_stats=new_actor_vars['batch_stats'])
-        
-        alpha_loss_val = 0.0
-        log_alpha_state_to_return = log_alpha_input
-        current_alpha_to_return = actor_effective_alpha
 
+        alpha_loss_val = jnp.array(0.0, dtype=jnp.float32)
+        log_alpha_state_to_return = log_alpha_state
+        current_alpha_to_return = current_alpha
         if self.algo_config.autotune:
-            detached_log_prob = jax.lax.stop_gradient(log_prob_val)
-            def alpha_loss_fn(log_alpha_params_dict):
-                alpha_loss = (-jnp.exp(log_alpha_params_dict['log_alpha']) * (detached_log_prob + self.target_entropy)).mean()
-                return alpha_loss
-
-            alpha_loss_val, alpha_grads_dict = jax.value_and_grad(alpha_loss_fn)(log_alpha_input.params)
-            
-            log_alpha_state_updated = log_alpha_input.apply_gradients(grads=alpha_grads_dict)
+            mean_det, log_std_det = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x_t_det.reshape(-1, x_t_det.shape[-1]), deterministic=True)
+            mean_det = mean_det.reshape(B, T, -1)
+            log_std_det = log_std_det.reshape(B, T, -1)
+            dist_det = tfd.MultivariateNormalDiag(loc=mean_det, scale_diag=jnp.exp(log_std_det))
+            u_det = dist_det.sample(seed=key)
+            log_prob_det = dist_det.log_prob(u_det)
+            log_prob_det -= jnp.sum(jnp.log(1 - jnp.tanh(u_det) ** 2 + 1e-6), axis=-1)
+            def alpha_loss_fn(log_alpha_params):
+                return ((-jnp.exp(log_alpha_params['log_alpha']) * (log_prob_det + self.target_entropy)) * m).sum() / (m.sum() + 1e-8)
+            alpha_loss_val, alpha_grads = jax.value_and_grad(alpha_loss_fn)(log_alpha_state.params)
+            log_alpha_state_updated = log_alpha_state.apply_gradients(grads=alpha_grads)
             log_alpha_state_to_return = log_alpha_state_updated
             current_alpha_to_return = jnp.exp(log_alpha_state_updated.params['log_alpha'])
-        
-        actor_metrics = {'actor_loss': actor_loss_val, 'alpha_loss': alpha_loss_val, 'alpha': current_alpha_to_return, 'entropy': entropy_val}
-        
-        return actor_state_new, log_alpha_state_to_return, current_alpha_to_return, actor_loss_val, actor_metrics
 
-SACAgent = Union[SACAgentDiscrete, SACAgentContinuous]
+        metrics = {
+            'critic_loss': critic_loss_val,
+            'actor_loss': actor_loss_val,
+            'alpha_loss': alpha_loss_val,
+            'alpha': current_alpha_to_return,
+            'entropy': entropy_val,
+        }
+        return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
+
+RSACAgent = Union[RSACAgentDiscrete, RSACAgentContinuous]

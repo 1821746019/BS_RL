@@ -4,14 +4,14 @@ import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
-from .agent import SACAgent
+from .agent import RSACAgent
 from .common import eval_env_maker, MetricLogger, StatsAggregator
 from .config import EnvConfig, EvalConfig
 from TradingEnv import DataLoader, DataLoaderConfig, TradingEnvConfig
 
 class Evaluator:
     def __init__(self,
-                 agent: SACAgent,
+                 agent: RSACAgent,
                  env_config: EnvConfig,
                  eval_config: EvalConfig,
                  run_name_suffix: str,
@@ -33,24 +33,21 @@ class Evaluator:
         print("Creating evaluation environments...")
         eval_vec_env_cls = gym.vector.AsyncVectorEnv if self.eval_config.async_vector_env else gym.vector.SyncVectorEnv
         
-        # Note: The `make_env` was changed to `eval_env_maker` which has a different signature.
-        # We now pass the dataloader to it.
         return eval_vec_env_cls(
             [
                 eval_env_maker(
                     seed=self.eval_config.seed + i,
                     config=self.env_config.trading_env_config,
                     data_loader=self.data_loader,
-                    # Capture media for the first eval env if configured
-                    capture_media=self.eval_config.capture_media,# 解除注释则只对env0绘制图片and i == 0,
-                    run_name=f"{self.run_name_suffix}_eval", # Simplified run name
+                    capture_media=self.eval_config.capture_media,
+                    run_name=f"{self.run_name_suffix}_eval",
                     capture_episode_trigger=lambda e: e == 0
                 )
                 for i in range(self.eval_config.env_num)
             ]
         )
 
-    def evaluate(self, actor_state_eval, current_train_step: int):
+    def evaluate(self, actor_state_eval, summarizer_params_eval, current_train_step: int):
         num_episodes = self.eval_config.eval_episodes
         print(f"\nStarting evaluation for {num_episodes} episodes with seed {self.eval_config.seed} at step {current_train_step}...")
 
@@ -64,17 +61,26 @@ class Evaluator:
         key_eval_actions = jax.random.PRNGKey(self.eval_config.seed)
 
         obs, _ = eval_envs.reset(seed=self.eval_config.seed + current_train_step)
+        # init hidden states
+        L = self.agent.network_config.lstm_num_layers
+        H = self.agent.network_config.lstm_hidden_dim
+        N = eval_envs.num_envs
+        hidden_h = jnp.zeros((L, N, H), dtype=jnp.float32)
+        hidden_c = jnp.zeros((L, N, H), dtype=jnp.float32)
 
         while len(stats_aggregator.buffer) < num_episodes:
             key_eval_actions, key_step = jax.random.split(key_eval_actions)
-            
-            actions_jax = self.agent.select_action(
+            actions_jax, new_h, new_c = self.agent.select_action(
                 actor_state_eval, 
+                summarizer_params_eval,
                 jnp.asarray(obs), 
+                hidden_h, hidden_c,
                 key_step, 
                 deterministic=self.eval_config.greedy_actions
             )
             actions_numpy = np.array(jax.device_get(actions_jax))
+            hidden_h = jax.device_get(new_h)
+            hidden_c = jax.device_get(new_c)
 
             next_obs, rewards, terminations, truncations, infos = eval_envs.step(actions_numpy)
             obs = next_obs

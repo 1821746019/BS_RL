@@ -18,18 +18,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tyro
-from stable_baselines3.common.buffers import ReplayBuffer
 from flax.training import checkpoints
-import flax.jax_utils
 from tqdm.auto import tqdm
 import joblib
 from BS_RL.SAC.config import Args
 from BS_RL.SAC.common import profile, train_env_maker, MetricLogger, StatsAggregator, jax_profiler
 from BS_RL.SAC.networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
-from BS_RL.SAC.agent import SACAgentDiscrete, SACAgentContinuous, TrainStateWithBatchStats, CriticTrainState
+from BS_RL.SAC.agent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SimpleTrainState
 from BS_RL.SAC.eval import Evaluator
 from TradingEnv import DataLoader
+from BS_RL.SAC.replay_buffer import RecurrentReplayBuffer
 import wandb
+import optax
 
 def count_params(params):
     return sum(x.size for x in jax.tree_util.tree_leaves(params))
@@ -49,18 +49,20 @@ class Trainer:
         self.key_update_base = None
         self.envs: AsyncVectorEnv| SyncVectorEnv
         self.agent = None
-        self.rb = None
+        self.rb: RecurrentReplayBuffer = None
         self.actor_state: TrainStateWithBatchStats = None
         self.qf1_state: CriticTrainState = None
         self.qf2_state: CriticTrainState = None
+        self.summarizer_state: SimpleTrainState = None
+        self.summarizer_target_params = None
         self.log_alpha_state = None
         self.current_alpha = None
-        self.update_all = None
-        self.update_target_networks = None
         self.data_loader = None
         self.evaluator = None
         self.logger = None
         self.is_discrete: bool
+        self.hidden_h = None  # [L, N, H]
+        self.hidden_c = None  # [L, N, H]
 
     def setup(self):
         self._setup_paths_and_run_name()
@@ -91,19 +93,16 @@ class Trainer:
 
     def _setup_jax_devices(self):
         print(f"JAX running on: {jax.devices()}")
-        # Simplified: no multi-device logic. We assume single device usage.
-        self.batch_size_per_device = self.args.algo.batch_size # Not really per-device anymore
+        self.batch_size_per_device = self.args.algo.batch_size
         print(f"Using global batch size: {self.args.algo.batch_size}")
 
     def _handle_resume_and_directory_setup(self):
         restored_ckpt_path = None
         if self.args.train.resume:
-            # The ckpt_dir here should be the parent directory containing all checkpoint folders.
             latest_ckpt_path_str = checkpoints.latest_checkpoint(os.path.abspath(self.ckpt_dir), prefix="ckpt_step")
             if latest_ckpt_path_str:
                 print(f"Found latest checkpoint: {latest_ckpt_path_str}")
                 try:
-                    # The step is parsed from the directory name itself.
                     self.initial_global_step = int(Path(latest_ckpt_path_str).name.split("_")[-1])
                     print(f"Resuming from global_step {self.initial_global_step}")
                     restored_ckpt_path = latest_ckpt_path_str
@@ -121,7 +120,6 @@ class Trainer:
             self.base_output_dir.mkdir(parents=True, exist_ok=True)
             self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         
-        # This will be used to load states later in _setup_agent
         self.restored_ckpt_path = restored_ckpt_path
 
     def _setup_wandb(self):
@@ -197,17 +195,16 @@ class Trainer:
 
     def _setup_agent(self):
         obs_shape = self.envs.single_observation_space.shape
-
         if self.is_discrete:
             action_dim = self.envs.single_action_space.n
             actor_model_cls, critic_model_cls = TradingActorDiscrete, TradingCriticDiscrete
-            agent_cls = SACAgentDiscrete
-            print(f"Using Discrete SAC with action dim: {action_dim}")
+            agent_cls = RSACAgentDiscrete
+            print(f"Using RSAC-Share Discrete with action dim: {action_dim}")
         else:
             action_dim = self.envs.single_action_space.shape[0]
             actor_model_cls, critic_model_cls = TradingActorContinuous, TradingCriticContinuous
-            agent_cls = SACAgentContinuous
-            print(f"Using Continuous SAC with action dim: {action_dim}")
+            agent_cls = RSACAgentContinuous
+            print(f"Using RSAC-Share Continuous with action dim: {action_dim}")
 
         key_agent, self.key = jax.random.split(self.key)
         self.agent = agent_cls(
@@ -219,116 +216,116 @@ class Trainer:
             actor_model_cls=actor_model_cls,
             critic_model_cls=critic_model_cls
         )
-        
+        self.actor_state = self.agent.actor_state
+        self.qf1_state = self.agent.qf1_state
+        self.qf2_state = self.agent.qf2_state
+        self.summarizer_state = self.agent.summarizer_state
+        self.summarizer_target_params = self.agent.summarizer_target_params
+        self.log_alpha_state = self.agent.log_alpha_state if self.args.algo.autotune else None
+        self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha']) if self.args.algo.autotune and self.log_alpha_state else jnp.array(self.args.algo.alpha)
+
+        # initialize per-env hidden states
+        L = self.args.network.lstm_num_layers
+        H = self.args.network.lstm_hidden_dim
+        N = self.envs.num_envs
+        self.hidden_h = jnp.zeros((L, N, H), dtype=jnp.float32)
+        self.hidden_c = jnp.zeros((L, N, H), dtype=jnp.float32)
+
+        # restore if checkpoint exists
         self._initialize_or_restore_agent_states()
 
         actor_p_count = count_params(self.actor_state.params) / 1e6
         critic_p_count = count_params(self.qf1_state.params) / 1e6
+        summarizer_p_count = count_params(self.summarizer_state.params) / 1e6
         print(f"Actor params: {actor_p_count:.2f}M")
         print(f"Critic params: {critic_p_count:.2f}M (x2 networks)")
+        print(f"Summarizer params: {summarizer_p_count:.2f}M")
         if self.args.wandb.track:
             wandb.summary['actor_params_m'] = actor_p_count
             wandb.summary['critic_params_m'] = critic_p_count
-
+            wandb.summary['summarizer_params_m'] = summarizer_p_count
 
     def _initialize_or_restore_agent_states(self):
-        actor_state = self.agent.actor_state
-        qf1_state = self.agent.qf1_state
-        qf2_state = self.agent.qf2_state
-        log_alpha_state = self.agent.log_alpha_state if self.args.algo.autotune else None
-        
         if self.restored_ckpt_path:
             try:
-                # Define the structure for restoration using placeholder values from the initial states.
-                # This structure must match what was saved in _save_checkpoint.
                 restore_target = {
-                    'actor_params': actor_state.params,
-                    'actor_opt_state': actor_state.opt_state,
-                    'actor_batch_stats': actor_state.batch_stats,
-                    'qf1_params': qf1_state.params,
-                    'qf1_opt_state': qf1_state.opt_state,
-                    'qf1_batch_stats': qf1_state.batch_stats,
-                    'qf1_target_params': qf1_state.target_params,
-                    'qf1_target_batch_stats': qf1_state.target_batch_stats,
-                    'qf2_params': qf2_state.params,
-                    'qf2_opt_state': qf2_state.opt_state,
-                    'qf2_batch_stats': qf2_state.batch_stats,
-                    'qf2_target_params': qf2_state.target_params,
-                    'qf2_target_batch_stats': qf2_state.target_batch_stats,
+                    'actor_params': self.actor_state.params,
+                    'actor_opt_state': self.actor_state.opt_state,
+                    'actor_batch_stats': self.actor_state.batch_stats,
+                    'qf1_params': self.qf1_state.params,
+                    'qf1_opt_state': self.qf1_state.opt_state,
+                    'qf1_batch_stats': self.qf1_state.batch_stats,
+                    'qf1_target_params': self.qf1_state.target_params,
+                    'qf1_target_batch_stats': self.qf1_state.target_batch_stats,
+                    'qf2_params': self.qf2_state.params,
+                    'qf2_opt_state': self.qf2_state.opt_state,
+                    'qf2_batch_stats': self.qf2_state.batch_stats,
+                    'qf2_target_params': self.qf2_state.target_params,
+                    'qf2_target_batch_stats': self.qf2_state.target_batch_stats,
+                    'summarizer_params': self.summarizer_state.params,
+                    'summarizer_opt_state': self.summarizer_state.opt_state,
+                    'summarizer_target_params': self.summarizer_target_params,
                 }
                 if self.args.algo.autotune:
-                    restore_target['log_alpha_params'] = log_alpha_state.params
-                    restore_target['log_alpha_opt_state'] = log_alpha_state.opt_state
+                    restore_target['log_alpha_params'] = self.log_alpha_state.params
+                    restore_target['log_alpha_opt_state'] = self.log_alpha_state.opt_state
 
-                # Restore the raw arrays and optimizer states.
-                # latest_checkpoint provides the full path to the specific checkpoint directory.
                 loaded_contents = checkpoints.restore_checkpoint(
                     ckpt_dir=self.restored_ckpt_path,
                     target=restore_target
                 )
-                
-                # Manually update the TrainState objects with the loaded contents.
-                actor_state = actor_state.replace(
+
+                self.actor_state = self.actor_state.replace(
                     params=loaded_contents['actor_params'],
                     opt_state=loaded_contents['actor_opt_state'],
                     batch_stats=loaded_contents['actor_batch_stats']
                 )
-                qf1_state = qf1_state.replace(
+                self.qf1_state = self.qf1_state.replace(
                     params=loaded_contents['qf1_params'],
                     opt_state=loaded_contents['qf1_opt_state'],
                     batch_stats=loaded_contents['qf1_batch_stats'],
                     target_params=loaded_contents['qf1_target_params'],
                     target_batch_stats=loaded_contents['qf1_target_batch_stats']
                 )
-                qf2_state = qf2_state.replace(
+                self.qf2_state = self.qf2_state.replace(
                     params=loaded_contents['qf2_params'],
                     opt_state=loaded_contents['qf2_opt_state'],
                     batch_stats=loaded_contents['qf2_batch_stats'],
                     target_params=loaded_contents['qf2_target_params'],
                     target_batch_stats=loaded_contents['qf2_target_batch_stats']
                 )
+                self.summarizer_state = self.summarizer_state.replace(
+                    params=loaded_contents['summarizer_params'],
+                    opt_state=loaded_contents['summarizer_opt_state']
+                )
+                self.summarizer_target_params = loaded_contents['summarizer_target_params']
                 if self.args.algo.autotune and 'log_alpha_params' in loaded_contents:
-                    log_alpha_state = log_alpha_state.replace(
+                    self.log_alpha_state = self.log_alpha_state.replace(
                         params=loaded_contents['log_alpha_params'],
                         opt_state=loaded_contents['log_alpha_opt_state']
                     )
-                print(f"Agent states, including optimizer states, successfully restored from step {self.initial_global_step}.")
+                print(f"Agent states restored from step {self.initial_global_step}.")
             except Exception as e:
                 print(f"Error restoring agent states: {e}. Starting with fresh states.")
                 self.initial_global_step = 0
-        
-        self.actor_state = actor_state
-        self.qf1_state = qf1_state
-        self.qf2_state = qf2_state
-        self.log_alpha_state = log_alpha_state
-        self.current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.args.algo.autotune and log_alpha_state else jnp.array(self.args.algo.alpha)
-
 
     def _setup_replay_buffer(self):
-        loaded_rb = False
-        if self.restored_ckpt_path:
-            rb_path = os.path.join(self.restored_ckpt_path, "replay_buffer.joblib.gz")
-            if os.path.exists(rb_path):
-                try:
-                    print(f"Loading replay buffer from {rb_path}...")
-                    self.rb:ReplayBuffer = joblib.load(rb_path)
-                    print(f"Replay buffer loaded. Current size: {self.rb.size()}, full: {self.rb.full}")
-                    assert self.rb.buffer_size == max(self.args.algo.buffer_size//self.args.env.env_num, 1) # 和SB3的ReplayBuffer的内部逻辑保持一致
-                    assert self.rb.n_envs == self.args.env.env_num
-                    loaded_rb = True
-                except Exception as e:
-                    print(f"Could not load replay buffer due to {e}. A new one will be created.")
-
-        if not loaded_rb:
-            print("Creating new replay buffer.")
-            self.rb = ReplayBuffer(
-                self.args.algo.buffer_size,
-                self.envs.single_observation_space,
-                self.envs.single_action_space,
-                device="cpu",
-                handle_timeout_termination=False,
-                n_envs=self.args.env.env_num
-            )
+        print("Creating recurrent replay buffer.")
+        obs_dim = int(np.prod(self.envs.single_observation_space.shape)) if len(self.envs.single_observation_space.shape) == 1 else self.envs.single_observation_space.shape[-1]
+        if self.is_discrete:
+            action_shape = ()
+        else:
+            action_shape = self.envs.single_action_space.shape
+        self.rb = RecurrentReplayBuffer(
+            obs_dim=obs_dim,
+            action_shape=action_shape,
+            is_discrete_action=self.is_discrete,
+            capacity_episodes=max(self.args.algo.buffer_size // max(self.args.env.env_num,1), 1),
+            num_envs=self.args.env.env_num,
+            max_episode_len=self.args.algo.max_episode_len,
+            num_bptt=self.args.algo.num_bptt,
+            segment_sample=self.args.algo.segment_sample
+        )
 
     def _setup_evaluator(self):
         if self.args.eval.eval_episodes <= 0:
@@ -345,6 +342,8 @@ class Trainer:
 
     def train(self):
         obs, _ = self.envs.reset(seed=self.args.env.seed + self.initial_global_step)
+        # initialize first obs in rb working buffers
+        # environment step loop will populate
         train_stats_aggregator = StatsAggregator()
         pbar_postfix = collections.OrderedDict()
 
@@ -375,26 +374,19 @@ class Trainer:
                         if metrics_from_update:
                             sps = int(pbar.format_dict['rate'] * self.args.env.env_num) # iter/s * env_num = step/s
                             pbar_postfix["SPS"] = sps
-                            
                             log_data = {}
-                            
                             metrics_from_update["SPS"] = sps
                             for k, v in metrics_from_update.items():
                                 log_data[f"metrics/{k}"] = v
-                            
                             buffered_stats = train_stats_aggregator.get_aggregated_stats()
                             if buffered_stats:
                                 for k, v in buffered_stats.items():
                                     log_data[f"train_buffered/{k}"] = v
                                 if 'return_mean' in buffered_stats:
                                     pbar_postfix["return_mean"] = f"{buffered_stats['return_mean']:.2f}"
-                            
                             if self.args.wandb.track:
                                 wandb.log(log_data, step=current_step)
 
-                    # if current_step % self.args.algo.target_network_frequency == 0:
-                    #     self._update_target_networks()
-                
                 next_step = (loop_iter + 1) * self.args.env.env_num
                 self._run_evaluation(current_step, next_step)
                 self._save_checkpoint(current_step, next_step)
@@ -410,48 +402,79 @@ class Trainer:
         self.key_actions_base, key_actions_step = jax.random.split(self.key_actions_base)
         if current_step < self.args.algo.learning_starts:
             actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)])
+            # keep hidden states unchanged
         else:
             jax_obs = jnp.asarray(obs)
-            actions_jax = self.agent.select_action(self.actor_state, jax_obs, key_actions_step, deterministic=False)
+            actions_jax, new_h, new_c = self.agent.select_action(self.actor_state, self.summarizer_state.params, jax_obs, self.hidden_h, self.hidden_c, key_actions_step, deterministic=False)
             actions = np.array(jax.device_get(actions_jax))
+            self.hidden_h = jax.device_get(new_h)
+            self.hidden_c = jax.device_get(new_c)
 
         next_obs, rewards, terminations, truncations, infos = self.envs.step(actions)
-        
+
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc and "final_observation" in infos and infos["final_observation"][idx] is not None:
                 real_next_obs[idx] = infos["final_observation"][idx]
-        
-        self.rb.add(obs, real_next_obs, actions, rewards.astype(np.float32), terminations.astype(np.float32), infos)
+        # add to recurrent buffer
+        self.rb.add_batch(obs.astype(np.float32), real_next_obs.astype(np.float32), actions.astype(np.int32 if self.is_discrete else np.float32), rewards.astype(np.float32), (terminations | truncations).astype(np.float32))
+
+        # reset hidden states on done envs
+        done_mask = (terminations | truncations).astype(bool)
+        if done_mask.any():
+            L, N, H = self.hidden_h.shape
+            hh = np.array(self.hidden_h)
+            hc = np.array(self.hidden_c)
+            hh[:, done_mask, :] = 0.0
+            hc[:, done_mask, :] = 0.0
+            self.hidden_h = jnp.asarray(hh)
+            self.hidden_c = jnp.asarray(hc)
         return next_obs, infos
 
     @profile
     def _agent_update(self, current_step):
         self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
-        data = self.rb.sample(self.args.algo.batch_size)
-
-        actions_np = data.actions.numpy()
-        if self.is_discrete:
-            actions_np = actions_np.astype(np.int32)
-
-        data_numpy = {
-            'observations': data.observations.numpy(), 
-            'actions': actions_np,
-            'next_observations': data.next_observations.numpy(), 
-            'rewards': data.rewards.numpy().flatten(),
-            'dones': data.dones.numpy().flatten()
+        # allow early start when enough segments exist
+        if not self.rb.can_sample(self.args.algo.batch_size):
+            return None
+        batch_np = self.rb.sample(self.args.algo.batch_size)
+        # pack into jnp
+        data = {
+            'o': jnp.asarray(batch_np['o']),
+            'a': jnp.asarray(batch_np['a']) if self.is_discrete else jnp.asarray(batch_np['a']).astype(jnp.float32),
+            'r': jnp.asarray(batch_np['r']),
+            'd': jnp.asarray(batch_np['d']),
+            'm': jnp.asarray(batch_np['m']),
         }
-        
-        log_alpha_arg = self.log_alpha_state if self.args.algo.autotune else self.current_alpha
+        log_alpha_arg = self.log_alpha_state if self.args.algo.autotune else None
 
-        do_target_update = (current_step // self.args.algo.update_frequency) % (self.args.algo.target_network_frequency // self.args.algo.update_frequency) == 0
-
-        self.actor_state, self.qf1_state, self.qf2_state, returned_log_alpha, self.current_alpha, metrics = self.agent._update_train_step(
-            self.actor_state, self.qf1_state, self.qf2_state, log_alpha_arg, data_numpy, do_target_update, key_update_step
+        # one update step
+        actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, returned_log_alpha, self.current_alpha, metrics = self.agent._update(
+            self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state, self.summarizer_target_params, log_alpha_arg, data, key_update_step
         )
+
+        self.actor_state = actor_state_new
+        self.qf1_state = qf1_state_new
+        self.qf2_state = qf2_state_new
+        self.summarizer_state = summarizer_state_new
         if self.args.algo.autotune:
             self.log_alpha_state = returned_log_alpha
-        
+
+        # target network update (soft/hard)
+        do_target_update = (current_step // self.args.algo.update_frequency) % max(self.args.algo.target_network_frequency // max(self.args.algo.update_frequency,1), 1) == 0
+        if do_target_update:
+            tau = self.args.algo.tau
+            self.qf1_state = self.qf1_state.replace(
+                target_params=optax.incremental_update(self.qf1_state.params, self.qf1_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(self.qf1_state.batch_stats, self.qf1_state.target_batch_stats, tau) if self.qf1_state.batch_stats is not None else self.qf1_state.target_batch_stats
+            )
+            self.qf2_state = self.qf2_state.replace(
+                target_params=optax.incremental_update(self.qf2_state.params, self.qf2_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(self.qf2_state.batch_stats, self.qf2_state.target_batch_stats, tau) if self.qf2_state.batch_stats is not None else self.qf2_state.target_batch_stats
+            )
+            # summarizer target uses same tau
+            self.summarizer_target_params = optax.incremental_update(self.summarizer_state.params, self.summarizer_target_params, tau)
+
         if current_step % (self.args.algo.update_frequency * 100) == 0:
             return {f"{k}": v for k, v in metrics.items()}
         return None
@@ -471,13 +494,13 @@ class Trainer:
         
         eval_metrics = self.evaluator.evaluate(
             actor_state_eval=self.actor_state,
+            summarizer_params_eval=self.summarizer_state.params,
             current_train_step=current_step
         )
         
         tqdm.write(f"Evaluation at step {current_step}: {eval_metrics}")
 
     def _save_checkpoint(self, current_step, next_step, is_final=False):
-        step_for_ckpt: int
         ckpt_freq = self.args.train.ckpt_save_frequency_abs_steps
         if not ckpt_freq or next_step < ckpt_freq or (current_step // ckpt_freq) >= (next_step // ckpt_freq):
             return
@@ -499,6 +522,9 @@ class Trainer:
                 'qf2_batch_stats': self.qf2_state.batch_stats,
                 'qf2_target_params': self.qf2_state.target_params,
                 'qf2_target_batch_stats': self.qf2_state.target_batch_stats,
+                'summarizer_params': self.summarizer_state.params,
+                'summarizer_opt_state': self.summarizer_state.opt_state,
+                'summarizer_target_params': self.summarizer_target_params,
             }
             if self.args.algo.autotune and self.log_alpha_state:
                 save_target['log_alpha_params'] = self.log_alpha_state.params
@@ -513,8 +539,6 @@ class Trainer:
             if saved_path:
                 print(f"Checkpoint saved to {saved_path}")
 
-                # Log the model artifact to wandb before adding other files to the checkpoint directory.
-                # This ensures that only the model is part of the artifact.
                 if self.args.wandb.track and wandb.run and self.args.train.upload_model:
                     artifact = wandb.Artifact(f"model_ckpt_{self.wandb_run_name}", type="model")
                     artifact.add_dir(str(saved_path))
