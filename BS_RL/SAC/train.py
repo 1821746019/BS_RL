@@ -310,21 +310,22 @@ class Trainer:
                 self.initial_global_step = 0
 
     def _setup_replay_buffer(self):
-        print("Creating recurrent replay buffer.")
+        print("Creating recurrent replay buffer with segment-based storage.")
         obs_dim = int(np.prod(self.envs.single_observation_space.shape)) if len(self.envs.single_observation_space.shape) == 1 else self.envs.single_observation_space.shape[-1]
         if self.is_discrete:
             action_shape = ()
         else:
             action_shape = self.envs.single_action_space.shape
+        # Calculate capacity in terms of segments rather than episodes
+        # Assuming average episode length, convert buffer_size (in steps) to segments
+        capacity_segments = max(self.args.algo.buffer_size // self.args.algo.num_bptt, 1)
         self.rb = RecurrentReplayBuffer(
             obs_dim=obs_dim,
             action_shape=action_shape,
             is_discrete_action=self.is_discrete,
-            capacity_episodes=max(self.args.algo.buffer_size // max(self.args.env.env_num,1), 1),
+            capacity_segments=capacity_segments,
             num_envs=self.args.env.env_num,
-            max_episode_len=self.args.algo.max_episode_len,
-            num_bptt=self.args.algo.num_bptt,
-            segment_sample=self.args.algo.segment_sample
+            num_bptt=self.args.algo.num_bptt
         )
 
     def _setup_evaluator(self):
@@ -434,6 +435,8 @@ class Trainer:
     @profile
     def _agent_update(self, current_step):
         self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
+        if not self.rb.can_sample(self.args.algo.batch_size): # 如果buffer中没有足够的样本，则不更新
+            return None
         batch_np = self.rb.sample(self.args.algo.batch_size)
         # pack into jnp
         data = {

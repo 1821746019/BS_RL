@@ -6,35 +6,40 @@ class RecurrentReplayBuffer:
                  obs_dim: int,
                  action_shape: tuple,
                  is_discrete_action: bool,
-                 capacity_episodes: int,
+                 capacity_segments: int,
                  num_envs: int,
-                 max_episode_len: int,
-                 num_bptt: int,
-                 segment_sample: bool = True):
+                 num_bptt: int):
         self.obs_dim = obs_dim
         self.action_shape = action_shape
         self.is_discrete_action = is_discrete_action
-        self.capacity_episodes = capacity_episodes
+        self.capacity_segments = capacity_segments
         self.num_envs = num_envs
-        self.max_episode_len = max_episode_len
         self.num_bptt = num_bptt
-        self.segment_sample = segment_sample
 
-        # Storage for finalized episodes
-        self.episodes = []  # list of dicts with keys: 'o', 'a', 'r', 'term', 'trunc'
-        self.ep_ptr = 0
+        # Storage for segments as multi-dimensional arrays for vectorized operations
+        self.segments_o = np.zeros((capacity_segments, num_bptt + 1, obs_dim), dtype=np.float32)
+        self.segments_a = np.zeros((capacity_segments, num_bptt) + action_shape, dtype=np.int32 if is_discrete_action else np.float32)
+        self.segments_r = np.zeros((capacity_segments, num_bptt), dtype=np.float32)
+        self.segments_term = np.zeros((capacity_segments, num_bptt), dtype=np.float32)
+        self.segments_trunc = np.zeros((capacity_segments, num_bptt), dtype=np.float32)
+        self.segments_m = np.zeros((capacity_segments, num_bptt), dtype=np.float32)
+        
+        self.seg_ptr = 0
+        self.num_stored_segments = 0
 
         # Ongoing buffers for each env
-        self._reset_working_episodes()
+        self._reset_working_buffers()
 
-    def _reset_working_episodes(self):
-        self.work_o = [np.zeros((self.max_episode_len + 1, self.obs_dim), dtype=np.float32) for _ in range(self.num_envs)]
-        self.work_a = [np.zeros((self.max_episode_len,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32) for _ in range(self.num_envs)]
-        self.work_r = [np.zeros((self.max_episode_len,), dtype=np.float32) for _ in range(self.num_envs)]
-        self.work_term = [np.zeros((self.max_episode_len,), dtype=np.float32) for _ in range(self.num_envs)]
-        self.work_trunc = [np.zeros((self.max_episode_len,), dtype=np.float32) for _ in range(self.num_envs)]
+    def _reset_working_buffers(self):
+        # Working buffers for accumulating num_bptt steps before storing as segment
+        self.work_o = [np.zeros((self.num_bptt + 1, self.obs_dim), dtype=np.float32) for _ in range(self.num_envs)]
+        self.work_a = [np.zeros((self.num_bptt,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32) for _ in range(self.num_envs)]
+        self.work_r = [np.zeros((self.num_bptt,), dtype=np.float32) for _ in range(self.num_envs)]
+        self.work_term = [np.zeros((self.num_bptt,), dtype=np.float32) for _ in range(self.num_envs)]
+        self.work_trunc = [np.zeros((self.num_bptt,), dtype=np.float32) for _ in range(self.num_envs)]
         self.work_t = np.zeros((self.num_envs,), dtype=np.int32)
         self.work_started = np.zeros((self.num_envs,), dtype=bool)
+        self.work_ep_start = np.zeros((self.num_envs,), dtype=bool)  # True if this segment starts a new episode
 
     def add_batch(self, obs: np.ndarray, next_obs: np.ndarray, actions: np.ndarray, rewards: np.ndarray,
                   terminations: np.ndarray, truncations: np.ndarray):
@@ -50,16 +55,14 @@ class RecurrentReplayBuffer:
         assert N == self.num_envs
         for i in range(N):
             t = int(self.work_t[i])
+            
             if not self.work_started[i]:
-                # initialize first observation for this episode
+                # Initialize first observation for this segment
                 self.work_o[i][0] = obs[i]
                 self.work_started[i] = True
+                self.work_ep_start[i] = True  # Mark as episode start
 
-            if t >= self.max_episode_len:
-                # force finalize if overflow
-                self._finalize_env_episode(i, last_next_obs=next_obs[i])
-                t = 0
-
+            # Store current transition
             self.work_a[i][t] = actions[i]
             self.work_r[i][t] = rewards[i]
             self.work_term[i][t] = terminations[i]
@@ -67,28 +70,58 @@ class RecurrentReplayBuffer:
             self.work_o[i][t + 1] = next_obs[i]
             self.work_t[i] = t + 1
 
-            if terminations[i] > 0.5 or truncations[i] > 0.5:
-                self._finalize_env_episode(i, last_next_obs=next_obs[i])
+            # Check if we should finalize this segment
+            should_finalize = False
+            if t + 1 >= self.num_bptt:
+                # Segment is full
+                should_finalize = True
+            elif terminations[i] > 0.5 or truncations[i] > 0.5:
+                # Episode ended, finalize segment even if not full
+                should_finalize = True
 
-    def _finalize_env_episode(self, env_idx: int, last_next_obs: Optional[np.ndarray] = None):
+            if should_finalize:
+                self._finalize_env_segment(i, next_obs[i], terminations[i] > 0.5 or truncations[i] > 0.5)
+
+    def _finalize_env_segment(self, env_idx: int, last_next_obs: np.ndarray, episode_ended: bool):
         t = int(self.work_t[env_idx])
         if t == 0:
             # nothing collected
             return
-        o = self.work_o[env_idx][:t + 1].copy()
-        a = self.work_a[env_idx][:t].copy()
-        r = self.work_r[env_idx][:t].copy()
-        term = self.work_term[env_idx][:t].copy()
-        trunc = self.work_trunc[env_idx][:t].copy()
+        
+        # Create segment with proper padding/masking
+        length = t
+        o = np.zeros((self.num_bptt + 1, self.obs_dim), dtype=np.float32)
+        a = np.zeros((self.num_bptt,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32)
+        r = np.zeros((self.num_bptt,), dtype=np.float32)
+        term = np.zeros((self.num_bptt,), dtype=np.float32)
+        trunc = np.zeros((self.num_bptt,), dtype=np.float32)
+        m = np.zeros((self.num_bptt,), dtype=np.float32)  # mask for valid steps
+        
+        # Copy actual data
+        o[:length + 1] = self.work_o[env_idx][:length + 1]
+        a[:length] = self.work_a[env_idx][:length]
+        r[:length] = self.work_r[env_idx][:length]
+        term[:length] = self.work_term[env_idx][:length]
+        trunc[:length] = self.work_trunc[env_idx][:length]
+        m[:length] = 1.0  # mark valid steps
+        
+        # For padded steps, mark as terminal to prevent bootstrap
+        if length < self.num_bptt:
+            term[length:] = 1.0
 
-        ep = {'o': o, 'a': a, 'r': r, 'term': term, 'trunc': trunc}
-        if len(self.episodes) < self.capacity_episodes:
-            self.episodes.append(ep)
-        else:
-            self.episodes[self.ep_ptr] = ep
-            self.ep_ptr = (self.ep_ptr + 1) % self.capacity_episodes
+        # Store segment in circular buffer using vectorized operations
+        self.segments_o[self.seg_ptr] = o
+        self.segments_a[self.seg_ptr] = a
+        self.segments_r[self.seg_ptr] = r
+        self.segments_term[self.seg_ptr] = term
+        self.segments_trunc[self.seg_ptr] = trunc
+        self.segments_m[self.seg_ptr] = m
+        
+        # Update pointers
+        self.seg_ptr = (self.seg_ptr + 1) % self.capacity_segments
+        self.num_stored_segments = min(self.num_stored_segments + 1, self.capacity_segments)
 
-        # reset this env working buffer
+        # Reset working buffer for this env
         self.work_o[env_idx][:] = 0
         self.work_a[env_idx][:] = 0
         self.work_r[env_idx][:] = 0
@@ -96,77 +129,40 @@ class RecurrentReplayBuffer:
         self.work_trunc[env_idx][:] = 0
         self.work_t[env_idx] = 0
         self.work_started[env_idx] = False
-        if last_next_obs is not None:
-            # prepare first obs of next episode if env immediately continues
+        self.work_ep_start[env_idx] = False
+        
+        # If episode didn't end, continue accumulating next segment
+        if not episode_ended:
             self.work_o[env_idx][0] = last_next_obs
             self.work_started[env_idx] = True
+            self.work_ep_start[env_idx] = False  # Not an episode start
+        else:
+            # Episode ended, next segment (if any) will be episode start
+            self.work_ep_start[env_idx] = True
 
     def size(self) -> int:
-        return len(self.episodes)
-
-    def _sample_episode_indices(self, batch_size: int):
-        assert len(self.episodes) >= batch_size
-        # weighted by episode length for more uniform step coverage
-        lengths = np.array([ep['a'].shape[0] for ep in self.episodes], dtype=np.float32)
-        prob = lengths / np.clip(lengths.sum(), 1e-8, None)
-        idxs = np.random.choice(len(self.episodes), size=batch_size, p=prob)
-        return idxs
-
+        return self.num_stored_segments
+    def can_sample(self, batch_size: int) -> bool:
+        return self.num_stored_segments >= batch_size
     def sample(self, batch_size: int) -> Dict[str, Any]:
-        idxs = self._sample_episode_indices(batch_size)
-        o_list, a_list, r_list, term_list, trunc_list, m_list = [], [], [], [], [], []
-        for idx in idxs:
-            ep = self.episodes[idx]
-            T = ep['a'].shape[0]
-            if self.segment_sample and T > self.num_bptt:
-                start = np.random.randint(0, T - self.num_bptt + 1)
-                end = start + self.num_bptt
-                o_seg = ep['o'][start:end + 1]
-                a_seg = ep['a'][start:end]
-                r_seg = ep['r'][start:end]
-                term_seg = ep['term'][start:end]
-                trunc_seg = ep['trunc'][start:end]
-                m_seg = np.ones_like(r_seg, dtype=np.float32)
-            else:
-                # take last num_bptt steps, pad if needed at front
-                length = min(T, self.num_bptt)
-                o_seg = ep['o'][T - length:T + 1]
-                a_seg = ep['a'][T - length:T]
-                r_seg = ep['r'][T - length:T]
-                term_seg = ep['term'][T - length:T]
-                trunc_seg = ep['trunc'][T - length:T]
-                pad = self.num_bptt - length
-                if pad > 0:
-                    o_pad = np.zeros((pad, self.obs_dim), dtype=np.float32)
-                    a_pad = np.zeros((pad,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32)
-                    r_pad = np.zeros((pad,), dtype=np.float32)
-                    term_pad = np.ones((pad,), dtype=np.float32)  # treat padded steps as terminal/masked
-                    trunc_pad = np.zeros((pad,), dtype=np.float32)
-                    m_pad = np.zeros((pad,), dtype=np.float32)
-                    o_seg = np.concatenate([o_pad, o_seg], axis=0)
-                    a_seg = np.concatenate([a_pad, a_seg], axis=0)
-                    r_seg = np.concatenate([r_pad, r_seg], axis=0)
-                    term_seg = np.concatenate([term_pad, term_seg], axis=0)
-                    trunc_seg = np.concatenate([trunc_pad, trunc_seg], axis=0)
-                    m_seg = np.concatenate([m_pad, np.ones((length,), dtype=np.float32)], axis=0)
-                else:
-                    m_seg = np.ones((self.num_bptt,), dtype=np.float32)
-            o_list.append(o_seg)
-            a_list.append(a_seg)
-            r_list.append(r_seg)
-            term_list.append(term_seg)
-            trunc_list.append(trunc_seg)
-            m_list.append(m_seg)
+        assert self.num_stored_segments >= batch_size, f"Not enough segments in buffer: {self.num_stored_segments} < {batch_size}"
+        
+        # Vectorized uniform sampling - no loops!
+        idxs = np.random.choice(self.num_stored_segments, size=batch_size, replace=False)
+        
         batch = {
-            'o': np.stack(o_list, axis=0),                 # [B, T+1, obs_dim]
-            'a': np.stack(a_list, axis=0),                 # [B, T, *action_shape]
-            'r': np.stack(r_list, axis=0),                 # [B, T]
-            'term': np.stack(term_list, axis=0),           # [B, T]
-            'trunc': np.stack(trunc_list, axis=0),         # [B, T]
-            'm': np.stack(m_list, axis=0),                 # [B, T]
+            'o': self.segments_o[idxs],                    # [B, T+1, obs_dim]
+            'a': self.segments_a[idxs],                    # [B, T, *action_shape]
+            'r': self.segments_r[idxs],                    # [B, T]
+            'term': self.segments_term[idxs],              # [B, T]
+            'trunc': self.segments_trunc[idxs],            # [B, T]
+            'm': self.segments_m[idxs],                    # [B, T]
         }
         return batch
 
     def finalize_all_working(self):
         for i in range(self.num_envs):
-            self._finalize_env_episode(i) 
+            if self.work_started[i]:
+                # Force finalize with dummy next obs and episode_ended=True
+                dummy_next_obs = np.zeros(self.obs_dim, dtype=np.float32)
+                self._finalize_env_segment(i, dummy_next_obs, episode_ended=True) 

@@ -52,11 +52,7 @@ class AlgoConfig:
     
     # RSAC-share specific
     num_bptt: int = 64
-    """Truncated BPTT sequence length (T)."""
-    max_episode_len: int = 2048
-    """Maximum episode length to buffer; longer episodes are cut into segments when stored."""
-    segment_sample: bool = True
-    """If True, sample random segments of length T from episodes; otherwise pad/trim to full episodes."""
+    """Truncated BPTT sequence length (T). Also the fixed segment length for storage."""
 
 @dataclass
 class WandbConfig:
