@@ -237,7 +237,8 @@ class RSACAgentDiscrete(RSACAgentBase):
         o = batch['o']
         a = batch['a']
         r = batch['r']
-        d = batch['d']
+        term = batch['term']
+        trunc = batch['trunc']
         m = batch['m']
         B, T = a.shape[0], a.shape[1]
         market_o, agent_o = self._split_obs(o)
@@ -265,7 +266,7 @@ class RSACAgentDiscrete(RSACAgentBase):
             q2_next = self.critic_model.apply({'params': qf2_state.target_params, 'batch_stats': qf2_state.target_batch_stats}, actor_input_tp1.reshape(-1, actor_input_tp1.shape[-1]), deterministic=True).reshape(B, T, -1)
             min_q_next = jnp.minimum(q1_next, q2_next)
             v_next = jnp.sum(next_probs * (min_q_next - current_alpha * next_log_probs), axis=-1)
-            target = r + (1.0 - d) * self.algo_config.gamma * v_next
+            target = r + (1.0 - term) * self.algo_config.gamma * v_next
 
             q1_all, new_q1_vars = self.critic_model.apply({'params': q1_params, 'batch_stats': q1_bs}, actor_input_t.reshape(-1, actor_input_t.shape[-1]), deterministic=False, mutable=['batch_stats'])
             q2_all, new_q2_vars = self.critic_model.apply({'params': q2_params, 'batch_stats': q2_bs}, actor_input_t.reshape(-1, actor_input_t.shape[-1]), deterministic=False, mutable=['batch_stats'])
@@ -422,7 +423,8 @@ class RSACAgentContinuous(RSACAgentBase):
         o = batch['o']
         a = batch['a']  # [B, T, A]
         r = batch['r']
-        d = batch['d']
+        term = batch['term']
+        trunc = batch['trunc']
         m = batch['m']
         B, T = r.shape
         market_o, agent_o = self._split_obs(o)
@@ -453,7 +455,7 @@ class RSACAgentContinuous(RSACAgentBase):
             q1_next = self.critic_model.apply({'params': qf1_state.target_params, 'batch_stats': qf1_state.target_batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(B, T)
             q2_next = self.critic_model.apply({'params': qf2_state.target_params, 'batch_stats': qf2_state.target_batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(B, T)
             min_q_next = jnp.minimum(q1_next, q2_next)
-            target = r + (1.0 - d) * self.algo_config.gamma * (min_q_next - current_alpha * log_prob)
+            target = r + (1.0 - term) * self.algo_config.gamma * (min_q_next - current_alpha * log_prob)
 
             q1_cur, new_q1_vars = self.critic_model.apply({'params': q1_params, 'batch_stats': q1_bs}, x_t.reshape(-1, x_t.shape[-1]), a.reshape(-1, a.shape[-1]), deterministic=False, mutable=['batch_stats'])
             q2_cur, new_q2_vars = self.critic_model.apply({'params': q2_params, 'batch_stats': q2_bs}, x_t.reshape(-1, x_t.shape[-1]), a.reshape(-1, a.shape[-1]), deterministic=False, mutable=['batch_stats'])

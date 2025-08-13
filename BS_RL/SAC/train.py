@@ -417,7 +417,7 @@ class Trainer:
             if trunc and "final_observation" in infos and infos["final_observation"][idx] is not None:
                 real_next_obs[idx] = infos["final_observation"][idx]
         # add to recurrent buffer
-        self.rb.add_batch(obs.astype(np.float32), real_next_obs.astype(np.float32), actions.astype(np.int32 if self.is_discrete else np.float32), rewards.astype(np.float32), (terminations | truncations).astype(np.float32))
+        self.rb.add_batch(obs.astype(np.float32), real_next_obs.astype(np.float32), actions.astype(np.int32 if self.is_discrete else np.float32), rewards.astype(np.float32), terminations.astype(np.float32), truncations.astype(np.float32))
 
         # reset hidden states on done envs
         done_mask = (terminations | truncations).astype(bool)
@@ -434,16 +434,14 @@ class Trainer:
     @profile
     def _agent_update(self, current_step):
         self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
-        # allow early start when enough segments exist
-        if not self.rb.can_sample(self.args.algo.batch_size):
-            return None
         batch_np = self.rb.sample(self.args.algo.batch_size)
         # pack into jnp
         data = {
             'o': jnp.asarray(batch_np['o']),
             'a': jnp.asarray(batch_np['a']) if self.is_discrete else jnp.asarray(batch_np['a']).astype(jnp.float32),
             'r': jnp.asarray(batch_np['r']),
-            'd': jnp.asarray(batch_np['d']),
+            'term': jnp.asarray(batch_np['term']),
+            'trunc': jnp.asarray(batch_np['trunc']),
             'm': jnp.asarray(batch_np['m']),
         }
         log_alpha_arg = self.log_alpha_state if self.args.algo.autotune else None

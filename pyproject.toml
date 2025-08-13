@@ -60,6 +60,7 @@ cpu = [
 tpu = [
     'jax[tpu]==0.5.*', # 保持flax的版本近乎不变(0.10.4 -> 0.10.4)，代码完全不变 SPS 120->140 说明0.4版本的性能更好!
     # 可惜呀，flax.nn.scan用了jax v0.5的api：jax.api_util.debug_info导致报错
+    # .venv/lib/python3.11/site-packages/flax/core/axes_scan.py 手动将debug_info去掉即可用jax v0.4，可是发现和jax v0.5的性能差不多，起始SPS都是30，所以还是用v0.5吧
 ]
 gpu = [
     'jax[cuda12]==0.4.26', # 0.4.26对应cuDNN 9(kaggle镜像安装的版本)，系统cuda和jax所使用的cuda需保持一致。不知道jax的cuda版本是多少的看用下面的命令可以看，需注意不能用uv pip，它似乎不能正确检索
