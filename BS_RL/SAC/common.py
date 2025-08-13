@@ -13,19 +13,22 @@ try:
     profile: Callable = line_profiler.profile
 except:
     profile = lambda x: x
-
+class CallableFalse:
+    def __bool__(self):
+        """在布尔上下文中返回False"""
+        return False
+    
+    def __call__(self, *args, **kwargs):
+        """使对象可调用"""
+        return None
+class Profiler:
+    def __init__(self):
+        print("pyinstrument Profiler is disabled")
+    def __getattr__(self, name: str, /, cached_ret = CallableFalse()) -> CallableFalse:
+        return cached_ret
 if ENABLE_PROFILE:
-    from pyinstrument import Profiler
-else:
-    class Profiler:
-        def __init__(self):
-            print("pyinstrument Profiler is disabled")
-        def start(self):
-            pass
-        def stop(self):
-            pass
-        def print(self):
-            pass
+    from pyinstrument import Profiler as PyInstrumentProfiler
+    Profiler: type[PyInstrumentProfiler] = PyInstrumentProfiler # 需要类型注解才能提供正确的IntelliSense
 jax_profiler = jax.profiler
 if  not USE_JAX_PROFILER:
     class JaxProfiler:

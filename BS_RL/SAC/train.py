@@ -355,7 +355,7 @@ class Trainer:
         update_cnt = 0
         with tqdm(initial=start_iteration, total=total_iterations, desc="Training") as pbar:
             for loop_iter in range(start_iteration, total_iterations):
-                if update_cnt == 1:
+                if update_cnt == 1 and not profiler.is_running :
                     profiler.start() # 首次更新，tpu预热完毕，开始profile
                 current_step = loop_iter * self.args.env.env_num
                 
@@ -369,11 +369,12 @@ class Trainer:
                             if i == 0:
                                 self.logger.log_env0_episode(info_item['episode'], current_step, prefix="train")
 
-                if current_step > self.args.algo.learning_starts:
+                # 如果buffer中没有足够的样本，则不更新
+                if current_step > self.args.algo.learning_starts and self.rb.can_sample(self.args.algo.batch_size):
                     if current_step % self.args.algo.update_frequency == 0:
+                        update_cnt += 1
                         metrics_from_update = self._agent_update(current_step)
                         if metrics_from_update:
-                            update_cnt += 1
                             sps = int(pbar.format_dict['rate'] * self.args.env.env_num) # iter/s * env_num = step/s
                             pbar_postfix["SPS"] = sps
                             log_data = {}
@@ -436,8 +437,6 @@ class Trainer:
     @profile
     def _agent_update(self, current_step):
         self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
-        if not self.rb.can_sample(self.args.algo.batch_size): # 如果buffer中没有足够的样本，则不更新
-            return None
         batch_np = self.rb.sample(self.args.algo.batch_size)
         # pack into jnp
         data = {
