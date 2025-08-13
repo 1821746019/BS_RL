@@ -78,7 +78,7 @@ class GymTrainer(Trainer):
 
 if __name__ == "__main__":
     # LunarLanderContinuous参数配置
-    total_timesteps = int(1e5)  # 100万步，足够测试收敛性
+    total_timesteps = int(2e4)  # 100万步，足够测试收敛性
     batch_size = 256
     env_num = 1  # SAC通常使用单环境
     eval_env_num = 10

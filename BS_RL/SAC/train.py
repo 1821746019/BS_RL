@@ -359,7 +359,8 @@ class Trainer:
                     profiler.start() # 首次更新，tpu预热完毕，开始profile
                 current_step = loop_iter * self.args.env.env_num
                 
-                obs, infos = self._environment_step(obs, current_step)
+                # 在critic更新一次后，才使用actor和env交互
+                obs, infos = self._env_step(obs, current_step >= self.args.algo.learning_starts and update_cnt > 0)
                 
                 if "final_info" in infos and self.logger:
                     for i, info_item in enumerate(infos["final_info"]):
@@ -370,9 +371,9 @@ class Trainer:
 
                 if current_step > self.args.algo.learning_starts:
                     if current_step % self.args.algo.update_frequency == 0:
-                        update_cnt += 1
                         metrics_from_update = self._agent_update(current_step)
                         if metrics_from_update:
+                            update_cnt += 1
                             sps = int(pbar.format_dict['rate'] * self.args.env.env_num) # iter/s * env_num = step/s
                             pbar_postfix["SPS"] = sps
                             log_data = {}
@@ -399,9 +400,9 @@ class Trainer:
         jax_profiler.stop_trace()
         self.cleanup()
 
-    def _environment_step(self, obs, current_step):
+    def _env_step(self, obs, use_actor=True):
         self.key_actions_base, key_actions_step = jax.random.split(self.key_actions_base)
-        if current_step < self.args.algo.learning_starts:
+        if not use_actor:
             actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)])
             # keep hidden states unchanged
         else:

@@ -48,12 +48,11 @@ class AlgoConfig:
     # JAX-specific Adam epsilon, matching PyTorch default for fair comparison
     adam_eps: float = 1e-4 # CleanRL used 1e-4 for PyTorch Adam, default optax Adam is 1e-8.
     use_SGD: bool = True
-    """whether to use SGD instead of Adam"""
-    
+    """whether to use SGD instead of AdamW"""
     # RSAC-share specific
     num_bptt: int = 64
     """Truncated BPTT sequence length (T). Also the fixed segment length for storage."""
-
+    
 @dataclass
 class WandbConfig:
     track: bool = True
