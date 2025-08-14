@@ -74,7 +74,7 @@ class StatsAggregator:
         if remapped:
             self.buffer.append(remapped)
 
-    def get_aggregated_stats(self) -> Dict[str, float]:
+    def get_aggregated_stats(self, prefix: str = "") -> Dict[str, float]:
         if not self.buffer:
             return {}
 
@@ -93,11 +93,11 @@ class StatsAggregator:
         results = {}
         for key, values in aggregated.items():
             if not values: continue
-            results[f"{key}_mean"] = np.mean(values)
+            results[f"{prefix}{key}_mean"] = np.mean(values)
             # if len(values) > 1:
             #     results[f"{key}_std"] = np.std(values)
-            results[f"{key}_max"] = np.max(values)
-            results[f"{key}_min"] = np.min(values)
+            results[f"{prefix}{key}_max"] = np.max(values)
+            results[f"{prefix}{key}_min"] = np.min(values)
         return results
 
     def clear(self):

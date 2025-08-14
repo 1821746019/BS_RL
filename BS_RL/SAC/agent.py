@@ -156,6 +156,10 @@ class RSACAgentBase:
 
     def _update(self, states, batch, key):
         raise NotImplementedError
+    
+    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update,  actor_state, qf1_state, qf2_state, summarizer_state,  summarizer_target_params, log_alpha_state, key, deterministic: bool = False):
+        """Combined function to reduce CPU-TPU communication overhead"""
+        raise NotImplementedError
 
 class RSACAgentDiscrete(RSACAgentBase):
     def __init__(self,
@@ -342,6 +346,74 @@ class RSACAgentDiscrete(RSACAgentBase):
             'entropy': entropy_val,
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
+
+    @partial(jax.jit, static_argnums=(0, 5, 6, 14))
+    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state, qf1_state, qf2_state, summarizer_state, summarizer_target_params, log_alpha_state, key, deterministic: bool = False):
+        """Combined action selection and agent update to reduce CPU-TPU communication"""
+        # Split rng on device to avoid host-device traffic
+        key_action, key_update, new_key = jax.random.split(key, 3)
+        
+        # 1. First perform agent update if requested
+        def do_agent_update():
+            return self._update(actor_state, qf1_state, qf2_state, summarizer_state, 
+                              summarizer_target_params, log_alpha_state, batch, key_update)
+        
+        def no_agent_update():
+            empty_metrics = {
+                'critic_loss': jnp.array(0.0),
+                'actor_loss': jnp.array(0.0), 
+                'alpha_loss': jnp.array(0.0),
+                'alpha': jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha),
+                'entropy': jnp.array(0.0),
+            }
+            return actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha), empty_metrics
+        
+        # Use jax.lax.cond to conditionally update
+        updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, current_alpha, metrics = jax.lax.cond(
+            do_update,
+            do_agent_update,
+            no_agent_update
+        )
+        
+        # Apply target network updates if requested
+        def apply_target_updates(states):
+            qf1_state, qf2_state, summarizer_target_params = states
+            tau = self.algo_config.tau
+            updated_qf1_state = qf1_state.replace(
+                target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(qf1_state.batch_stats, qf1_state.target_batch_stats, tau) if qf1_state.batch_stats is not None else qf1_state.target_batch_stats
+            )
+            updated_qf2_state = qf2_state.replace(
+                target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(qf2_state.batch_stats, qf2_state.target_batch_stats, tau) if qf2_state.batch_stats is not None else qf2_state.target_batch_stats
+            )
+            updated_summarizer_target_params = optax.incremental_update(updated_summarizer_state.params, summarizer_target_params, tau)
+            return updated_qf1_state, updated_qf2_state, updated_summarizer_target_params
+        
+        def no_target_updates(states):
+            return states
+        
+        final_qf1_state, final_qf2_state, final_summarizer_target_params = jax.lax.cond(
+            do_update & do_target_update,  # Only apply target updates if we're doing regular updates too
+            apply_target_updates,
+            no_target_updates,
+            (updated_qf1_state, updated_qf2_state, summarizer_target_params)
+        )
+        
+        # 2. Then perform action selection using potentially updated states
+        market = obs[..., :self.market_feature_dim]
+        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0), dtype=obs.dtype)
+        seq = market[:, None, :]
+        outputs, (new_h, new_c) = self.summarizer.apply({'params': updated_summarizer_state.params}, seq, (hidden_h, hidden_c))
+        summary_t = outputs[:, -1, :]
+        x = jnp.concatenate([summary_t, agent_feat], axis=-1)
+        logits = self.actor_model.apply({'params': updated_actor_state.params, 'batch_stats': updated_actor_state.batch_stats}, x, deterministic=True)
+        if deterministic:
+            actions = jnp.argmax(logits, axis=-1)
+        else:
+            actions = jax.random.categorical(key_action, logits, axis=-1)
+        
+        return actions, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, updated_summarizer_state, final_summarizer_target_params, updated_log_alpha_state, metrics, new_key
 
 class RSACAgentContinuous(RSACAgentBase):
     def __init__(self,
@@ -532,5 +604,75 @@ class RSACAgentContinuous(RSACAgentBase):
             'entropy': entropy_val,
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
+
+    @partial(jax.jit, static_argnums=(0, 5, 6, 14))
+    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state, qf1_state, qf2_state, summarizer_state, summarizer_target_params, log_alpha_state, key, deterministic: bool = False):
+        """Combined action selection and agent update to reduce CPU-TPU communication"""
+        # Split rng on device to avoid host-device traffic
+        key_action, key_update, new_key = jax.random.split(key, 3)
+        
+        # 1. First perform agent update if requested
+        def do_agent_update():
+            return self._update(actor_state, qf1_state, qf2_state, summarizer_state, 
+                              summarizer_target_params, log_alpha_state, batch, key_update)
+        
+        def no_agent_update():
+            empty_metrics = {
+                'critic_loss': jnp.array(0.0),
+                'actor_loss': jnp.array(0.0), 
+                'alpha_loss': jnp.array(0.0),
+                'alpha': jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha),
+                'entropy': jnp.array(0.0),
+            }
+            return actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha), empty_metrics
+        
+        # Use jax.lax.cond to conditionally update
+        updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, current_alpha, metrics = jax.lax.cond(
+            do_update,
+            do_agent_update,
+            no_agent_update
+        )
+        
+        # Apply target network updates if requested
+        def apply_target_updates(states):
+            qf1_state, qf2_state, summarizer_target_params = states
+            tau = self.algo_config.tau
+            updated_qf1_state = qf1_state.replace(
+                target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(qf1_state.batch_stats, qf1_state.target_batch_stats, tau) if qf1_state.batch_stats is not None else qf1_state.target_batch_stats
+            )
+            updated_qf2_state = qf2_state.replace(
+                target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(qf2_state.batch_stats, qf2_state.target_batch_stats, tau) if qf2_state.batch_stats is not None else qf2_state.target_batch_stats
+            )
+            updated_summarizer_target_params = optax.incremental_update(updated_summarizer_state.params, summarizer_target_params, tau)
+            return updated_qf1_state, updated_qf2_state, updated_summarizer_target_params
+        
+        def no_target_updates(states):
+            return states
+        
+        final_qf1_state, final_qf2_state, final_summarizer_target_params = jax.lax.cond(
+            do_update & do_target_update,  # Only apply target updates if we're doing regular updates too
+            apply_target_updates,
+            no_target_updates,
+            (updated_qf1_state, updated_qf2_state, summarizer_target_params)
+        )
+        
+        # 2. Then perform action selection using potentially updated states
+        market = obs[..., :self.market_feature_dim]
+        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0), dtype=obs.dtype)
+        seq = market[:, None, :]
+        outputs, (new_h, new_c) = self.summarizer.apply({'params': updated_summarizer_state.params}, seq, (hidden_h, hidden_c))
+        summary_t = outputs[:, -1, :]
+        x = jnp.concatenate([summary_t, agent_feat], axis=-1)
+        mean, log_std = self.actor_model.apply({'params': updated_actor_state.params, 'batch_stats': updated_actor_state.batch_stats}, x, deterministic=True)
+        dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
+        if deterministic:
+            action = dist.mean()
+        else:
+            action = dist.sample(seed=key_action)
+        squashed = jnp.tanh(action)
+        
+        return squashed, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, updated_summarizer_state, final_summarizer_target_params, updated_log_alpha_state, metrics, new_key
 
 RSACAgent = Union[RSACAgentDiscrete, RSACAgentContinuous]

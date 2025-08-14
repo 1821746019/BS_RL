@@ -41,15 +41,12 @@ class Trainer:
     def __init__(self, args: Args):
         self.args = args
         self.num_devices = 1
-
         self.run_name_suffix = None
         self.wandb_run_name = None
         self.base_output_dir = None
         self.ckpt_dir = None
         self.initial_global_step = 0
-        self.key = None
-        self.key_actions_base = None
-        self.key_update_base = None
+        self.jax_key: jax.random.PRNGKey
         self.envs: AsyncVectorEnv| SyncVectorEnv
         self.agent = None
         self.rb: RecurrentReplayBuffer = None
@@ -161,9 +158,7 @@ class Trainer:
                         prng_states = pickle.load(f)
                     random.setstate(prng_states['random_state'])
                     np.random.set_state(prng_states['np_random_state'])
-                    self.key = prng_states['key']
-                    self.key_actions_base = prng_states['key_actions_base']
-                    self.key_update_base = prng_states['key_update_base']
+                    self.jax_key = prng_states['jax_key']
                     print("PRNG states successfully restored.")
                     prng_restored = True
                 except Exception as e:
@@ -173,9 +168,7 @@ class Trainer:
             print("Initializing new PRNG states.")
             random.seed(self.args.train.seed)
             np.random.seed(self.args.train.seed)
-            base_key = jax.random.PRNGKey(self.args.train.seed)
-            self.key, key_for_loop = jax.random.split(base_key)
-            self.key_actions_base, self.key_update_base = jax.random.split(key_for_loop)
+            self.jax_key = jax.random.PRNGKey(self.args.train.seed)
 
     def _setup_data_loader(self):
         print("Initializing Trainer's DataLoader...")
@@ -209,7 +202,7 @@ class Trainer:
             agent_cls = RSACAgentContinuous
             print(f"Using RSAC-Share Continuous with action dim: {action_dim}")
 
-        key_agent, self.key = jax.random.split(self.key)
+        key_agent, self.jax_key = jax.random.split(self.jax_key)
         self.agent = agent_cls(
             action_dim=action_dim,
             observation_space_shape=obs_shape,
@@ -231,8 +224,8 @@ class Trainer:
         L = self.args.network.lstm_num_layers
         H = self.args.network.lstm_hidden_dim
         N = self.envs.num_envs
-        self.hidden_h = jnp.zeros((L, N, H), dtype=jnp.float32)
-        self.hidden_c = jnp.zeros((L, N, H), dtype=jnp.float32)
+        self.hidden_h = jnp.zeros((L, N, H))
+        self.hidden_c = jnp.zeros((L, N, H))
 
         # restore if checkpoint exists
         self._initialize_or_restore_agent_states()
@@ -363,9 +356,74 @@ class Trainer:
                     profiler.start() # 首次更新，tpu预热完毕，开始profile
                 current_step = loop_iter * self.args.env.env_num
                 
-                # 在critic更新一次后，才使用actor和env交互
-                obs, infos = self._env_step(obs, current_step >= self.args.algo.learning_starts and update_cnt > 0)
+                # Prepare rng on device inside jit to avoid host-device split cost
                 
+                # Determine if we should update and use actor
+                use_actor = current_step >= self.args.algo.learning_starts and update_cnt > 0
+                do_update = (current_step > self.args.algo.learning_starts and 
+                           self.rb.can_sample(self.args.algo.batch_size) and 
+                           current_step % self.args.algo.update_frequency == 0)
+                do_target_update = False
+                batch_data = None
+                
+                if do_update:
+                    update_cnt += 1
+                    do_target_update = (current_step // self.args.algo.update_frequency) % max(self.args.algo.target_network_frequency // max(self.args.algo.update_frequency,1), 1) == 0
+                    batch_data = self.rb.sample(self.args.algo.batch_size)
+                
+                # Combined action selection and agent update in single JIT call
+                if use_actor:
+                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_summarizer_target_params, new_log_alpha_state, metrics, self.jax_key = self.agent.get_action_and_update_agent(
+                        obs, self.hidden_h, self.hidden_c, batch_data, do_update, do_target_update,
+                        self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state,
+                        self.summarizer_target_params, self.log_alpha_state, self.jax_key,
+                        deterministic=False
+                    )
+                    # Update states
+                    self.actor_state = new_actor_state
+                    self.qf1_state = new_qf1_state
+                    self.qf2_state = new_qf2_state
+                    self.summarizer_state = new_summarizer_state
+                    self.summarizer_target_params = new_summarizer_target_params
+                    if self.args.algo.autotune:
+                        self.log_alpha_state = new_log_alpha_state
+                    self.hidden_h = new_h
+                    self.hidden_c = new_c
+                    actions = np.array(jax.device_get(actions))
+                else:
+                    # Random actions during warmup
+                    actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)])
+                    metrics = None
+                
+                # Environment step
+                next_obs, rewards, terminations, truncations, infos = self.envs.step(actions)
+                
+                # Handle final observations
+                real_next_obs = next_obs.copy()
+                for idx, trunc in enumerate(truncations):
+                    if trunc and "final_observation" in infos and infos["final_observation"][idx] is not None:
+                        real_next_obs[idx] = infos["final_observation"][idx]
+                
+                # Add to replay buffer
+                self.rb.add_batch(obs.astype(np.float32), real_next_obs.astype(np.float32), 
+                                actions.astype(np.int32 if self.is_discrete else np.float32), 
+                                rewards.astype(np.float32), terminations.astype(np.float32), 
+                                truncations.astype(np.float32))
+                
+                # Reset hidden states on done envs
+                done_mask = (terminations | truncations).astype(bool)
+                if done_mask.any():
+                    L, N, H = self.hidden_h.shape
+                    hh = np.array(self.hidden_h)
+                    hc = np.array(self.hidden_c)
+                    hh[:, done_mask, :] = 0.0
+                    hc[:, done_mask, :] = 0.0
+                    self.hidden_h = jnp.asarray(hh)
+                    self.hidden_c = jnp.asarray(hc)
+                
+                obs = next_obs
+                
+                # Logging
                 if "final_info" in infos and self.logger:
                     for i, info_item in enumerate(infos["final_info"]):
                         if info_item and "episode" in info_item:
@@ -373,28 +431,21 @@ class Trainer:
                             if i == 0:
                                 self.logger.log_env0_episode(info_item['episode'], current_step, prefix="train")
 
-                # 如果buffer中没有足够的样本，则不更新
-                if current_step > self.args.algo.learning_starts and self.rb.can_sample(self.args.algo.batch_size):
-                    if current_step % self.args.algo.update_frequency == 0:
-                        update_cnt += 1
-                        do_target_update = (current_step // self.args.algo.update_frequency) % max(self.args.algo.target_network_frequency // max(self.args.algo.update_frequency,1), 1) == 0
-                        batch_np = self.rb.sample(self.args.algo.batch_size) #np会自动变为jnp
-                        metrics = self._agent_update(batch_np, do_target_update)
-                        if metrics and current_step % (self.args.train.log_freq) == 0:
-                            sps = int(pbar.format_dict['rate'] * self.args.env.env_num) # iter/s * env_num = step/s
-                            pbar_postfix["SPS"] = sps
-                            log_data = {}
-                            metrics["SPS"] = sps
-                            for k, v in metrics.items():
-                                log_data[f"metrics/{k}"] = v
-                            buffered_stats = train_stats_aggregator.get_aggregated_stats()
-                            if buffered_stats:
-                                for k, v in buffered_stats.items():
-                                    log_data[f"train_buffered/{k}"] = v
-                                if 'return_mean' in buffered_stats:
-                                    pbar_postfix["return_mean"] = f"{buffered_stats['return_mean']:.2f}"
-                            if self.args.wandb.track:
-                                wandb.log(log_data, step=current_step)
+                if metrics and current_step % (self.args.train.log_freq) == 0:
+                    sps = int(pbar.format_dict['rate'] * self.args.env.env_num) # iter/s * env_num = step/s
+                    pbar_postfix["SPS"] = sps
+                    log_data = {}
+                    metrics["SPS"] = sps
+                    for k, v in metrics.items():
+                        log_data[f"metrics/{k}"] = v
+                    buffered_stats = train_stats_aggregator.get_aggregated_stats()
+                    if buffered_stats:
+                        for k, v in buffered_stats.items():
+                            log_data[f"train_buffered/{k}"] = v
+                        if 'return_mean' in buffered_stats:
+                            pbar_postfix["return_mean"] = f"{buffered_stats['return_mean']:.2f}"
+                    if self.args.wandb.track:
+                        wandb.log(log_data, step=current_step)
 
                 next_step = (loop_iter + 1) * self.args.env.env_num
                 self._run_evaluation(current_step, next_step)
@@ -406,99 +457,6 @@ class Trainer:
         profiler.print()
         jax_profiler.stop_trace()
         self.cleanup()
-
-    def _env_step(self, obs, use_actor=True):
-        self.key_actions_base, key_actions_step = jax.random.split(self.key_actions_base)
-        if not use_actor:
-            actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)])
-            # keep hidden states unchanged
-        else:
-            jax_obs = jnp.asarray(obs)
-            actions_jax, new_h, new_c = self.agent.select_action(self.actor_state, self.summarizer_state.params, jax_obs, self.hidden_h, self.hidden_c, key_actions_step, deterministic=False)
-            actions = np.array(jax.device_get(actions_jax))
-            self.hidden_h = jax.device_get(new_h)
-            self.hidden_c = jax.device_get(new_c)
-
-        next_obs, rewards, terminations, truncations, infos = self.envs.step(actions)
-
-        real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc and "final_observation" in infos and infos["final_observation"][idx] is not None:
-                real_next_obs[idx] = infos["final_observation"][idx]
-        # add to recurrent buffer
-        self.rb.add_batch(obs.astype(np.float32), real_next_obs.astype(np.float32), actions.astype(np.int32 if self.is_discrete else np.float32), rewards.astype(np.float32), terminations.astype(np.float32), truncations.astype(np.float32))
-
-        # reset hidden states on done envs
-        done_mask = (terminations | truncations).astype(bool)
-        if done_mask.any():
-            L, N, H = self.hidden_h.shape
-            hh = np.array(self.hidden_h)
-            hc = np.array(self.hidden_c)
-            hh[:, done_mask, :] = 0.0
-            hc[:, done_mask, :] = 0.0
-            self.hidden_h = jnp.asarray(hh)
-            self.hidden_c = jnp.asarray(hc)
-        return next_obs, infos
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _compute_update(self, batch, do_target_update: bool, actor_state, qf1_state, qf2_state, summarizer_state, summarizer_target_params, log_alpha_state, key_update_step):
-        """纯函数版本的更新计算，不修改任何状态"""
-        log_alpha_arg = log_alpha_state if self.args.algo.autotune else None
-
-        # one update step
-        actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, returned_log_alpha, current_alpha, metrics = self.agent._update(
-            actor_state, qf1_state, qf2_state, summarizer_state, summarizer_target_params, log_alpha_arg, batch, key_update_step
-        )
-
-        # target network update (soft/hard) using jax.lax.cond
-        def update_targets(states: tuple[CriticTrainState, CriticTrainState, flax.core.FrozenDict]):
-            qf1_state, qf2_state, summarizer_target_params = states
-            tau = self.args.algo.tau
-            updated_qf1_state = qf1_state.replace(
-                target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(qf1_state.batch_stats, qf1_state.target_batch_stats, tau) if qf1_state.batch_stats is not None else qf1_state.target_batch_stats
-            )
-            updated_qf2_state = qf2_state.replace(
-                target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(qf2_state.batch_stats, qf2_state.target_batch_stats, tau) if qf2_state.batch_stats is not None else qf2_state.target_batch_stats
-            )
-            # summarizer target uses same tau
-            updated_summarizer_target_params = optax.incremental_update(summarizer_state_new.params, summarizer_target_params, tau)
-            return updated_qf1_state, updated_qf2_state, updated_summarizer_target_params
-        
-        def no_update_targets(states):
-            return states
-        
-        qf1_state_final, qf2_state_final, summarizer_target_params_final = jax.lax.cond(
-            do_target_update,
-            update_targets,
-            no_update_targets,
-            (qf1_state_new, qf2_state_new, summarizer_target_params)
-        )
-
-        return actor_state_new, qf1_state_final, qf2_state_final, summarizer_state_new, returned_log_alpha, current_alpha, summarizer_target_params_final, metrics
-
-    def _agent_update(self, batch, do_target_update: bool) -> dict:
-        """在非JIT环境中调用纯函数并更新状态"""
-        self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
-        
-        # 调用纯函数版本的更新计算
-        actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, returned_log_alpha, current_alpha, summarizer_target_params_new, metrics = self._compute_update(
-            batch, do_target_update, self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state, 
-            self.summarizer_target_params, self.log_alpha_state, key_update_step
-        )
-        
-        # 在非JIT环境中更新状态
-        self.actor_state = actor_state_new
-        self.qf1_state = qf1_state_new
-        self.qf2_state = qf2_state_new
-        self.summarizer_state = summarizer_state_new
-        self.summarizer_target_params = summarizer_target_params_new
-        self.current_alpha = current_alpha
-        if self.args.algo.autotune:
-            self.log_alpha_state = returned_log_alpha
-
-        return metrics
 
     def _run_evaluation(self, current_step, next_step):
         if not self.evaluator: return
@@ -574,9 +532,7 @@ class Trainer:
                 prng_states = {
                     'random_state': random.getstate(),
                     'np_random_state': np.random.get_state(),
-                    'key': self.key,
-                    'key_actions_base': self.key_actions_base,
-                    'key_update_base': self.key_update_base,
+                    'jax_key': self.jax_key,
                 }
                 with open(os.path.join(saved_path, "prng_states.pkl"), 'wb') as f:
                     pickle.dump(prng_states, f)
