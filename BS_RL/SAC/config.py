@@ -51,6 +51,8 @@ class AlgoConfig:
     # RSAC-share specific
     num_bptt: int = 64
     """Truncated BPTT sequence length (T). Also the fixed segment length for storage."""
+    burn_in: int = 0
+    """Number of prefix steps used only to roll LSTM hidden state (excluded from loss)."""
     
 @dataclass
 class WandbConfig:

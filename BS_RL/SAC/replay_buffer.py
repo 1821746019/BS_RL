@@ -8,21 +8,25 @@ class RecurrentReplayBuffer:
                  is_discrete_action: bool,
                  capacity_segments: int,
                  num_envs: int,
-                 num_bptt: int):
+                 num_bptt: int,
+                 burn_in: int = 0):
         self.obs_dim = obs_dim
         self.action_shape = action_shape
         self.is_discrete_action = is_discrete_action
         self.capacity_segments = capacity_segments
         self.num_envs = num_envs
         self.num_bptt = num_bptt
+        self.burn_in = int(max(burn_in, 0))
+        self.total_len = int(self.num_bptt + self.burn_in)
 
         # Storage for segments as multi-dimensional arrays for vectorized operations
-        self.segments_o = np.zeros((capacity_segments, num_bptt + 1, obs_dim), dtype=np.float32)
-        self.segments_a = np.zeros((capacity_segments, num_bptt) + action_shape, dtype=np.int32 if is_discrete_action else np.float32)
-        self.segments_r = np.zeros((capacity_segments, num_bptt), dtype=np.float32)
-        self.segments_term = np.zeros((capacity_segments, num_bptt), dtype=np.float32)
-        self.segments_trunc = np.zeros((capacity_segments, num_bptt), dtype=np.float32)
-        self.segments_m = np.zeros((capacity_segments, num_bptt), dtype=np.float32)
+        T = self.total_len
+        self.segments_o = np.zeros((capacity_segments, T + 1, obs_dim), dtype=np.float32)
+        self.segments_a = np.zeros((capacity_segments, T) + action_shape, dtype=np.int32 if is_discrete_action else np.float32)
+        self.segments_r = np.zeros((capacity_segments, T), dtype=np.float32)
+        self.segments_term = np.zeros((capacity_segments, T), dtype=np.float32)
+        self.segments_trunc = np.zeros((capacity_segments, T), dtype=np.float32)
+        self.segments_m = np.zeros((capacity_segments, T), dtype=np.float32)
         
         self.seg_ptr = 0
         self.num_stored_segments = 0
@@ -32,11 +36,12 @@ class RecurrentReplayBuffer:
 
     def _reset_working_buffers(self):
         # Working buffers for accumulating num_bptt steps before storing as segment
-        self.work_o = [np.zeros((self.num_bptt + 1, self.obs_dim), dtype=np.float32) for _ in range(self.num_envs)]
-        self.work_a = [np.zeros((self.num_bptt,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32) for _ in range(self.num_envs)]
-        self.work_r = [np.zeros((self.num_bptt,), dtype=np.float32) for _ in range(self.num_envs)]
-        self.work_term = [np.zeros((self.num_bptt,), dtype=np.float32) for _ in range(self.num_envs)]
-        self.work_trunc = [np.zeros((self.num_bptt,), dtype=np.float32) for _ in range(self.num_envs)]
+        T = self.total_len
+        self.work_o = [np.zeros((T + 1, self.obs_dim), dtype=np.float32) for _ in range(self.num_envs)]
+        self.work_a = [np.zeros((T,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32) for _ in range(self.num_envs)]
+        self.work_r = [np.zeros((T,), dtype=np.float32) for _ in range(self.num_envs)]
+        self.work_term = [np.zeros((T,), dtype=np.float32) for _ in range(self.num_envs)]
+        self.work_trunc = [np.zeros((T,), dtype=np.float32) for _ in range(self.num_envs)]
         self.work_t = np.zeros((self.num_envs,), dtype=np.int32)
         self.work_started = np.zeros((self.num_envs,), dtype=bool)
         self.work_ep_start = np.zeros((self.num_envs,), dtype=bool)  # True if this segment starts a new episode
@@ -72,7 +77,7 @@ class RecurrentReplayBuffer:
 
             # Check if we should finalize this segment
             should_finalize = False
-            if t + 1 >= self.num_bptt:
+            if t + 1 >= self.total_len:
                 # Segment is full
                 should_finalize = True
             elif terminations[i] > 0.5 or truncations[i] > 0.5:
@@ -90,12 +95,13 @@ class RecurrentReplayBuffer:
         
         # Create segment with proper padding/masking
         length = t
-        o = np.zeros((self.num_bptt + 1, self.obs_dim), dtype=np.float32)
-        a = np.zeros((self.num_bptt,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32)
-        r = np.zeros((self.num_bptt,), dtype=np.float32)
-        term = np.zeros((self.num_bptt,), dtype=np.float32)
-        trunc = np.zeros((self.num_bptt,), dtype=np.float32)
-        m = np.zeros((self.num_bptt,), dtype=np.float32)  # mask for valid steps
+        T = self.total_len
+        o = np.zeros((T + 1, self.obs_dim), dtype=np.float32)
+        a = np.zeros((T,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32)
+        r = np.zeros((T,), dtype=np.float32)
+        term = np.zeros((T,), dtype=np.float32)
+        trunc = np.zeros((T,), dtype=np.float32)
+        m = np.zeros((T,), dtype=np.float32)  # mask for valid steps
         
         # Copy actual data
         o[:length + 1] = self.work_o[env_idx][:length + 1]
@@ -103,10 +109,15 @@ class RecurrentReplayBuffer:
         r[:length] = self.work_r[env_idx][:length]
         term[:length] = self.work_term[env_idx][:length]
         trunc[:length] = self.work_trunc[env_idx][:length]
-        m[:length] = 1.0  # mark valid steps
+        # mark valid training steps: exclude burn-in prefix
+        if length > self.burn_in:
+            m[self.burn_in:length] = 1.0
+        else:
+            # not enough steps to reach burn-in; keep m as zeros
+            pass
         
         # For padded steps, mark as terminal to prevent bootstrap
-        if length < self.num_bptt:
+        if length < self.total_len:
             term[length:] = 1.0
 
         # Store segment in circular buffer using vectorized operations

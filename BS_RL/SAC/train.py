@@ -1,10 +1,7 @@
 from functools import partial
 from BS_RL.SAC.common import Profiler
-
 import os
 import warnings
-
-import flax
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
 warnings.filterwarnings("ignore", category=UserWarning, module="absl")
 import copy
@@ -60,8 +57,8 @@ class Trainer:
         self.evaluator = None
         self.logger = None
         self.is_discrete: bool
-        self.hidden_h = None  # [L, N, H]
-        self.hidden_c = None  # [L, N, H]
+        self.hidden_h: jnp.ndarray  # [L, N, H]
+        self.hidden_c: jnp.ndarray  # [L, N, H]
 
     def setup(self):
         self._setup_paths_and_run_name()
@@ -312,14 +309,16 @@ class Trainer:
             action_shape = self.envs.single_action_space.shape
         # Calculate capacity in terms of segments rather than episodes
         # Assuming average episode length, convert buffer_size (in steps) to segments
-        capacity_segments = max(self.args.algo.buffer_size // self.args.algo.num_bptt, 1)
+        total_len_per_segment = int(self.args.algo.num_bptt + max(self.args.algo.burn_in, 0))
+        capacity_segments = max(self.args.algo.buffer_size // max(total_len_per_segment, 1), 1)
         self.rb = RecurrentReplayBuffer(
             obs_dim=obs_dim,
             action_shape=action_shape,
             is_discrete_action=self.is_discrete,
             capacity_segments=capacity_segments,
             num_envs=self.args.env.env_num,
-            num_bptt=self.args.algo.num_bptt
+            num_bptt=self.args.algo.num_bptt,
+            burn_in=self.args.algo.burn_in
         )
 
     def _setup_evaluator(self):
