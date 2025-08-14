@@ -138,7 +138,7 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
 
     return thunk
 
-def eval_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader, capture_media: bool=True, run_name: str=None,capture_episode_trigger: Callable[[int], bool]=None):
+def eval_env_maker(config: TradingEnvConfig, data_loader: DataLoader, capture_media: bool=True, run_name: str=None,capture_episode_trigger: Callable[[int], bool]=None):
    
     def thunk():
         account = Account(config)

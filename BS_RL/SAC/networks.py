@@ -2,8 +2,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from typing import List, Callable, Sequence
-from .config import NetworkConfig, ConvNextConfig, Cnn1DConfig, ResNet1DConfig
-from .nn.ResMLP import UnifiedResMLP, ResMLPConfig
+from .config import NetworkConfig
 from .nn.ResNet1DEncoder import ResNet1DEncoder
 from .nn.Simba import SimbaMLPResidualBlock, RSNorm, SimbaMLP
 

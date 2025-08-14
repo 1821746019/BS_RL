@@ -45,7 +45,6 @@ if __name__ == "__main__":
         ),
         env=EnvConfig(
             trading_env_config=trading_env_config,
-            seed=1,
             env_num=env_num, # SAC typically uses 1 env for off-policy learning
         ),
         network=NetworkConfig(

@@ -1,7 +1,10 @@
+from functools import partial
 from BS_RL.SAC.common import Profiler
 
 import os
 import warnings
+
+import flax
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
 warnings.filterwarnings("ignore", category=UserWarning, module="absl")
 import copy
@@ -78,7 +81,7 @@ class Trainer:
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
 
     def _setup_paths_and_run_name(self):
-        run_name_suffix = f"{self.args.train.exp_name}__{self.args.env.seed}__{int(time.time())}"
+        run_name_suffix = f"{self.args.train.exp_name}__{self.args.train.seed}__{int(time.time())}"
         if self.args.train.save_dir:
             self.base_output_dir = Path(self.args.train.save_dir)
             self.wandb_run_name = f"{run_name_suffix}__{self.base_output_dir.name}__{os.environ.get('TUNNEL_NAME', 'unknownDevice')}" if self.base_output_dir.name else run_name_suffix
@@ -168,9 +171,9 @@ class Trainer:
         
         if not prng_restored:
             print("Initializing new PRNG states.")
-            random.seed(self.args.env.seed)
-            np.random.seed(self.args.env.seed)
-            base_key = jax.random.PRNGKey(self.args.env.seed)
+            random.seed(self.args.train.seed)
+            np.random.seed(self.args.train.seed)
+            base_key = jax.random.PRNGKey(self.args.train.seed)
             self.key, key_for_loop = jax.random.split(base_key)
             self.key_actions_base, self.key_update_base = jax.random.split(key_for_loop)
 
@@ -184,7 +187,7 @@ class Trainer:
         vec_env_cls = AsyncVectorEnv if self.args.train.async_vector_env else SyncVectorEnv
         self.envs = vec_env_cls(
             [train_env_maker(
-                seed=self.args.env.seed + i,
+                seed=self.args.train.seed + i,
                 config=self.args.env.trading_env_config,
                 data_loader=self.data_loader
             ) for i in range(self.args.env.env_num)]
@@ -339,10 +342,11 @@ class Trainer:
             eval_config=self.args.eval,
             run_name_suffix=self.run_name_suffix,
             logger=self.logger,
+            seed=self.args.train.seed + 1
         )
 
     def train(self):
-        obs, _ = self.envs.reset(seed=self.args.env.seed + self.initial_global_step)
+        obs, _ = self.envs.reset(seed=self.args.train.seed + self.initial_global_step)
         # initialize first obs in rb working buffers
         # environment step loop will populate
         train_stats_aggregator = StatsAggregator()
@@ -351,7 +355,7 @@ class Trainer:
         total_iterations = self.args.algo.total_timesteps // self.args.env.env_num
         start_iteration = self.initial_global_step // self.args.env.env_num
         profiler = Profiler()
-        jax_profiler.start_trace(self.base_output_dir / "trace", True, True)
+        jax_profiler.start_trace(self.base_output_dir / "trace")
         update_cnt = 0
         with tqdm(initial=start_iteration, total=total_iterations, desc="Training") as pbar:
             for loop_iter in range(start_iteration, total_iterations):
@@ -373,13 +377,15 @@ class Trainer:
                 if current_step > self.args.algo.learning_starts and self.rb.can_sample(self.args.algo.batch_size):
                     if current_step % self.args.algo.update_frequency == 0:
                         update_cnt += 1
-                        metrics_from_update = self._agent_update(current_step)
-                        if metrics_from_update:
+                        do_target_update = (current_step // self.args.algo.update_frequency) % max(self.args.algo.target_network_frequency // max(self.args.algo.update_frequency,1), 1) == 0
+                        batch_np = self.rb.sample(self.args.algo.batch_size) #np会自动变为jnp
+                        metrics = self._agent_update(batch_np, do_target_update)
+                        if metrics and current_step % (self.args.train.log_freq) == 0:
                             sps = int(pbar.format_dict['rate'] * self.args.env.env_num) # iter/s * env_num = step/s
                             pbar_postfix["SPS"] = sps
                             log_data = {}
-                            metrics_from_update["SPS"] = sps
-                            for k, v in metrics_from_update.items():
+                            metrics["SPS"] = sps
+                            for k, v in metrics.items():
                                 log_data[f"metrics/{k}"] = v
                             buffered_stats = train_stats_aggregator.get_aggregated_stats()
                             if buffered_stats:
@@ -434,51 +440,65 @@ class Trainer:
             self.hidden_c = jnp.asarray(hc)
         return next_obs, infos
 
-    @profile
-    def _agent_update(self, current_step):
-        self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
-        batch_np = self.rb.sample(self.args.algo.batch_size)
-        # pack into jnp
-        data = {
-            'o': jnp.asarray(batch_np['o']),
-            'a': jnp.asarray(batch_np['a']) if self.is_discrete else jnp.asarray(batch_np['a']).astype(jnp.float32),
-            'r': jnp.asarray(batch_np['r']),
-            'term': jnp.asarray(batch_np['term']),
-            'trunc': jnp.asarray(batch_np['trunc']),
-            'm': jnp.asarray(batch_np['m']),
-        }
-        log_alpha_arg = self.log_alpha_state if self.args.algo.autotune else None
+    @partial(jax.jit, static_argnums=(0,))
+    def _compute_update(self, batch, do_target_update: bool, actor_state, qf1_state, qf2_state, summarizer_state, summarizer_target_params, log_alpha_state, key_update_step):
+        """纯函数版本的更新计算，不修改任何状态"""
+        log_alpha_arg = log_alpha_state if self.args.algo.autotune else None
 
         # one update step
-        actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, returned_log_alpha, self.current_alpha, metrics = self.agent._update(
-            self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state, self.summarizer_target_params, log_alpha_arg, data, key_update_step
+        actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, returned_log_alpha, current_alpha, metrics = self.agent._update(
+            actor_state, qf1_state, qf2_state, summarizer_state, summarizer_target_params, log_alpha_arg, batch, key_update_step
         )
 
+        # target network update (soft/hard) using jax.lax.cond
+        def update_targets(states: tuple[CriticTrainState, CriticTrainState, flax.core.FrozenDict]):
+            qf1_state, qf2_state, summarizer_target_params = states
+            tau = self.args.algo.tau
+            updated_qf1_state = qf1_state.replace(
+                target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(qf1_state.batch_stats, qf1_state.target_batch_stats, tau) if qf1_state.batch_stats is not None else qf1_state.target_batch_stats
+            )
+            updated_qf2_state = qf2_state.replace(
+                target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(qf2_state.batch_stats, qf2_state.target_batch_stats, tau) if qf2_state.batch_stats is not None else qf2_state.target_batch_stats
+            )
+            # summarizer target uses same tau
+            updated_summarizer_target_params = optax.incremental_update(summarizer_state_new.params, summarizer_target_params, tau)
+            return updated_qf1_state, updated_qf2_state, updated_summarizer_target_params
+        
+        def no_update_targets(states):
+            return states
+        
+        qf1_state_final, qf2_state_final, summarizer_target_params_final = jax.lax.cond(
+            do_target_update,
+            update_targets,
+            no_update_targets,
+            (qf1_state_new, qf2_state_new, summarizer_target_params)
+        )
+
+        return actor_state_new, qf1_state_final, qf2_state_final, summarizer_state_new, returned_log_alpha, current_alpha, summarizer_target_params_final, metrics
+
+    def _agent_update(self, batch, do_target_update: bool) -> dict:
+        """在非JIT环境中调用纯函数并更新状态"""
+        self.key_update_base, key_update_step = jax.random.split(self.key_update_base)
+        
+        # 调用纯函数版本的更新计算
+        actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, returned_log_alpha, current_alpha, summarizer_target_params_new, metrics = self._compute_update(
+            batch, do_target_update, self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state, 
+            self.summarizer_target_params, self.log_alpha_state, key_update_step
+        )
+        
+        # 在非JIT环境中更新状态
         self.actor_state = actor_state_new
         self.qf1_state = qf1_state_new
         self.qf2_state = qf2_state_new
         self.summarizer_state = summarizer_state_new
+        self.summarizer_target_params = summarizer_target_params_new
+        self.current_alpha = current_alpha
         if self.args.algo.autotune:
             self.log_alpha_state = returned_log_alpha
 
-        # target network update (soft/hard)
-        do_target_update = (current_step // self.args.algo.update_frequency) % max(self.args.algo.target_network_frequency // max(self.args.algo.update_frequency,1), 1) == 0
-        if do_target_update:
-            tau = self.args.algo.tau
-            self.qf1_state = self.qf1_state.replace(
-                target_params=optax.incremental_update(self.qf1_state.params, self.qf1_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(self.qf1_state.batch_stats, self.qf1_state.target_batch_stats, tau) if self.qf1_state.batch_stats is not None else self.qf1_state.target_batch_stats
-            )
-            self.qf2_state = self.qf2_state.replace(
-                target_params=optax.incremental_update(self.qf2_state.params, self.qf2_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(self.qf2_state.batch_stats, self.qf2_state.target_batch_stats, tau) if self.qf2_state.batch_stats is not None else self.qf2_state.target_batch_stats
-            )
-            # summarizer target uses same tau
-            self.summarizer_target_params = optax.incremental_update(self.summarizer_state.params, self.summarizer_target_params, tau)
-
-        if current_step % (self.args.algo.update_frequency * 100) == 0:
-            return {f"{k}": v for k, v in metrics.items()}
-        return None
+        return metrics
 
     def _run_evaluation(self, current_step, next_step):
         if not self.evaluator: return

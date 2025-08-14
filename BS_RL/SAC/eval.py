@@ -15,11 +15,13 @@ class Evaluator:
                  env_config: EnvConfig,
                  eval_config: EvalConfig,
                  run_name_suffix: str,
+                 seed: int,
                  logger: MetricLogger = None):
         self.agent = agent
         self.env_config = env_config
         self.eval_config = eval_config
         self.run_name_suffix = run_name_suffix
+        self.seed = seed
         self.logger = logger
         self.eval_envs = None
         trading_env_config = copy.deepcopy(self.env_config.trading_env_config)
@@ -28,6 +30,7 @@ class Evaluator:
         self.env_config.trading_env_config = trading_env_config
         if self.eval_config.cache_env:
             self.eval_envs = self._make_envs()
+        
 
     def _make_envs(self):
         print("Creating evaluation environments...")
@@ -36,7 +39,6 @@ class Evaluator:
         return eval_vec_env_cls(
             [
                 eval_env_maker(
-                    seed=self.eval_config.seed + i,
                     config=self.env_config.trading_env_config,
                     data_loader=self.data_loader,
                     capture_media=self.eval_config.capture_media,
@@ -49,7 +51,7 @@ class Evaluator:
 
     def evaluate(self, actor_state_eval, summarizer_params_eval, current_train_step: int):
         num_episodes = self.eval_config.eval_episodes
-        print(f"\nStarting evaluation for {num_episodes} episodes with seed {self.eval_config.seed} at step {current_train_step}...")
+        print(f"\nStarting evaluation for {num_episodes} episodes at step {current_train_step}...")
 
         eval_envs = self.eval_envs
         envs_were_created_here = False
@@ -58,9 +60,9 @@ class Evaluator:
             envs_were_created_here = True
         
         stats_aggregator = StatsAggregator(num_episodes) #防止默认大小64<num_episodes时下面的代码陷入死循环
-        key_eval_actions = jax.random.PRNGKey(self.eval_config.seed)
+        key_eval_actions = jax.random.PRNGKey(self.seed)
 
-        obs, _ = eval_envs.reset(seed=self.eval_config.seed + current_train_step)
+        obs, _ = eval_envs.reset(seed=self.seed + current_train_step)
         # init hidden states
         L = self.agent.network_config.lstm_num_layers
         H = self.agent.network_config.lstm_hidden_dim

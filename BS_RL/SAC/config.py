@@ -5,17 +5,16 @@ from typing import Optional, Union, Tuple, List
 from TradingEnv import TradingEnvConfig as TradingEnvConfig
 from .nn.ResMLP import ResMLPConfig, ResidualStrategy, ActivationPosition, ResMLPPresets
 from .nn.ResNet1DEncoder import ResNet1DConfig, ResidualBlock1D
+import numpy as np
 import jax
 ENABLE_PROFILE = __name__.split(".")[0] in os.getenv("PROFILE_PACKAGES", "").split(",") # 如果PROFILE_PACKAGES中包含当前包名，则进行profile
 USE_JAX_PROFILER = os.getenv("USE_JAX_PROFILER", "false").lower() == "true"
+
 @dataclass
 class EnvConfig:
     trading_env_config: TradingEnvConfig = field(default_factory=TradingEnvConfig)
     env_num: int = 1 # sac_atari.py uses 1 env
     """the number of parallel game environments"""
-    seed: int = 1
-    """seed of the experiment"""
-
 
 @dataclass
 class AlgoConfig:
@@ -75,7 +74,8 @@ class TrainConfig:
     """Base directory to save all outputs (logs, checkpoints). If None, defaults to runs/{run_name}."""
     resume: bool = False
     """Whether to resume training from the latest checkpoint in save_dir/ckpts/."""
-    
+    log_freq: int = 100
+    "Frequency to log metrics to terminal and wandb"
     ckpt_save_frequency: Union[float, int] = 0.01
     """Frequency to save a checkpoint. If > 1, it's absolute steps. If (0, 1], it's fraction of total_timesteps."""
     ckpt_save_frequency_abs_steps: Optional[int] = None # Will be populated by Args.__post_init__
@@ -84,11 +84,16 @@ class TrainConfig:
     """Whether to upload the model checkpoint to wandb."""
     async_vector_env: bool = False
     """whether to use async vector env"""
+    seed: int = 996
+    np_rng: np.random.Generator = field(init=False)
+    "无需外部传参初始化, 在post_init中用seed初始化"
     def __post_init__(self):
         if self.jax_platform_name is None:
             # 自动选择可用后端
             self.jax_platform_name = ""
         jax.config.update('jax_platforms', self.jax_platform_name)
+        # 重置PRNG状态
+        self.np_rng = np.random.default_rng(self.seed)
 @dataclass
 class EvalConfig:
     eval_frequency: Union[float, int] = 0.01
@@ -107,31 +112,6 @@ class EvalConfig:
     """the number of parallel game environments for evaluation"""
     async_vector_env: bool = False
     """whether to use async vector env for evaluation"""
-    seed: int = 996
-    """the seed for the evaluation environment"""
-
-@dataclass
-class ConvNextConfig:
-    """Configuration for a ConvNeXt encoder block."""
-    num_layers: int
-    embed_dim: int
-    ffn_dim_multiplier: int = 4
-    drop_path_rate: float = 0.1
-    depthwise_kernel_size: int = 7
-
-@dataclass
-class Cnn1DConfig:
-    """Configuration for a 1D CNN encoder."""
-    num_layers: int
-    embed_dim: int
-    kernel_size: int = 3
-    dropout_rate: float = 0.1
-
-@dataclass
-class KLineEncoderConfig:
-    """Configuration for a KLine encoder."""
-    block_features: List[int]
-    kernel_sizes: List[int]
 
 
 @dataclass
@@ -141,48 +121,8 @@ class NetworkConfig:
     critic_net_arch: List[int] = field(default_factory=lambda: [512, 512, 512])
     actor_dropout_rate: float = 0
     critic_dropout_rate: float = 0
-    encoder_type: str = "resnet1d"  # "convnext", "cnn1d", "resnet1d", "kline"
-    
-    # Encoder configs
-    convnext_layers_5m: ConvNextConfig = field(default_factory=lambda: ConvNextConfig(num_layers=8, embed_dim=16)) # 48=128*0.375
-    cnn1d_layers_5m: Cnn1DConfig = field(default_factory=lambda: Cnn1DConfig(num_layers=8, embed_dim=16))
-    # ResNet1D-34 的配置
-    resnet1d_layers_5m: ResNet1DConfig = field(default_factory=lambda: ResNet1DConfig(
-        stage_sizes=[2, 2, 2, 2],
-        block_cls=ResidualBlock1D,
-        ))
-
-    # 针对5m数据, shape为(48, 18)（序列长，趋势更明显）的配置
-    kline_encoder_5m: KLineEncoderConfig = field(default_factory=lambda: KLineEncoderConfig(
-        block_features=[64, 128, 256, 256, 512, 512, 512, 512],
-        kernel_sizes=[9, 7, 5, 5, 3, 3, 3, 3],
-    ))
-
-    # # MLP configs
-    # MLP_layers_rest: List[int] = field(default_factory=lambda: [32, 32]) # restet有40维
-    # MLP_layers_final: List[int] = field(default_factory=lambda: [128, 128, 128])
-    MLP_type: str = "ResMLP" # "MLP" or "ResMLP"
+    encoder_type: str = "none"  # "none"
     activation:str = "gelu"
-    # CartPole的观察是4维向量，网络用的(64,64)，那么通道的扩展倍数是64/4=16。若要借鉴的话：40*16=640
-    # 但是data_reset主要是回合+账户仓位+时间特征信息，并不能对盈利起决定性作用故不应用太多维度和层数都不应过大？
-    # 卷积投影适合有空间结构的数据(相邻特征有时/空关系)，在这里用不合适
-    ResMLP_rest: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
-            hidden_dims=[32, 32],
-            add_initial_embedding_layer=True,
-            residual_strategy=ResidualStrategy.PROJECTION,
-            dropout_rate=0.1,
-            name="account_state",
-            description="账户状态数据处理配置"
-        ))
-    ResMLP_final: ResMLPConfig = field(default_factory=lambda: ResMLPConfig(
-            hidden_dims=[384, 384, 384, 384, 384],
-            add_initial_embedding_layer=True,
-            residual_strategy=ResidualStrategy.PROJECTION,  # 线性投影，适合特征融合
-            use_highway=True,                               # 门控机制，动态选择特征
-            dropout_rate=0.1,
-            name="time_series+account_state_fusion",
-            description="时间序列+账户状态特征融合配置"
-    ))
 
     # RSAC-share specific
     market_feature_dim: int = 0

@@ -26,7 +26,7 @@ class GymTrainer(Trainer):
         self.envs = vec_env_cls([
             gym_train_env_maker(
                 env_id=self.env_id,
-                seed=self.args.env.seed + i
+                seed=self.args.train.seed + i
             ) for i in range(self.args.env.env_num)
         ])
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
@@ -41,13 +41,14 @@ class GymTrainer(Trainer):
         from BS_RL.SAC.eval import Evaluator
         
         class GymEvaluator(Evaluator):
-            def __init__(self, agent, env_config, eval_config, run_name_suffix, logger, env_id):
+            def __init__(self, agent, env_config, eval_config, run_name_suffix, logger, env_id, seed):
                 self.agent = agent
                 self.env_config = env_config
                 self.eval_config = eval_config
                 self.run_name_suffix = run_name_suffix
                 self.logger = logger
                 self.env_id = env_id
+                self.seed = seed
                 self.eval_envs = None
                 self.data_loader = None  # gym环境不需要DataLoader
                 
@@ -61,7 +62,7 @@ class GymTrainer(Trainer):
                 return eval_vec_env_cls([
                     gym_eval_env_maker(
                         env_id=self.env_id,
-                        seed=self.eval_config.seed + i,
+                        seed=self.seed + i,
                         capture_video=self.eval_config.capture_media and i == 0,
                         run_name=f"{self.run_name_suffix}_eval"
                     ) for i in range(self.eval_config.env_num)
@@ -73,12 +74,13 @@ class GymTrainer(Trainer):
             eval_config=self.args.eval,
             run_name_suffix=self.run_name_suffix,
             logger=self.logger,
-            env_id=self.env_id
+            env_id=self.env_id,
+            seed=self.args.train.seed + 1
         )
 
 if __name__ == "__main__":
     # LunarLanderContinuous参数配置
-    total_timesteps = int(5e4)  # 100万步，足够测试收敛性
+    total_timesteps = int(1e6)  # 100万步，足够测试收敛性
     batch_size = 256
     env_num = 1  # SAC通常使用单环境
     eval_env_num = 10
@@ -112,7 +114,6 @@ if __name__ == "__main__":
         ),
         env=EnvConfig(
             trading_env_config=TradingEnvConfig(),  # 提供默认配置，但不会使用
-            seed=42,
             env_num=env_num,
         ),
         network=NetworkConfig(
