@@ -12,6 +12,7 @@ import tensorflow_probability.substrates.jax.distributions as tfd
 from .common import profile
 from .config import AlgoConfig, NetworkConfig
 from .networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
+MAX_NORM = 0.4
 class TrainStateWithBatchStats(TrainState):
     batch_stats: Optional[flax.core.FrozenDict] = None
 
@@ -34,9 +35,9 @@ class _LSTMStackStep(nn.Module):
         cur = x_t  # [B,H]
         new_h_layers = []
         new_c_layers = []
-        for li in range(self.num_layers):
-            cell = nn.OptimizedLSTMCell(features=self.hidden_dim, name=f"lstm_{li}")
-            (h_new, c_new), cur = cell((h_layers[li], c_layers[li]), cur)
+        for i in range(self.num_layers):
+            cell = nn.OptimizedLSTMCell(features=self.hidden_dim, name=f"lstm_{i}")
+            (h_new, c_new), cur = cell((h_layers[i], c_layers[i]), cur)
             new_h_layers.append(h_new)
             new_c_layers.append(c_new)
         new_h = jnp.stack(new_h_layers, axis=0)
@@ -83,6 +84,136 @@ class LSTMSummarizer(nn.Module):
         (final_h, final_c), ys = time_scan((h, c), x_proj)  # ys: [B,T,H]
         outputs = jnp.concatenate([h[-1][:, None, :], ys], axis=1)  # [B,T+1,H]
         return outputs, (final_h, final_c)
+
+class S5Layer(nn.Module):
+    hidden_dim: int
+    delta_min: float = 0.001
+    delta_max: float = 0.1
+
+    def setup(self):
+        """
+        Initializes the structured state space model parameters.
+        A is diagonal, B, C, D are dense projections.
+        """
+        # A_log_diag represents the log of the diagonal of the continuous-time A matrix.
+        # Initializing it to be negative is crucial for stability.
+        # We parameterize the log for unconstrained optimization.
+        self.A_log_diag = self.param("A_log_diag", nn.initializers.zeros, (self.hidden_dim,))
+
+        # B, C, and D are standard projection matrices.
+        self.B_proj = nn.Dense(self.hidden_dim, kernel_init=nn.initializers.lecun_normal(), name="B_proj")
+        self.C_proj = nn.Dense(self.hidden_dim, kernel_init=nn.initializers.lecun_normal(), name="C_proj")
+        self.D_proj = nn.Dense(self.hidden_dim, name="D_proj") # Skip connection
+
+        # log_delta is the learnable discretization step size Δ.
+        self.log_delta = self.param("log_delta", nn.initializers.zeros, ())
+
+    def __call__(self, x_t: jnp.ndarray, h_prev: jnp.ndarray):
+        """
+        Performs one recurrent step of the S5 model.
+        
+        Args:
+            x_t: Input at the current timestep, shape [B, H_in]. (H_in is proj_dim)
+            h_prev: Previous hidden state, shape [B, H].
+
+        Returns:
+            h_t: New hidden state, shape [B, H].
+            y_t: Output at the current timestep, shape [B, H].
+        """
+        # 1. Get continuous-time parameters (A, B, C, D) and step size (Δ)
+        # Ensure A has negative real parts for stability
+        A_diag = -jnp.exp(self.A_log_diag) 
+        
+        # Project input x_t to the hidden dimension to get u_t
+        u_t = self.B_proj(x_t)
+
+        # Calculate learnable step size Δ, constrained to a range
+        delta = jax.nn.sigmoid(self.log_delta) * (self.delta_max - self.delta_min) + self.delta_min
+
+        # 2. Discretize continuous-time parameters to get A_bar, B_bar (ZOH method)
+        # For a diagonal A, the formulas are simpler and can be applied element-wise.
+        delta_A = delta * A_diag
+        A_bar_diag = jnp.exp(delta_A)
+        
+        # B_bar = (A_bar - I) * A^-1 * B -> (exp(ΔA) - 1)/A * u_t
+        # Use jnp.expm1 for better numerical stability when delta_A is close to zero
+        B_bar_u = jnp.expm1(delta_A) / A_diag * u_t
+
+        # 3. Apply the recurrent update for the hidden state
+        # x_t = A_bar * x_{t-1} + B_bar * u_t
+        h_t = A_bar_diag * h_prev + B_bar_u
+
+        # 4. Compute the output y_t
+        # y_t = C * x_t + D * u_t
+        # Here, D*u_t is a skip connection from the input projection.
+        y_t = self.C_proj(h_t) + self.D_proj(x_t)
+
+        return h_t, y_t
+
+class _S5StackStep(nn.Module):
+    hidden_dim: int
+    num_layers: int
+    delta_min: float
+    delta_max: float
+
+    @nn.compact
+    def __call__(self, carry: jnp.ndarray, x_t: jnp.ndarray):
+        # carry: h layers [L,B,H]
+        h_layers = carry
+        cur = x_t
+        new_h_layers = []
+        for i in range(self.num_layers):
+            # *** KEY CHANGE IS HERE ***
+            # Replace the old S5Layer with the new, paper-aligned version.
+            layer = S5Layer(
+                hidden_dim=self.hidden_dim, 
+                delta_min=self.delta_min, 
+                delta_max=self.delta_max, 
+                name=f"s5_layer_aligned_{i}"
+            )
+            h_new, cur = layer(cur, h_layers[i]) # The new layer outputs (h_new, y_t), use y_t as input for next layer
+            new_h_layers.append(h_new)
+            
+        new_h = jnp.stack(new_h_layers, axis=0)
+        summary_t = cur # The final output 'y' from the last layer is the summary
+        return new_h, summary_t
+    
+class S5Summarizer(nn.Module):
+    hidden_dim: int
+    num_layers: int = 1
+    delta_min: float = 0.001
+    delta_max: float = 0.1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, initial_state: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None):
+        """
+        x: [B, T, D]
+        Returns:
+          outputs: [B, T+1, H] (includes initial top-layer hidden as t=0)
+          final_state: (h, c_dummy) with shapes [L,B,H]
+        """
+        B, T, _ = x.shape
+        H = self.hidden_dim
+        L = self.num_layers
+        x_proj = nn.Dense(H, name="in_proj")(x)
+
+        if initial_state is None:
+            h0 = jnp.zeros((L, B, H))
+        else:
+            h0, _ = initial_state
+            h0 = h0.astype(jnp.float32)
+
+        Scanned = nn.scan(
+            _S5StackStep,
+            variable_broadcast="params",
+            split_rngs={"params": False},
+            in_axes=1,
+            out_axes=1,
+        )
+        time_scan = Scanned(hidden_dim=H, num_layers=L, delta_min=self.delta_min, delta_max=self.delta_max, name="time_scan")
+        final_h, ys = time_scan(h0, x_proj)
+        outputs = jnp.concatenate([h0[-1][:, None, :], ys], axis=1)
+        return outputs, (final_h, jnp.zeros_like(final_h))
 
 class RSACAgentBase:
     def __init__(self,
@@ -170,11 +301,23 @@ class RSACAgentDiscrete(RSACAgentBase):
                  algo_config: AlgoConfig,
                  actor_model_cls=TradingActorDiscrete,
                  critic_model_cls=TradingCriticDiscrete):
-        super().__init__(action_dim, observation_space_shape, key, network_config, algo_config, actor_model_cls, critic_model_cls, True, norm_limit=0.6)
+        super().__init__(action_dim, observation_space_shape, key, network_config, algo_config, actor_model_cls, critic_model_cls, True, norm_limit=MAX_NORM)
 
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls):
         # Shared summarizer and target summarizer
-        self.summarizer = LSTMSummarizer(hidden_dim=self.network_config.lstm_hidden_dim, num_layers=self.network_config.lstm_num_layers)
+        if self.network_config.use_s5_summarizer:
+            print("Using S5 Summarizer.")
+            self.summarizer = S5Summarizer(
+                hidden_dim=self.network_config.s5_hidden_dim,
+                num_layers=self.network_config.s5_num_layers,
+                delta_min=self.network_config.s5_delta_min,
+                delta_max=self.network_config.s5_delta_max,
+            )
+            summarizer_hidden_dim = self.network_config.s5_hidden_dim
+        else:
+            print("Using LSTM Summarizer.")
+            self.summarizer = LSTMSummarizer(hidden_dim=self.network_config.lstm_hidden_dim, num_layers=self.network_config.lstm_num_layers)
+            summarizer_hidden_dim = self.network_config.lstm_hidden_dim
         dummy_seq = jnp.zeros((1, 1, self.market_feature_dim))
         summarizer_params, _ = self._init_model_with_batch_stats(self.summarizer, key_summarizer, dummy_seq)
         # Load pretrained summarizer if configured
@@ -189,14 +332,14 @@ class RSACAgentDiscrete(RSACAgentBase):
 
         # Actor head
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), deterministic=True)
+        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, summarizer_hidden_dim + self.agent_feature_dim)), deterministic=True)
         self.actor_state = TrainStateWithBatchStats.create(apply_fn=self.actor_model.apply, params=actor_params, batch_stats=actor_batch_stats, tx=self.actor_optimizer)
 
         # Critic heads (two critics)
         self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), deterministic=True)
+        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, jnp.zeros((1, summarizer_hidden_dim + self.agent_feature_dim)), deterministic=True)
         self.qf1_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf1_params, batch_stats=qf1_batch_stats, target_params=qf1_params, target_batch_stats=qf1_batch_stats, tx=self.critic_optimizer)
-        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), deterministic=True)
+        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, jnp.zeros((1, summarizer_hidden_dim + self.agent_feature_dim)), deterministic=True)
         self.qf2_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf2_params, batch_stats=qf2_batch_stats, target_params=qf2_params, target_batch_stats=qf2_batch_stats, tx=self.critic_optimizer)
 
         # Freeze summarizer if not training
@@ -404,10 +547,22 @@ class RSACAgentContinuous(RSACAgentBase):
                  algo_config: AlgoConfig,
                  actor_model_cls=TradingActorContinuous,
                  critic_model_cls=TradingCriticContinuous):
-        super().__init__(action_dim, observation_space_shape, key, network_config, algo_config, actor_model_cls, critic_model_cls, False, norm_limit=1.0)
+        super().__init__(action_dim, observation_space_shape, key, network_config, algo_config, actor_model_cls, critic_model_cls, False, norm_limit=MAX_NORM)
 
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls):
-        self.summarizer = LSTMSummarizer(hidden_dim=self.network_config.lstm_hidden_dim, num_layers=self.network_config.lstm_num_layers)
+        if self.network_config.use_s5_summarizer:
+            print("Using S5 Summarizer.")
+            self.summarizer = S5Summarizer(
+                hidden_dim=self.network_config.s5_hidden_dim,
+                num_layers=self.network_config.s5_num_layers,
+                delta_min=self.network_config.s5_delta_min,
+                delta_max=self.network_config.s5_delta_max,
+            )
+            summarizer_hidden_dim = self.network_config.s5_hidden_dim
+        else:
+            print("Using LSTM Summarizer.")
+            self.summarizer = LSTMSummarizer(hidden_dim=self.network_config.lstm_hidden_dim, num_layers=self.network_config.lstm_num_layers)
+            summarizer_hidden_dim = self.network_config.lstm_hidden_dim
         dummy_seq = jnp.zeros((1, 1, self.market_feature_dim))
         summarizer_params, _ = self._init_model_with_batch_stats(self.summarizer, key_summarizer, dummy_seq)
         if self.network_config.use_pretrained_summarizer_path:
@@ -421,15 +576,15 @@ class RSACAgentContinuous(RSACAgentBase):
 
         # Actor head
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), deterministic=True)
+        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, summarizer_hidden_dim + self.agent_feature_dim)), deterministic=True)
         self.actor_state = TrainStateWithBatchStats.create(apply_fn=self.actor_model.apply, params=actor_params, batch_stats=actor_batch_stats, tx=self.actor_optimizer)
 
         # Critic heads (two critics)
         self.critic_model = critic_model_cls(network_config=self.network_config)
         dummy_action = jnp.zeros((1, self.action_dim))
-        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), dummy_action, deterministic=True)
+        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, jnp.zeros((1, summarizer_hidden_dim + self.agent_feature_dim)), dummy_action, deterministic=True)
         self.qf1_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf1_params, batch_stats=qf1_batch_stats, target_params=qf1_params, target_batch_stats=qf1_batch_stats, tx=self.critic_optimizer)
-        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), dummy_action, deterministic=True)
+        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, jnp.zeros((1, summarizer_hidden_dim + self.agent_feature_dim)), dummy_action, deterministic=True)
         self.qf2_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf2_params, batch_stats=qf2_batch_stats, target_params=qf2_params, target_batch_stats=qf2_batch_stats, tx=self.critic_optimizer)
 
         if self.network_config.use_pretrained_summarizer_path:

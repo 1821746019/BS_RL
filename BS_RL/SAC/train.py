@@ -216,8 +216,12 @@ class Trainer:
         self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha']) if self.args.algo.autotune and self.log_alpha_state else jnp.array(self.args.algo.alpha)
 
         # initialize per-env hidden states
-        L = self.args.network.lstm_num_layers
-        H = self.args.network.lstm_hidden_dim
+        if self.args.network.use_s5_summarizer:
+            L = self.args.network.s5_num_layers
+            H = self.args.network.s5_hidden_dim
+        else:
+            L = self.args.network.lstm_num_layers
+            H = self.args.network.lstm_hidden_dim
         N = self.envs.num_envs
         self.hidden_h = jnp.zeros((L, N, H))
         self.hidden_c = jnp.zeros((L, N, H))
@@ -411,11 +415,12 @@ class Trainer:
                 if done_mask.any():
                     L, N, H = self.hidden_h.shape
                     hh = np.array(self.hidden_h)
-                    hc = np.array(self.hidden_c)
                     hh[:, done_mask, :] = 0.0
-                    hc[:, done_mask, :] = 0.0
                     self.hidden_h = jnp.asarray(hh)
-                    self.hidden_c = jnp.asarray(hc)
+                    if self.hidden_c is not None:
+                        hc = np.array(self.hidden_c)
+                        hc[:, done_mask, :] = 0.0
+                        self.hidden_c = jnp.asarray(hc)
                 
                 obs = next_obs
                 

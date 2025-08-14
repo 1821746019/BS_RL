@@ -131,14 +131,23 @@ class NetworkConfig:
     """Dimension of market features fed into the LSTM summarizer (set 0 to use all)."""
     agent_feature_dim: int = 0
     """Dimension of agent-specific features concatenated after summarizer (remaining dims if market_feature_dim>0)."""
-    lstm_hidden_dim: int = 256
-    """Hidden size of LSTM summarizer."""
-    lstm_num_layers: int = 1
-    """Number of stacked LSTM layers."""
     use_pretrained_summarizer_path: Optional[str] = None
     """Path to a pretrained summarizer params (Flax serialization). If None, train from scratch."""
     train_summarizer: bool = False
     """Whether to update summarizer during training. If False and pretrained path is provided, summarizer is frozen."""
+    lstm_hidden_dim: int = 256
+    """Hidden size of LSTM summarizer."""
+    lstm_num_layers: int = 1
+    """Number of stacked LSTM layers."""
+    # S5 options
+    use_s5_summarizer: bool = True
+    """Whether to use S5 summarizer instead of LSTM (default True)."""
+    s5_hidden_dim: int = 256
+    """Hidden size of S5 summarizer (defaults to LSTM hidden size for compatibility)."""
+    s5_num_layers: int = 1
+    """Number of stacked S5 layers."""
+    s5_delta_min: float = 0.001
+    s5_delta_max: float = 0.1
 @dataclass
 class Args:
     train: TrainConfig = field(default_factory=TrainConfig)

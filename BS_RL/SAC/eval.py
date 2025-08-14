@@ -64,8 +64,12 @@ class Evaluator:
 
         obs, _ = eval_envs.reset(seed=self.seed + current_train_step)
         # init hidden states
-        L = self.agent.network_config.lstm_num_layers
-        H = self.agent.network_config.lstm_hidden_dim
+        if self.agent.network_config.use_s5_summarizer:
+            L = self.agent.network_config.s5_num_layers
+            H = self.agent.network_config.s5_hidden_dim
+        else:
+            L = self.agent.network_config.lstm_num_layers
+            H = self.agent.network_config.lstm_hidden_dim
         N = eval_envs.num_envs
         hidden_h = jnp.zeros((L, N, H), dtype=jnp.float32)
         hidden_c = jnp.zeros((L, N, H), dtype=jnp.float32)
