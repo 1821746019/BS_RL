@@ -27,7 +27,7 @@ import joblib
 from BS_RL.SAC.config import Args
 from BS_RL.SAC.common import profile, train_env_maker, MetricLogger, StatsAggregator, jax_profiler
 from BS_RL.SAC.networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
-from BS_RL.SAC.agent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SimpleTrainState
+from BS_RL.SAC.agent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState
 from BS_RL.SAC.eval import Evaluator
 from TradingEnv import DataLoader
 from BS_RL.SAC.replay_buffer import RecurrentReplayBuffer
@@ -53,8 +53,7 @@ class Trainer:
         self.actor_state: TrainStateWithBatchStats = None
         self.qf1_state: CriticTrainState = None
         self.qf2_state: CriticTrainState = None
-        self.summarizer_state: SimpleTrainState = None
-        self.summarizer_target_params = None
+        self.summarizer_state: SummarizerTrainState = None
         self.log_alpha_state = None
         self.current_alpha = None
         self.data_loader = None
@@ -216,7 +215,6 @@ class Trainer:
         self.qf1_state = self.agent.qf1_state
         self.qf2_state = self.agent.qf2_state
         self.summarizer_state = self.agent.summarizer_state
-        self.summarizer_target_params = self.agent.summarizer_target_params
         self.log_alpha_state = self.agent.log_alpha_state if self.args.algo.autotune else None
         self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha']) if self.args.algo.autotune and self.log_alpha_state else jnp.array(self.args.algo.alpha)
 
@@ -260,7 +258,7 @@ class Trainer:
                     'qf2_target_batch_stats': self.qf2_state.target_batch_stats,
                     'summarizer_params': self.summarizer_state.params,
                     'summarizer_opt_state': self.summarizer_state.opt_state,
-                    'summarizer_target_params': self.summarizer_target_params,
+                    'summarizer_target_params': self.summarizer_state.target_params,
                 }
                 if self.args.algo.autotune:
                     restore_target['log_alpha_params'] = self.log_alpha_state.params
@@ -292,9 +290,9 @@ class Trainer:
                 )
                 self.summarizer_state = self.summarizer_state.replace(
                     params=loaded_contents['summarizer_params'],
-                    opt_state=loaded_contents['summarizer_opt_state']
+                    opt_state=loaded_contents['summarizer_opt_state'],
+                    target_params=loaded_contents['summarizer_target_params']
                 )
-                self.summarizer_target_params = loaded_contents['summarizer_target_params']
                 if self.args.algo.autotune and 'log_alpha_params' in loaded_contents:
                     self.log_alpha_state = self.log_alpha_state.replace(
                         params=loaded_contents['log_alpha_params'],
@@ -373,10 +371,10 @@ class Trainer:
                 
                 # Combined action selection and agent update in single JIT call
                 if use_actor:
-                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_summarizer_target_params, new_log_alpha_state, metrics, self.jax_key = self.agent.get_action_and_update_agent(
+                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_log_alpha_state, metrics, self.jax_key = self.agent.get_action_and_update_agent(
                         obs, self.hidden_h, self.hidden_c, batch_data, do_update, do_target_update,
                         self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state,
-                        self.summarizer_target_params, self.log_alpha_state, self.jax_key,
+                        self.log_alpha_state, self.jax_key,
                         deterministic=False
                     )
                     # Update states
@@ -384,7 +382,6 @@ class Trainer:
                     self.qf1_state = new_qf1_state
                     self.qf2_state = new_qf2_state
                     self.summarizer_state = new_summarizer_state
-                    self.summarizer_target_params = new_summarizer_target_params
                     if self.args.algo.autotune:
                         self.log_alpha_state = new_log_alpha_state
                     self.hidden_h = new_h
@@ -503,7 +500,7 @@ class Trainer:
                 'qf2_target_batch_stats': self.qf2_state.target_batch_stats,
                 'summarizer_params': self.summarizer_state.params,
                 'summarizer_opt_state': self.summarizer_state.opt_state,
-                'summarizer_target_params': self.summarizer_target_params,
+                'summarizer_target_params': self.summarizer_state.target_params,
             }
             if self.args.algo.autotune and self.log_alpha_state:
                 save_target['log_alpha_params'] = self.log_alpha_state.params

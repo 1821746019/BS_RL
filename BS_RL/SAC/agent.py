@@ -20,8 +20,8 @@ class CriticTrainState(TrainState):
     batch_stats: Optional[flax.core.FrozenDict] = None
     target_batch_stats: Optional[flax.core.FrozenDict] = None
 
-class SimpleTrainState(TrainState):
-    pass
+class SummarizerTrainState(TrainState):
+    target_params: flax.core.FrozenDict
 
 class _LSTMStackStep(nn.Module):
     hidden_dim: int
@@ -157,7 +157,7 @@ class RSACAgentBase:
     def _update(self, states, batch, key):
         raise NotImplementedError
     
-    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update,  actor_state, qf1_state, qf2_state, summarizer_state,  summarizer_target_params, log_alpha_state, key, deterministic: bool = False):
+    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update,  actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, key, deterministic: bool = False):
         """Combined function to reduce CPU-TPU communication overhead"""
         raise NotImplementedError
 
@@ -185,8 +185,7 @@ class RSACAgentDiscrete(RSACAgentBase):
                 print(f"Loaded pretrained summarizer from {self.network_config.use_pretrained_summarizer_path}")
             except Exception as e:
                 print(f"Warning: failed to load pretrained summarizer: {e}")
-        self.summarizer_state = SimpleTrainState.create(apply_fn=self.summarizer.apply, params=summarizer_params, tx=self.summarizer_optimizer)
-        self.summarizer_target_params = summarizer_params
+        self.summarizer_state = SummarizerTrainState.create(apply_fn=self.summarizer.apply, params=summarizer_params, target_params=summarizer_params, tx=self.summarizer_optimizer)
 
         # Actor head
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
@@ -233,8 +232,7 @@ class RSACAgentDiscrete(RSACAgentBase):
                 actor_state: TrainStateWithBatchStats,
                 qf1_state: CriticTrainState,
                 qf2_state: CriticTrainState,
-                summarizer_state: SimpleTrainState,
-                summarizer_target_params: flax.core.FrozenDict,
+                summarizer_state: SummarizerTrainState,
                 log_alpha_state: Optional[TrainState],
                 batch: dict,
                 key: jax.random.PRNGKey):
@@ -249,7 +247,7 @@ class RSACAgentDiscrete(RSACAgentBase):
 
         summaries, _ = self.summarizer.apply({'params': summarizer_state.params}, market_o)
         summaries_t = summaries[:, 1:-1, :]
-        summaries_tp1_targ, _ = self.summarizer.apply({'params': summarizer_target_params}, market_o)
+        summaries_tp1_targ, _ = self.summarizer.apply({'params': summarizer_state.target_params}, market_o)
         summaries_tp1 = summaries_tp1_targ[:, 2:, :]
 
         actor_input_t = jnp.concatenate([summaries_t, agent_o[:, :-1, :]], axis=-1)
@@ -347,8 +345,8 @@ class RSACAgentDiscrete(RSACAgentBase):
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax.jit, static_argnums=(0, 5, 6, 14))
-    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state, qf1_state, qf2_state, summarizer_state, summarizer_target_params, log_alpha_state, key, deterministic: bool = False):
+    @partial(jax.jit, static_argnums=(0, 5, 6, 13))
+    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, key, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication"""
         # Split rng on device to avoid host-device traffic
         key_action, key_update, new_key = jax.random.split(key, 3)
@@ -356,7 +354,7 @@ class RSACAgentDiscrete(RSACAgentBase):
         # 1. First perform agent update if requested
         def do_agent_update():
             return self._update(actor_state, qf1_state, qf2_state, summarizer_state, 
-                              summarizer_target_params, log_alpha_state, batch, key_update)
+                              log_alpha_state, batch, key_update)
         
         def no_agent_update():
             empty_metrics = {
@@ -376,8 +374,8 @@ class RSACAgentDiscrete(RSACAgentBase):
         )
         
         # Apply target network updates if requested
-        def apply_target_updates(states):
-            qf1_state, qf2_state, summarizer_target_params = states
+        def apply_target_updates(states: tuple[CriticTrainState, CriticTrainState, SummarizerTrainState]):
+            qf1_state, qf2_state, summarizer_state_local = states
             tau = self.algo_config.tau
             updated_qf1_state = qf1_state.replace(
                 target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, tau),
@@ -387,24 +385,25 @@ class RSACAgentDiscrete(RSACAgentBase):
                 target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, tau),
                 target_batch_stats=optax.incremental_update(qf2_state.batch_stats, qf2_state.target_batch_stats, tau) if qf2_state.batch_stats is not None else qf2_state.target_batch_stats
             )
-            updated_summarizer_target_params = optax.incremental_update(updated_summarizer_state.params, summarizer_target_params, tau)
-            return updated_qf1_state, updated_qf2_state, updated_summarizer_target_params
+            new_target = optax.incremental_update(updated_summarizer_state.params, summarizer_state_local.target_params, tau)
+            updated_summarizer_state_local = summarizer_state_local.replace(target_params=new_target)
+            return updated_qf1_state, updated_qf2_state, updated_summarizer_state_local
         
         def no_target_updates(states):
             return states
         
-        final_qf1_state, final_qf2_state, final_summarizer_target_params = jax.lax.cond(
+        final_qf1_state, final_qf2_state, final_summarizer_state = jax.lax.cond(
             do_update & do_target_update,  # Only apply target updates if we're doing regular updates too
             apply_target_updates,
             no_target_updates,
-            (updated_qf1_state, updated_qf2_state, summarizer_target_params)
+            (updated_qf1_state, updated_qf2_state, updated_summarizer_state)
         )
         
         # 2. Then perform action selection using potentially updated states
         market = obs[..., :self.market_feature_dim]
         agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0), dtype=obs.dtype)
         seq = market[:, None, :]
-        outputs, (new_h, new_c) = self.summarizer.apply({'params': updated_summarizer_state.params}, seq, (hidden_h, hidden_c))
+        outputs, (new_h, new_c) = self.summarizer.apply({'params': final_summarizer_state.params}, seq, (hidden_h, hidden_c))
         summary_t = outputs[:, -1, :]
         x = jnp.concatenate([summary_t, agent_feat], axis=-1)
         logits = self.actor_model.apply({'params': updated_actor_state.params, 'batch_stats': updated_actor_state.batch_stats}, x, deterministic=True)
@@ -413,7 +412,7 @@ class RSACAgentDiscrete(RSACAgentBase):
         else:
             actions = jax.random.categorical(key_action, logits, axis=-1)
         
-        return actions, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, updated_summarizer_state, final_summarizer_target_params, updated_log_alpha_state, metrics, new_key
+        return actions, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, final_summarizer_state, updated_log_alpha_state, metrics, new_key
 
 class RSACAgentContinuous(RSACAgentBase):
     def __init__(self,
@@ -437,8 +436,7 @@ class RSACAgentContinuous(RSACAgentBase):
                 print(f"Loaded pretrained summarizer from {self.network_config.use_pretrained_summarizer_path}")
             except Exception as e:
                 print(f"Warning: failed to load pretrained summarizer: {e}")
-        self.summarizer_state = SimpleTrainState.create(apply_fn=self.summarizer.apply, params=summarizer_params, tx=self.summarizer_optimizer)
-        self.summarizer_target_params = summarizer_params
+        self.summarizer_state = SummarizerTrainState.create(apply_fn=self.summarizer.apply, params=summarizer_params, target_params=summarizer_params, tx=self.summarizer_optimizer)
 
         # Actor head
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
@@ -487,8 +485,7 @@ class RSACAgentContinuous(RSACAgentBase):
                 actor_state: TrainStateWithBatchStats,
                 qf1_state: CriticTrainState,
                 qf2_state: CriticTrainState,
-                summarizer_state: SimpleTrainState,
-                summarizer_target_params: flax.core.FrozenDict,
+                summarizer_state: SummarizerTrainState,
                 log_alpha_state: Optional[TrainState],
                 batch: dict,
                 key: jax.random.PRNGKey):
@@ -503,7 +500,7 @@ class RSACAgentContinuous(RSACAgentBase):
 
         summaries, _ = self.summarizer.apply({'params': summarizer_state.params}, market_o)
         s_t = summaries[:, 1:-1, :]
-        s_tp1_targ, _ = self.summarizer.apply({'params': summarizer_target_params}, market_o)
+        s_tp1_targ, _ = self.summarizer.apply({'params': summarizer_state.target_params}, market_o)
         s_tp1 = s_tp1_targ[:, 2:, :]
 
         x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
@@ -605,8 +602,8 @@ class RSACAgentContinuous(RSACAgentBase):
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax.jit, static_argnums=(0, 5, 6, 14))
-    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state, qf1_state, qf2_state, summarizer_state, summarizer_target_params, log_alpha_state, key, deterministic: bool = False):
+    @partial(jax.jit, static_argnums=(0, 5, 6, 13))
+    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, key, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication"""
         # Split rng on device to avoid host-device traffic
         key_action, key_update, new_key = jax.random.split(key, 3)
@@ -614,7 +611,7 @@ class RSACAgentContinuous(RSACAgentBase):
         # 1. First perform agent update if requested
         def do_agent_update():
             return self._update(actor_state, qf1_state, qf2_state, summarizer_state, 
-                              summarizer_target_params, log_alpha_state, batch, key_update)
+                              log_alpha_state, batch, key_update)
         
         def no_agent_update():
             empty_metrics = {
@@ -634,8 +631,8 @@ class RSACAgentContinuous(RSACAgentBase):
         )
         
         # Apply target network updates if requested
-        def apply_target_updates(states):
-            qf1_state, qf2_state, summarizer_target_params = states
+        def apply_target_updates(states: tuple[CriticTrainState, CriticTrainState, SummarizerTrainState]):
+            qf1_state, qf2_state, summarizer_state_local = states
             tau = self.algo_config.tau
             updated_qf1_state = qf1_state.replace(
                 target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, tau),
@@ -645,24 +642,25 @@ class RSACAgentContinuous(RSACAgentBase):
                 target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, tau),
                 target_batch_stats=optax.incremental_update(qf2_state.batch_stats, qf2_state.target_batch_stats, tau) if qf2_state.batch_stats is not None else qf2_state.target_batch_stats
             )
-            updated_summarizer_target_params = optax.incremental_update(updated_summarizer_state.params, summarizer_target_params, tau)
-            return updated_qf1_state, updated_qf2_state, updated_summarizer_target_params
+            new_target = optax.incremental_update(updated_summarizer_state.params, summarizer_state_local.target_params, tau)
+            updated_summarizer_state_local = summarizer_state_local.replace(target_params=new_target)
+            return updated_qf1_state, updated_qf2_state, updated_summarizer_state_local
         
         def no_target_updates(states):
             return states
         
-        final_qf1_state, final_qf2_state, final_summarizer_target_params = jax.lax.cond(
+        final_qf1_state, final_qf2_state, final_summarizer_state = jax.lax.cond(
             do_update & do_target_update,  # Only apply target updates if we're doing regular updates too
             apply_target_updates,
             no_target_updates,
-            (updated_qf1_state, updated_qf2_state, summarizer_target_params)
+            (updated_qf1_state, updated_qf2_state, updated_summarizer_state)
         )
         
         # 2. Then perform action selection using potentially updated states
         market = obs[..., :self.market_feature_dim]
         agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0), dtype=obs.dtype)
         seq = market[:, None, :]
-        outputs, (new_h, new_c) = self.summarizer.apply({'params': updated_summarizer_state.params}, seq, (hidden_h, hidden_c))
+        outputs, (new_h, new_c) = self.summarizer.apply({'params': final_summarizer_state.params}, seq, (hidden_h, hidden_c))
         summary_t = outputs[:, -1, :]
         x = jnp.concatenate([summary_t, agent_feat], axis=-1)
         mean, log_std = self.actor_model.apply({'params': updated_actor_state.params, 'batch_stats': updated_actor_state.batch_stats}, x, deterministic=True)
@@ -673,6 +671,6 @@ class RSACAgentContinuous(RSACAgentBase):
             action = dist.sample(seed=key_action)
         squashed = jnp.tanh(action)
         
-        return squashed, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, updated_summarizer_state, final_summarizer_target_params, updated_log_alpha_state, metrics, new_key
+        return squashed, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, final_summarizer_state, updated_log_alpha_state, metrics, new_key
 
 RSACAgent = Union[RSACAgentDiscrete, RSACAgentContinuous]
