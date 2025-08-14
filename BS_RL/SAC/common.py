@@ -8,6 +8,8 @@ import numpy as np
 import wandb
 import gymnasium
 from BS_RL.SAC.config import ENABLE_PROFILE, USE_JAX_PROFILER
+jax_jit: Any = jax.jit # 为了让调用jitWrapped函数时IDE能提供正常的IntelliSense
+
 try:
     import line_profiler
     profile: Callable = line_profiler.profile

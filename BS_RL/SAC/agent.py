@@ -6,12 +6,12 @@ from flax.training.train_state import TrainState
 from flax.training import checkpoints
 import optax
 from functools import partial
+from .common import jax_jit
 from typing import Union, Optional, Tuple
 import tensorflow_probability.substrates.jax.distributions as tfd
 from .common import profile
 from .config import AlgoConfig, NetworkConfig
 from .networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
-
 class TrainStateWithBatchStats(TrainState):
     batch_stats: Optional[flax.core.FrozenDict] = None
 
@@ -62,8 +62,8 @@ class LSTMSummarizer(nn.Module):
         x_proj = nn.Dense(H, name="in_proj")(x)  # [B,T,H]
 
         def init_state(bs):
-            h0 = jnp.zeros((L, bs, H), dtype=jnp.float32)
-            c0 = jnp.zeros((L, bs, H), dtype=jnp.float32)
+            h0 = jnp.zeros((L, bs, H))
+            c0 = jnp.zeros((L, bs, H))
             return (h0, c0)
 
         if initial_state is None:
@@ -128,7 +128,7 @@ class RSACAgentBase:
             self._setup_autotune(key_log_alpha)
             self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
         else:
-            self.current_alpha = jnp.array(algo_config.alpha, dtype=jnp.float32)
+            self.current_alpha = jnp.array(algo_config.alpha)
 
     def _init_model_with_batch_stats(self, model, key, *args, **kwargs):
         variables = model.init({'params': key, 'dropout': key}, *args, **kwargs)
@@ -146,7 +146,7 @@ class RSACAgentBase:
         raise NotImplementedError
 
     def _setup_autotune(self, key_log_alpha):
-        log_alpha_params = {'log_alpha': jnp.zeros((), dtype=jnp.float32)}
+        log_alpha_params = {'log_alpha': jnp.zeros(())}
         self.log_alpha_state = TrainState.create(apply_fn=None, params=log_alpha_params, tx=self.alpha_optimizer)
 
     def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
@@ -175,7 +175,7 @@ class RSACAgentDiscrete(RSACAgentBase):
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls):
         # Shared summarizer and target summarizer
         self.summarizer = LSTMSummarizer(hidden_dim=self.network_config.lstm_hidden_dim, num_layers=self.network_config.lstm_num_layers)
-        dummy_seq = jnp.zeros((1, 1, self.market_feature_dim), dtype=jnp.float32)
+        dummy_seq = jnp.zeros((1, 1, self.market_feature_dim))
         summarizer_params, _ = self._init_model_with_batch_stats(self.summarizer, key_summarizer, dummy_seq)
         # Load pretrained summarizer if configured
         if self.network_config.use_pretrained_summarizer_path:
@@ -189,14 +189,14 @@ class RSACAgentDiscrete(RSACAgentBase):
 
         # Actor head
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), deterministic=True)
+        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), deterministic=True)
         self.actor_state = TrainStateWithBatchStats.create(apply_fn=self.actor_model.apply, params=actor_params, batch_stats=actor_batch_stats, tx=self.actor_optimizer)
 
         # Critic heads (two critics)
         self.critic_model = critic_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), deterministic=True)
+        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), deterministic=True)
         self.qf1_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf1_params, batch_stats=qf1_batch_stats, target_params=qf1_params, target_batch_stats=qf1_batch_stats, tx=self.critic_optimizer)
-        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), deterministic=True)
+        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), deterministic=True)
         self.qf2_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf2_params, batch_stats=qf2_batch_stats, target_params=qf2_params, target_batch_stats=qf2_batch_stats, tx=self.critic_optimizer)
 
         # Freeze summarizer if not training
@@ -205,12 +205,12 @@ class RSACAgentDiscrete(RSACAgentBase):
         # target entropy for discrete
         self.target_entropy = -self.algo_config.target_entropy_scale * jnp.log(1.0 / self.action_dim)
 
-    @partial(jax.jit, static_argnums=(0, 7))
+    @partial(jax_jit, static_argnums=(0, 7))
     def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
                       obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
                       key: jax.random.PRNGKey, deterministic: bool = False):
         market = obs[..., :self.market_feature_dim]
-        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0), dtype=obs.dtype)
+        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0))
         seq = market[:, None, :]
         outputs, (new_h, new_c) = self.summarizer.apply({'params': summarizer_params}, seq, (hidden_h, hidden_c))
         summary_t = outputs[:, -1, :]
@@ -224,10 +224,10 @@ class RSACAgentDiscrete(RSACAgentBase):
 
     def _split_obs(self, o_seq: jnp.ndarray):
         market = o_seq[..., :self.market_feature_dim]
-        agent_feat = o_seq[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros(o_seq.shape[:-1] + (0,), dtype=o_seq.dtype)
+        agent_feat = o_seq[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros(o_seq.shape[:-1] + (0,))
         return market, agent_feat
 
-    @partial(jax.jit, static_argnums=(0,))
+    @partial(jax_jit, static_argnums=(0,))
     def _update(self,
                 actor_state: TrainStateWithBatchStats,
                 qf1_state: CriticTrainState,
@@ -321,7 +321,7 @@ class RSACAgentDiscrete(RSACAgentBase):
         (actor_loss_val, (entropy_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params, actor_state.batch_stats)
         actor_state_new = actor_state.apply_gradients(grads=actor_grads).replace(batch_stats=new_actor_vars['batch_stats'])
 
-        alpha_loss_val = jnp.array(0.0, dtype=jnp.float32)
+        alpha_loss_val = jnp.array(0.0)
         log_alpha_state_to_return = log_alpha_state
         current_alpha_to_return = current_alpha
         if self.algo_config.autotune:
@@ -350,8 +350,8 @@ class RSACAgentDiscrete(RSACAgentBase):
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax.jit, static_argnums=(0, 5, 6, 13))
-    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, key, deterministic: bool = False):
+    @partial(jax_jit, static_argnums=(0, 5, 6, 13))
+    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch: dict, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication"""
         # Split rng on device to avoid host-device traffic
         key_action, key_update, new_key = jax.random.split(key, 3)
@@ -382,7 +382,7 @@ class RSACAgentDiscrete(RSACAgentBase):
         
         # 2. Then perform action selection using potentially updated states
         market = obs[..., :self.market_feature_dim]
-        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0), dtype=obs.dtype)
+        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0))
         seq = market[:, None, :]
         outputs, (new_h, new_c) = self.summarizer.apply({'params': final_summarizer_state.params}, seq, (hidden_h, hidden_c))
         summary_t = outputs[:, -1, :]
@@ -408,7 +408,7 @@ class RSACAgentContinuous(RSACAgentBase):
 
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls):
         self.summarizer = LSTMSummarizer(hidden_dim=self.network_config.lstm_hidden_dim, num_layers=self.network_config.lstm_num_layers)
-        dummy_seq = jnp.zeros((1, 1, self.market_feature_dim), dtype=jnp.float32)
+        dummy_seq = jnp.zeros((1, 1, self.market_feature_dim))
         summarizer_params, _ = self._init_model_with_batch_stats(self.summarizer, key_summarizer, dummy_seq)
         if self.network_config.use_pretrained_summarizer_path:
             try:
@@ -421,15 +421,15 @@ class RSACAgentContinuous(RSACAgentBase):
 
         # Actor head
         self.actor_model = actor_model_cls(network_config=self.network_config, action_dim=self.action_dim)
-        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), deterministic=True)
+        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), deterministic=True)
         self.actor_state = TrainStateWithBatchStats.create(apply_fn=self.actor_model.apply, params=actor_params, batch_stats=actor_batch_stats, tx=self.actor_optimizer)
 
         # Critic heads (two critics)
         self.critic_model = critic_model_cls(network_config=self.network_config)
-        dummy_action = jnp.zeros((1, self.action_dim), dtype=jnp.float32)
-        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), dummy_action, deterministic=True)
+        dummy_action = jnp.zeros((1, self.action_dim))
+        qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), dummy_action, deterministic=True)
         self.qf1_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf1_params, batch_stats=qf1_batch_stats, target_params=qf1_params, target_batch_stats=qf1_batch_stats, tx=self.critic_optimizer)
-        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim), dtype=jnp.float32), dummy_action, deterministic=True)
+        qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, jnp.zeros((1, self.network_config.lstm_hidden_dim + self.agent_feature_dim)), dummy_action, deterministic=True)
         self.qf2_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf2_params, batch_stats=qf2_batch_stats, target_params=qf2_params, target_batch_stats=qf2_batch_stats, tx=self.critic_optimizer)
 
         if self.network_config.use_pretrained_summarizer_path:
@@ -437,12 +437,12 @@ class RSACAgentContinuous(RSACAgentBase):
         self.train_summarizer = bool(self.network_config.train_summarizer)
         self.target_entropy = -float(self.action_dim)
 
-    @partial(jax.jit, static_argnums=(0, 7))
+    @partial(jax_jit, static_argnums=(0, 7))
     def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
                       obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
                       key: jax.random.PRNGKey, deterministic: bool = False):
         market = obs[..., :self.market_feature_dim]
-        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0), dtype=obs.dtype)
+        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0))
         seq = market[:, None, :]
         outputs, (new_h, new_c) = self.summarizer.apply({'params': summarizer_params}, seq, (hidden_h, hidden_c))
         summary_t = outputs[:, -1, :]
@@ -458,10 +458,10 @@ class RSACAgentContinuous(RSACAgentBase):
 
     def _split_obs(self, o_seq: jnp.ndarray):
         market = o_seq[..., :self.market_feature_dim]
-        agent_feat = o_seq[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros(o_seq.shape[:-1] + (0,), dtype=o_seq.dtype)
+        agent_feat = o_seq[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros(o_seq.shape[:-1] + (0,))
         return market, agent_feat
 
-    @partial(jax.jit, static_argnums=(0,))
+    @partial(jax_jit, static_argnums=(0,))
     def _update(self,
                 actor_state: TrainStateWithBatchStats,
                 qf1_state: CriticTrainState,
@@ -559,7 +559,7 @@ class RSACAgentContinuous(RSACAgentBase):
         (actor_loss_val, (entropy_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params, actor_state.batch_stats)
         actor_state_new = actor_state.apply_gradients(grads=actor_grads).replace(batch_stats=new_actor_vars['batch_stats'])
 
-        alpha_loss_val = jnp.array(0.0, dtype=jnp.float32)
+        alpha_loss_val = jnp.array(0.0)
         log_alpha_state_to_return = log_alpha_state
         current_alpha_to_return = current_alpha
         if self.algo_config.autotune:
@@ -588,8 +588,8 @@ class RSACAgentContinuous(RSACAgentBase):
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax.jit, static_argnums=(0, 5, 6, 13))
-    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, key, deterministic: bool = False):
+    @partial(jax_jit, static_argnums=(0, 5, 6, 13))
+    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication"""
         # Split rng on device to avoid host-device traffic
         key_action, key_update, new_key = jax.random.split(key, 3)
@@ -620,7 +620,7 @@ class RSACAgentContinuous(RSACAgentBase):
         
         # 2. Then perform action selection using potentially updated states
         market = obs[..., :self.market_feature_dim]
-        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0), dtype=obs.dtype)
+        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0))
         seq = market[:, None, :]
         outputs, (new_h, new_c) = self.summarizer.apply({'params': final_summarizer_state.params}, seq, (hidden_h, hidden_c))
         summary_t = outputs[:, -1, :]
