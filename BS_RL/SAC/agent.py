@@ -283,9 +283,12 @@ class RSACAgentDiscrete(RSACAgentBase):
             mse1 = (mse1 * m).sum() / (m.sum() + 1e-8)
             mse2 = (mse2 * m).sum() / (m.sum() + 1e-8)
             loss = 0.5 * (mse1 + mse2)
-            return loss, (new_q1_vars, new_q2_vars)
+            # Masked mean Q values for metrics logging
+            qf1_value_mean = (q1_taken * m).sum() / (m.sum() + 1e-8)
+            qf2_value_mean = (q2_taken * m).sum() / (m.sum() + 1e-8)
+            return loss, (new_q1_vars, new_q2_vars, qf1_value_mean, qf2_value_mean)
 
-        (critic_loss_val, (new_q1_vars, new_q2_vars)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1,2,3,4))(qf1_state.params, qf1_state.batch_stats, qf2_state.params, qf2_state.batch_stats, summarizer_state.params)
+        (critic_loss_val, (new_q1_vars, new_q2_vars, qf1_value_mean, qf2_value_mean)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1,2,3,4))(qf1_state.params, qf1_state.batch_stats, qf2_state.params, qf2_state.batch_stats, summarizer_state.params)
         g_q1_params, g_q1_bs, g_q2_params, g_q2_bs, g_sum_params = critic_grads
         qf1_state_new = qf1_state.apply_gradients(grads=g_q1_params).replace(batch_stats=new_q1_vars['batch_stats'])
         qf2_state_new = qf2_state.apply_gradients(grads=g_q2_params).replace(batch_stats=new_q2_vars['batch_stats'])
@@ -342,6 +345,8 @@ class RSACAgentDiscrete(RSACAgentBase):
             'alpha_loss': alpha_loss_val,
             'alpha': current_alpha_to_return,
             'entropy': entropy_val,
+            'qf1_value_mean': qf1_value_mean,
+            'qf2_value_mean': qf2_value_mean,
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
@@ -352,52 +357,28 @@ class RSACAgentDiscrete(RSACAgentBase):
         key_action, key_update, new_key = jax.random.split(key, 3)
         
         # 1. First perform agent update if requested
-        def do_agent_update():
-            return self._update(actor_state, qf1_state, qf2_state, summarizer_state, 
-                              log_alpha_state, batch, key_update)
-        
-        def no_agent_update():
-            empty_metrics = {
-                'critic_loss': jnp.array(0.0),
-                'actor_loss': jnp.array(0.0), 
-                'alpha_loss': jnp.array(0.0),
-                'alpha': jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha),
-                'entropy': jnp.array(0.0),
-            }
-            return actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha), empty_metrics
-        
-        # Use jax.lax.cond to conditionally update
-        updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, current_alpha, metrics = jax.lax.cond(
-            do_update,
-            do_agent_update,
-            no_agent_update
-        )
+        if do_update:
+            updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, current_alpha, metrics = self._update(actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, batch, key_update)
+        else:
+            updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state = actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state
+            current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha)
+            metrics = {}
         
         # Apply target network updates if requested
-        def apply_target_updates(states: tuple[CriticTrainState, CriticTrainState, SummarizerTrainState]):
-            qf1_state, qf2_state, summarizer_state_local = states
+        if do_update and do_target_update:
             tau = self.algo_config.tau
-            updated_qf1_state = qf1_state.replace(
-                target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(qf1_state.batch_stats, qf1_state.target_batch_stats, tau) if qf1_state.batch_stats is not None else qf1_state.target_batch_stats
+            final_qf1_state = updated_qf1_state.replace(
+                target_params=optax.incremental_update(updated_qf1_state.params, updated_qf1_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(updated_qf1_state.batch_stats, updated_qf1_state.target_batch_stats, tau) if updated_qf1_state.batch_stats is not None else updated_qf1_state.target_batch_stats
             )
-            updated_qf2_state = qf2_state.replace(
-                target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(qf2_state.batch_stats, qf2_state.target_batch_stats, tau) if qf2_state.batch_stats is not None else qf2_state.target_batch_stats
+            final_qf2_state = updated_qf2_state.replace(
+                target_params=optax.incremental_update(updated_qf2_state.params, updated_qf2_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(updated_qf2_state.batch_stats, updated_qf2_state.target_batch_stats, tau) if updated_qf2_state.batch_stats is not None else updated_qf2_state.target_batch_stats
             )
-            new_target = optax.incremental_update(updated_summarizer_state.params, summarizer_state_local.target_params, tau)
-            updated_summarizer_state_local = summarizer_state_local.replace(target_params=new_target)
-            return updated_qf1_state, updated_qf2_state, updated_summarizer_state_local
-        
-        def no_target_updates(states):
-            return states
-        
-        final_qf1_state, final_qf2_state, final_summarizer_state = jax.lax.cond(
-            do_update & do_target_update,  # Only apply target updates if we're doing regular updates too
-            apply_target_updates,
-            no_target_updates,
-            (updated_qf1_state, updated_qf2_state, updated_summarizer_state)
-        )
+            new_target = optax.incremental_update(updated_summarizer_state.params, updated_summarizer_state.target_params, tau)
+            final_summarizer_state = updated_summarizer_state.replace(target_params=new_target)
+        else:
+            final_qf1_state, final_qf2_state, final_summarizer_state = updated_qf1_state, updated_qf2_state, updated_summarizer_state
         
         # 2. Then perform action selection using potentially updated states
         market = obs[..., :self.market_feature_dim]
@@ -536,9 +517,12 @@ class RSACAgentContinuous(RSACAgentBase):
             mse1 = (mse1 * m).sum() / (m.sum() + 1e-8)
             mse2 = (mse2 * m).sum() / (m.sum() + 1e-8)
             loss = 0.5 * (mse1 + mse2)
-            return loss, (new_q1_vars, new_q2_vars)
+            # Masked mean Q values for metrics logging
+            qf1_value_mean = (q1_cur * m).sum() / (m.sum() + 1e-8)
+            qf2_value_mean = (q2_cur * m).sum() / (m.sum() + 1e-8)
+            return loss, (new_q1_vars, new_q2_vars, qf1_value_mean, qf2_value_mean)
 
-        (critic_loss_val, (new_q1_vars, new_q2_vars)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1,2,3,4))(qf1_state.params, qf1_state.batch_stats, qf2_state.params, qf2_state.batch_stats, summarizer_state.params)
+        (critic_loss_val, (new_q1_vars, new_q2_vars, qf1_value_mean, qf2_value_mean)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1,2,3,4))(qf1_state.params, qf1_state.batch_stats, qf2_state.params, qf2_state.batch_stats, summarizer_state.params)
         g_q1_params, g_q1_bs, g_q2_params, g_q2_bs, g_sum_params = critic_grads
         qf1_state_new = qf1_state.apply_gradients(grads=g_q1_params).replace(batch_stats=new_q1_vars['batch_stats'])
         qf2_state_new = qf2_state.apply_gradients(grads=g_q2_params).replace(batch_stats=new_q2_vars['batch_stats'])
@@ -599,6 +583,8 @@ class RSACAgentContinuous(RSACAgentBase):
             'alpha_loss': alpha_loss_val,
             'alpha': current_alpha_to_return,
             'entropy': entropy_val,
+            'qf1_value_mean': qf1_value_mean,
+            'qf2_value_mean': qf2_value_mean,
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
@@ -609,52 +595,28 @@ class RSACAgentContinuous(RSACAgentBase):
         key_action, key_update, new_key = jax.random.split(key, 3)
         
         # 1. First perform agent update if requested
-        def do_agent_update():
-            return self._update(actor_state, qf1_state, qf2_state, summarizer_state, 
-                              log_alpha_state, batch, key_update)
-        
-        def no_agent_update():
-            empty_metrics = {
-                'critic_loss': jnp.array(0.0),
-                'actor_loss': jnp.array(0.0), 
-                'alpha_loss': jnp.array(0.0),
-                'alpha': jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha),
-                'entropy': jnp.array(0.0),
-            }
-            return actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha), empty_metrics
-        
-        # Use jax.lax.cond to conditionally update
-        updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, current_alpha, metrics = jax.lax.cond(
-            do_update,
-            do_agent_update,
-            no_agent_update
-        )
+        if do_update:
+            updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, current_alpha, metrics = self._update(actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, batch, key_update)
+        else:
+            updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state = actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state
+            current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha)
+            metrics = {}
         
         # Apply target network updates if requested
-        def apply_target_updates(states: tuple[CriticTrainState, CriticTrainState, SummarizerTrainState]):
-            qf1_state, qf2_state, summarizer_state_local = states
+        if do_update and do_target_update:
             tau = self.algo_config.tau
-            updated_qf1_state = qf1_state.replace(
-                target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(qf1_state.batch_stats, qf1_state.target_batch_stats, tau) if qf1_state.batch_stats is not None else qf1_state.target_batch_stats
+            final_qf1_state = updated_qf1_state.replace(
+                target_params=optax.incremental_update(updated_qf1_state.params, updated_qf1_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(updated_qf1_state.batch_stats, updated_qf1_state.target_batch_stats, tau) if updated_qf1_state.batch_stats is not None else updated_qf1_state.target_batch_stats
             )
-            updated_qf2_state = qf2_state.replace(
-                target_params=optax.incremental_update(qf2_state.params, qf2_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(qf2_state.batch_stats, qf2_state.target_batch_stats, tau) if qf2_state.batch_stats is not None else qf2_state.target_batch_stats
+            final_qf2_state = updated_qf2_state.replace(
+                target_params=optax.incremental_update(updated_qf2_state.params, updated_qf2_state.target_params, tau),
+                target_batch_stats=optax.incremental_update(updated_qf2_state.batch_stats, updated_qf2_state.target_batch_stats, tau) if updated_qf2_state.batch_stats is not None else updated_qf2_state.target_batch_stats
             )
-            new_target = optax.incremental_update(updated_summarizer_state.params, summarizer_state_local.target_params, tau)
-            updated_summarizer_state_local = summarizer_state_local.replace(target_params=new_target)
-            return updated_qf1_state, updated_qf2_state, updated_summarizer_state_local
-        
-        def no_target_updates(states):
-            return states
-        
-        final_qf1_state, final_qf2_state, final_summarizer_state = jax.lax.cond(
-            do_update & do_target_update,  # Only apply target updates if we're doing regular updates too
-            apply_target_updates,
-            no_target_updates,
-            (updated_qf1_state, updated_qf2_state, updated_summarizer_state)
-        )
+            new_target = optax.incremental_update(updated_summarizer_state.params, updated_summarizer_state.target_params, tau)
+            final_summarizer_state = updated_summarizer_state.replace(target_params=new_target)
+        else:
+            final_qf1_state, final_qf2_state, final_summarizer_state = updated_qf1_state, updated_qf2_state, updated_summarizer_state
         
         # 2. Then perform action selection using potentially updated states
         market = obs[..., :self.market_feature_dim]
