@@ -360,7 +360,6 @@ class Trainer:
                 # Prepare rng on device inside jit to avoid host-device split cost
                 
                 # Determine if we should update and use actor
-                use_actor = current_step >= self.args.algo.learning_starts and update_cnt > 0
                 do_update = (current_step > self.args.algo.learning_starts and 
                            self.rb.can_sample(self.args.algo.batch_size) and 
                            current_step % self.args.algo.update_frequency == 0)
@@ -371,10 +370,8 @@ class Trainer:
                     update_cnt += 1
                     do_target_update = (current_step // self.args.algo.update_frequency) % max(self.args.algo.target_network_frequency // max(self.args.algo.update_frequency,1), 1) == 0
                     batch_data = self.rb.sample(self.args.algo.batch_size)
-                
-                # Combined action selection and agent update in single JIT call
-                if use_actor:
-                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_log_alpha_state, metrics, self.jax_key = self.agent.get_action_and_update_agent(
+                    # Combined action selection and agent update in single JIT call
+                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_agent_then_get_action(
                         obs, self.hidden_h, self.hidden_c, batch_data, do_update, do_target_update,
                         self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state,
                         self.log_alpha_state, self.jax_key,

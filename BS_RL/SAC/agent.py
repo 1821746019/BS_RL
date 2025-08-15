@@ -288,7 +288,7 @@ class RSACAgentBase:
     def _update(self, states, batch, key):
         raise NotImplementedError
     
-    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update,  actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, key, deterministic: bool = False):
+    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update,  actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, key, deterministic: bool = False):
         """Combined function to reduce CPU-TPU communication overhead"""
         raise NotImplementedError
 
@@ -494,7 +494,7 @@ class RSACAgentDiscrete(RSACAgentBase):
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
     @partial(jax_jit, static_argnums=(0, 5, 6, 13))
-    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch: dict, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, deterministic: bool = False):
+    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batch: dict, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication"""
         # Split rng on device to avoid host-device traffic
         key_action, key_update, new_key = jax.random.split(key, 3)
@@ -744,7 +744,7 @@ class RSACAgentContinuous(RSACAgentBase):
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
     @partial(jax_jit, static_argnums=(0, 5, 6, 13))
-    def get_action_and_update_agent(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, deterministic: bool = False):
+    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication"""
         # Split rng on device to avoid host-device traffic
         key_action, key_update, new_key = jax.random.split(key, 3)
