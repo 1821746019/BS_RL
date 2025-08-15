@@ -26,7 +26,7 @@ class AlgoConfig:
     """the discount factor gamma"""
     tau: float = 1.0  # Original SAC discrete paper and CleanRL use 1.0 for hard updates for discrete
     """target smoothing coefficient (default: 1.0 for hard update)"""
-    batch_size: int = 64
+    batch_size: int = 256
     """the batch size of sample from the reply memory"""
     learning_starts: int = 20000
     """timestep to start learning"""
