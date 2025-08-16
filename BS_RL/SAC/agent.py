@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-import flax
+import flax.core
 import flax.linen as nn
 from flax.training.train_state import TrainState
 from flax.training import checkpoints
@@ -92,92 +92,71 @@ class S5Layer(nn.Module):
 
     def setup(self):
         """
-        Initializes the structured state space model parameters.
-        A is diagonal, B, C, D are dense projections.
+        Paper-aligned S5 layer using a diagonal continuous-time SSM, but implemented
+        with a parallel scan over time for the discrete recurrence. This mirrors the
+        ResettableS5 approach while keeping parameters simple and real-valued.
         """
-        # A_log_diag represents the log of the diagonal of the continuous-time A matrix.
-        # Initializing it to be negative is crucial for stability.
-        # We parameterize the log for unconstrained optimization.
+        # Continuous-time diagonal A parameterized via log for stability (negative real parts)
         self.A_log_diag = self.param("A_log_diag", nn.initializers.zeros, (self.hidden_dim,))
 
-        # B, C, and D are standard projection matrices.
+        # Projection matrices
         self.B_proj = nn.Dense(self.hidden_dim, kernel_init=nn.initializers.lecun_normal(), name="B_proj")
         self.C_proj = nn.Dense(self.hidden_dim, kernel_init=nn.initializers.lecun_normal(), name="C_proj")
-        self.D_proj = nn.Dense(self.hidden_dim, name="D_proj") # Skip connection
+        self.D_proj = nn.Dense(self.hidden_dim, name="D_proj")
 
-        # log_delta is the learnable discretization step size Δ.
+        # Learnable discretization step size Δ
         self.log_delta = self.param("log_delta", nn.initializers.zeros, ())
 
-    def __call__(self, x_t: jnp.ndarray, h_prev: jnp.ndarray):
+    def __call__(self, h_prev: jnp.ndarray, x_seq: jnp.ndarray):
         """
-        Performs one recurrent step of the S5 model.
-        
+        Parallel S5 forward pass over a whole sequence using associative_scan.
+
         Args:
-            x_t: Input at the current timestep, shape [B, H_in]. (H_in is proj_dim)
-            h_prev: Previous hidden state, shape [B, H].
+            h_prev: Initial hidden state, shape [B, H]
+            x_seq: Input sequence for this layer, shape [B, T, H]
 
         Returns:
-            h_t: New hidden state, shape [B, H].
-            y_t: Output at the current timestep, shape [B, H].
+            h_last: Final hidden state, shape [B, H]
+            y_seq: Output sequence, shape [B, T, H]
         """
-        # 1. Get continuous-time parameters (A, B, C, D) and step size (Δ)
-        # Ensure A has negative real parts for stability
-        A_diag = -jnp.exp(self.A_log_diag) 
-        
-        # Project input x_t to the hidden dimension to get u_t
-        u_t = self.B_proj(x_t)
+        B, T, H = x_seq.shape
 
-        # Calculate learnable step size Δ, constrained to a range
+        # Discretize continuous-time parameters
+        A_diag = -jnp.exp(self.A_log_diag)  # [H]
         delta = jax.nn.sigmoid(self.log_delta) * (self.delta_max - self.delta_min) + self.delta_min
+        delta_A = delta * A_diag  # [H]
+        A_bar_diag = jnp.exp(delta_A)  # [H]
 
-        # 2. Discretize continuous-time parameters to get A_bar, B_bar (ZOH method)
-        # For a diagonal A, the formulas are simpler and can be applied element-wise.
-        delta_A = delta * A_diag
-        A_bar_diag = jnp.exp(delta_A)
-        
-        # B_bar = (A_bar - I) * A^-1 * B -> (exp(ΔA) - 1)/A * u_t
-        # Use jnp.expm1 for better numerical stability when delta_A is close to zero
-        B_bar_u = jnp.expm1(delta_A) / A_diag * u_t
+        # Compute input drive u_t and its discretized contribution B_bar * u_t
+        u_seq = self.B_proj(x_seq)  # [B, T, H]
+        B_bar_factor = jnp.expm1(delta_A) / A_diag  # [H]
+        B_bar_u_seq = u_seq * B_bar_factor  # broadcast to [B, T, H]
 
-        # 3. Apply the recurrent update for the hidden state
-        # x_t = A_bar * x_{t-1} + B_bar * u_t
-        h_t = A_bar_diag * h_prev + B_bar_u
+        # Define associative binary operator for (A, b) pairs
+        def binary_op(q_i, q_j):
+            A_i, b_i = q_i  # [..., H]
+            A_j, b_j = q_j  # [..., H]
+            return A_j * A_i, A_j * b_i + b_j
 
-        # 4. Compute the output y_t
-        # y_t = C * x_t + D * u_t
-        # Here, D*u_t is a skip connection from the input projection.
-        y_t = self.C_proj(h_t) + self.D_proj(x_t)
+        # Per-batch parallel scan over time
+        def scan_one_batch(inputs):
+            h0_b, b_seq_b = inputs  # [H], [T, H]
+            # Build constant A elements along time
+            A_elems = jnp.broadcast_to(A_bar_diag, (T, H))  # [T, H]
+            # Prepend initial hidden to b sequence
+            A_elems = jnp.concatenate([jnp.ones((1, H)), A_elems], axis=0)  # [T+1, H]
+            b_elems = jnp.concatenate([h0_b[None, :], b_seq_b], axis=0)  # [T+1, H]
+            _, x_states = jax.lax.associative_scan(binary_op, (A_elems, b_elems))  # [T+1, H]
+            h_seq_b = x_states[1:, :]  # [T, H]
+            return h_seq_b
 
-        return h_t, y_t
+        h_seq = jax.vmap(scan_one_batch)((h_prev, B_bar_u_seq))  # [B, T, H]
+        h_last = h_seq[:, -1, :] if T > 0 else h_prev
 
-class _S5StackStep(nn.Module):
-    hidden_dim: int
-    num_layers: int
-    delta_min: float
-    delta_max: float
+        # Output: y_t = C h_t + D x_t (skip)
+        y_seq = self.C_proj(h_seq) + self.D_proj(x_seq)
+        return h_last, y_seq
 
-    @nn.compact
-    def __call__(self, carry: jnp.ndarray, x_t: jnp.ndarray):
-        # carry: h layers [L,B,H]
-        h_layers = carry
-        cur = x_t
-        new_h_layers = []
-        for i in range(self.num_layers):
-            # *** KEY CHANGE IS HERE ***
-            # Replace the old S5Layer with the new, paper-aligned version.
-            layer = S5Layer(
-                hidden_dim=self.hidden_dim, 
-                delta_min=self.delta_min, 
-                delta_max=self.delta_max, 
-                name=f"s5_layer_aligned_{i}"
-            )
-            h_new, cur = layer(cur, h_layers[i]) # The new layer outputs (h_new, y_t), use y_t as input for next layer
-            new_h_layers.append(h_new)
-            
-        new_h = jnp.stack(new_h_layers, axis=0)
-        summary_t = cur # The final output 'y' from the last layer is the summary
-        return new_h, summary_t
-    
 class S5Summarizer(nn.Module):
     hidden_dim: int
     num_layers: int = 1
@@ -195,24 +174,34 @@ class S5Summarizer(nn.Module):
         B, T, _ = x.shape
         H = self.hidden_dim
         L = self.num_layers
-        x_proj = nn.Dense(H, name="in_proj")(x)
 
+        # Project inputs to model dimension
+        x_proj = nn.Dense(H, name="in_proj")(x)  # [B, T, H]
+
+        # Initialize hidden states per layer: [L, B, H]
         if initial_state is None:
-            h0 = jnp.zeros((L, B, H))
+            h_layers = jnp.zeros((L, B, H), dtype=jnp.float32)
         else:
-            h0, _ = initial_state
-            h0 = h0.astype(jnp.float32)
+            h_init, _ = initial_state
+            h_layers = h_init.astype(jnp.float32)
 
-        Scanned = nn.scan(
-            _S5StackStep,
-            variable_broadcast="params",
-            split_rngs={"params": False},
-            in_axes=1,
-            out_axes=1,
-        )
-        time_scan = Scanned(hidden_dim=H, num_layers=L, delta_min=self.delta_min, delta_max=self.delta_max, name="time_scan")
-        final_h, ys = time_scan(h0, x_proj)
-        outputs = jnp.concatenate([h0[-1][:, None, :], ys], axis=1)
+        cur_seq = x_proj
+        new_h_layers = []
+        for i in range(L):
+            layer = S5Layer(
+                hidden_dim=H,
+                delta_min=self.delta_min,
+                delta_max=self.delta_max,
+                name=f"s5_layer_parallel_{i}"
+            )
+            h_last_i, cur_seq = layer(h_layers[i], cur_seq)  # cur_seq becomes layer output
+            new_h_layers.append(h_last_i)
+
+        final_h = jnp.stack(new_h_layers, axis=0)  # [L, B, H]
+
+        # As in previous summarizers, prepend the initial top-layer hidden state at t=0
+        top_init = h_layers[-1]  # [B, H]
+        outputs = jnp.concatenate([top_init[:, None, :], cur_seq], axis=1)  # [B, T+1, H]
         return outputs, (final_h, jnp.zeros_like(final_h))
 
 class RSACAgentBase:
