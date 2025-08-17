@@ -46,7 +46,7 @@ class AlgoConfig:
     """coefficient for scaling the autotune entropy target (e.g., 0.89 for Atari)"""
     # JAX-specific Adam epsilon, matching PyTorch default for fair comparison
     adam_eps: float = 1e-4 # CleanRL used 1e-4 for PyTorch Adam, default optax Adam is 1e-8.
-    use_SGD: bool = True
+    use_SGD: bool = False
     """whether to use SGD instead of AdamW"""
     # RSAC-share specific
     num_bptt: int = 64
