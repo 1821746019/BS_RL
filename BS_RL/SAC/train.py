@@ -413,6 +413,7 @@ class Trainer:
                     L, N, H = self.hidden_h.shape
                     hh = np.array(self.hidden_h)
                     hh[:, done_mask, :] = 0.0
+                    # 从将np.ndarray的数据转为jnp.ndarray涉及拷贝数据到default_backend上，是异步的，这里提前转比起调jit函数时让自动转, 性能更好
                     self.hidden_h = jnp.asarray(hh)
                     if self.hidden_c is not None:
                         hc = np.array(self.hidden_c)

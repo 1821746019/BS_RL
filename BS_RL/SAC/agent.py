@@ -92,69 +92,98 @@ class S5Layer(nn.Module):
 
     def setup(self):
         """
-        Paper-aligned S5 layer using a diagonal continuous-time SSM, but implemented
-        with a parallel scan over time for the discrete recurrence. This mirrors the
-        ResettableS5 approach while keeping parameters simple and real-valued.
+        Closer-to-standard S5 layer with complex diagonal Λ and bilinear (Tustin)
+        discretization. Implements parallel time propagation via associative_scan.
+        Hidden state is complex internally; inputs/outputs remain real.
         """
-        # Continuous-time diagonal A parameterized via log for stability (negative real parts)
-        self.A_log_diag = self.param("A_log_diag", nn.initializers.zeros, (self.hidden_dim,))
+        H = self.hidden_dim
 
-        # Projection matrices
-        self.B_proj = nn.Dense(self.hidden_dim, kernel_init=nn.initializers.lecun_normal(), name="B_proj")
-        self.C_proj = nn.Dense(self.hidden_dim, kernel_init=nn.initializers.lecun_normal(), name="C_proj")
-        self.D_proj = nn.Dense(self.hidden_dim, name="D_proj")
+        # Complex diagonal Λ = λ_r + i λ_i. We parameterize λ_r = -exp(θ_r) to ensure stability.
+        # HiPPO-inspired init: spread time-scales and frequencies across channels.
+        def init_theta_r(key, shape):
+            # Initialize exp(theta_r) roughly in [0.5, 2.0] so λ_r in [-2.0, -0.5]
+            base = jnp.linspace(0.5, 2.0, H)
+            return jnp.log(base).astype(jnp.float32)
 
-        # Learnable discretization step size Δ
-        self.log_delta = self.param("log_delta", nn.initializers.zeros, ())
+        def init_omega(key, shape):
+            # Frequencies spread in [0, pi]
+            return jnp.linspace(0.0, jnp.pi, H).astype(jnp.float32)
+
+        self.theta_r = self.param("theta_r", init_theta_r, (H,))  # unconstrained
+        self.omega = self.param("omega", init_omega, (H,))         # imag frequencies
+
+        # Per-channel learnable step Δ
+        self.log_delta = self.param("log_delta", nn.initializers.zeros, (H,))
+
+        # Real projections to build complex input drive u_t = (B_r x) + i (B_i x)
+        self.B_proj_real = nn.Dense(H, kernel_init=nn.initializers.lecun_normal(), name="B_proj_real")
+        self.B_proj_imag = nn.Dense(H, kernel_init=nn.initializers.lecun_normal(), name="B_proj_imag")
+
+        # Output projection from concatenated [Re(h), Im(h)] to real H
+        self.C_out = nn.Dense(H, kernel_init=nn.initializers.lecun_normal(), name="C_out")
+        # Real residual/skip from input
+        self.D_proj = nn.Dense(H, name="D_proj")
 
     def __call__(self, h_prev: jnp.ndarray, x_seq: jnp.ndarray):
         """
-        Parallel S5 forward pass over a whole sequence using associative_scan.
+        Parallel S5 forward pass over a whole sequence using associative_scan (per batch).
 
         Args:
-            h_prev: Initial hidden state, shape [B, H]
-            x_seq: Input sequence for this layer, shape [B, T, H]
+            h_prev: Initial complex hidden state, shape [B, H] complex64
+            x_seq: Input sequence (real), shape [B, T, H]
 
         Returns:
-            h_last: Final hidden state, shape [B, H]
-            y_seq: Output sequence, shape [B, T, H]
+            h_last: Final complex hidden, shape [B, H] complex64
+            y_seq: Output sequence (real), shape [B, T, H]
         """
         B, T, H = x_seq.shape
+        dtype_c = jnp.complex64
 
-        # Discretize continuous-time parameters
-        A_diag = -jnp.exp(self.A_log_diag)  # [H]
-        delta = jax.nn.sigmoid(self.log_delta) * (self.delta_max - self.delta_min) + self.delta_min
-        delta_A = delta * A_diag  # [H]
-        A_bar_diag = jnp.exp(delta_A)  # [H]
+        # Λ = λ_r + i ω, with λ_r < 0
+        lambda_real = -jnp.exp(self.theta_r).astype(jnp.float32)             # [H]
+        lambda_imag = self.omega.astype(jnp.float32)                          # [H]
+        Lambda = lambda_real.astype(dtype_c) + 1j * lambda_imag.astype(dtype_c)  # [H] complex
 
-        # Compute input drive u_t and its discretized contribution B_bar * u_t
-        u_seq = self.B_proj(x_seq)  # [B, T, H]
-        B_bar_factor = jnp.expm1(delta_A) / A_diag  # [H]
-        B_bar_u_seq = u_seq * B_bar_factor  # broadcast to [B, T, H]
+        # Per-channel Δ via sigmoid to bound in [delta_min, delta_max]
+        delta = jax.nn.sigmoid(self.log_delta) * (self.delta_max - self.delta_min) + self.delta_min  # [H]
+        delta = delta.astype(jnp.float32)
+        alpha = 0.5 * delta  # [H]
 
-        # Define associative binary operator for (A, b) pairs
+        # Bilinear discretization (Tustin):
+        # A_bar = (I + αA)(I - αA)^{-1}, B_bar = (I - αA)^{-1} Δ B
+        one = jnp.ones((H,), dtype=dtype_c)
+        denom = one - alpha.astype(dtype_c) * Lambda  # [H]
+        A_bar = (one + alpha.astype(dtype_c) * Lambda) / denom  # [H] complex
+        B_bar = (delta.astype(dtype_c)) / denom  # [H] complex, multiplies B u_t
+
+        # Input drive u_t (complex)
+        u_real = self.B_proj_real(x_seq)  # [B, T, H]
+        u_imag = self.B_proj_imag(x_seq)  # [B, T, H]
+        u_complex = u_real.astype(dtype_c) + 1j * u_imag.astype(dtype_c)
+        B_bar_u_seq = u_complex * B_bar  # broadcast [H] -> [B, T, H]
+
+        # Associative binary operator for complex (A, b)
         def binary_op(q_i, q_j):
-            A_i, b_i = q_i  # [..., H]
-            A_j, b_j = q_j  # [..., H]
+            A_i, b_i = q_i  # [..., H] complex
+            A_j, b_j = q_j  # [..., H] complex
             return A_j * A_i, A_j * b_i + b_j
 
         # Per-batch parallel scan over time
         def scan_one_batch(inputs):
-            h0_b, b_seq_b = inputs  # [H], [T, H]
-            # Build constant A elements along time
-            A_elems = jnp.broadcast_to(A_bar_diag, (T, H))  # [T, H]
-            # Prepend initial hidden to b sequence
-            A_elems = jnp.concatenate([jnp.ones((1, H)), A_elems], axis=0)  # [T+1, H]
+            h0_b, b_seq_b = inputs  # [H] complex, [T, H] complex
+            A_elems = jnp.broadcast_to(A_bar, (T, H))  # [T, H] complex
+            A_elems = jnp.concatenate([jnp.ones((1, H), dtype=dtype_c), A_elems], axis=0)  # [T+1, H]
             b_elems = jnp.concatenate([h0_b[None, :], b_seq_b], axis=0)  # [T+1, H]
             _, x_states = jax.lax.associative_scan(binary_op, (A_elems, b_elems))  # [T+1, H]
             h_seq_b = x_states[1:, :]  # [T, H]
             return h_seq_b
 
-        h_seq = jax.vmap(scan_one_batch)((h_prev, B_bar_u_seq))  # [B, T, H]
+        h_seq = jax.vmap(scan_one_batch)((h_prev, B_bar_u_seq))  # [B, T, H] complex
         h_last = h_seq[:, -1, :] if T > 0 else h_prev
 
-        # Output: y_t = C h_t + D x_t (skip)
-        y_seq = self.C_proj(h_seq) + self.D_proj(x_seq)
+        # Output: y_t = C_out([Re(h_t), Im(h_t)]) + D x_t
+        h_cat = jnp.concatenate([h_seq.real.astype(jnp.float32), h_seq.imag.astype(jnp.float32)], axis=-1)  # [B, T, 2H]
+        y_seq = self.C_out(h_cat) + self.D_proj(x_seq)  # [B, T, H]
         return h_last, y_seq
 
 class S5Summarizer(nn.Module):
@@ -178,15 +207,19 @@ class S5Summarizer(nn.Module):
         # Project inputs to model dimension
         x_proj = nn.Dense(H, name="in_proj")(x)  # [B, T, H]
 
-        # Initialize hidden states per layer: [L, B, H]
+        # Initialize hidden states per layer: [L, B, H] real for Re and Im via c
         if initial_state is None:
-            h_layers = jnp.zeros((L, B, H), dtype=jnp.float32)
+            h_layers_real = jnp.zeros((L, B, H), dtype=jnp.float32)
+            h_layers_imag = jnp.zeros((L, B, H), dtype=jnp.float32)
         else:
-            h_init, _ = initial_state
-            h_layers = h_init.astype(jnp.float32)
+            h_init, c_init = initial_state
+            h_layers_real = h_init.astype(jnp.float32)
+            # Use c as imaginary part carrier for S5
+            h_layers_imag = (c_init.astype(jnp.float32) if c_init is not None else jnp.zeros_like(h_layers_real))
 
-        cur_seq = x_proj
-        new_h_layers = []
+        cur_seq = x_proj  # real
+        final_h_real_list = []
+        final_h_imag_list = []
         for i in range(L):
             layer = S5Layer(
                 hidden_dim=H,
@@ -194,15 +227,18 @@ class S5Summarizer(nn.Module):
                 delta_max=self.delta_max,
                 name=f"s5_layer_parallel_{i}"
             )
-            h_last_i, cur_seq = layer(h_layers[i], cur_seq)  # cur_seq becomes layer output
-            new_h_layers.append(h_last_i)
+            h0_complex = h_layers_real[i].astype(jnp.complex64) + 1j * h_layers_imag[i].astype(jnp.complex64)
+            h_last_i, cur_seq = layer(h0_complex, cur_seq)  # cur_seq becomes layer output (real)
+            final_h_real_list.append(jnp.asarray(h_last_i.real, dtype=jnp.float32))
+            final_h_imag_list.append(jnp.asarray(h_last_i.imag, dtype=jnp.float32))
 
-        final_h = jnp.stack(new_h_layers, axis=0)  # [L, B, H]
+        final_h_real = jnp.stack(final_h_real_list, axis=0)  # [L, B, H]
+        final_h_imag = jnp.stack(final_h_imag_list, axis=0)  # [L, B, H]
 
-        # As in previous summarizers, prepend the initial top-layer hidden state at t=0
-        top_init = h_layers[-1]  # [B, H]
-        outputs = jnp.concatenate([top_init[:, None, :], cur_seq], axis=1)  # [B, T+1, H]
-        return outputs, (final_h, jnp.zeros_like(final_h))
+        # Prepend initial top-layer real hidden state at t=0 for outputs
+        top_init_real = h_layers_real[-1]  # [B, H]
+        outputs = jnp.concatenate([top_init_real[:, None, :], cur_seq], axis=1)  # [B, T+1, H]
+        return outputs, (final_h_real, final_h_imag)
 
 class RSACAgentBase:
     def __init__(self,
