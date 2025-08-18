@@ -15,7 +15,7 @@ if __name__ == "__main__":
     window_size = 1 # 防止过拟合，用1
     use_SGD = False
     total_timesteps = int(100e6) 
-    batch_size = 256
+    batch_size = 1
     env_num = 1  # SAC通常使用单环境
     eval_env_num = 1
     exp_name = f"env_num({env_num})_window({window_size})_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
@@ -46,7 +46,7 @@ if __name__ == "__main__":
             capture_media=True,  # 记录视频
         ),
         env=EnvConfig(
-            trading_env_config=TradingEnvConfig(data_loader_config=DataLoaderConfig(data_path="../../processed_data")),
+            trading_env_config=TradingEnvConfig(),
             env_num=env_num,
         ),
         network=NetworkConfig(

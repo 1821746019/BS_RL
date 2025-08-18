@@ -49,11 +49,14 @@ class AlgoConfig:
     use_SGD: bool = False
     """whether to use SGD instead of AdamW"""
     # RSAC-share specific
-    num_bptt: int = 64
+    rb_seg_len: int = int(1440*3)
+    """Segment length for replay buffer."""
+    num_bptt: int = 1440
     """Truncated BPTT sequence length (T). Also the fixed segment length for storage."""
-    burn_in: int = 0
+    burn_in: int = 1440 # 1440m = 1d
     """Number of prefix steps used only to roll LSTM hidden state (excluded from loss)."""
-    
+    rb_min_gap: int = 60
+    """Minimum gap between sequences in the same segment."""
 @dataclass
 class WandbConfig:
     track: bool = True

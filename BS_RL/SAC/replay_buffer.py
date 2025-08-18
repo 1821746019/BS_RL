@@ -8,19 +8,18 @@ class RecurrentReplayBuffer:
                  is_discrete_action: bool,
                  capacity_segments: int,
                  num_envs: int,
-                 num_bptt: int,
-                 burn_in: int = 0):
+                 seg_len: int,
+                 burn_in: int = 0, min_gap: int = 60):
         self.obs_dim = obs_dim
         self.action_shape = action_shape
         self.is_discrete_action = is_discrete_action
         self.capacity_segments = capacity_segments
         self.num_envs = num_envs
-        self.num_bptt = num_bptt
         self.burn_in = int(max(burn_in, 0))
-        self.total_len = int(self.num_bptt + self.burn_in)
-
+        self.seg_len = seg_len
+        self.min_gap = min_gap
         # Storage for segments as multi-dimensional arrays for vectorized operations
-        T = self.total_len
+        T = self.seg_len
         self.segments_o = np.zeros((capacity_segments, T + 1, obs_dim), dtype=np.float32)
         self.segments_a = np.zeros((capacity_segments, T) + action_shape, dtype=np.int32 if is_discrete_action else np.float32)
         self.segments_r = np.zeros((capacity_segments, T), dtype=np.float32)
@@ -36,7 +35,7 @@ class RecurrentReplayBuffer:
 
     def _reset_working_buffers(self):
         # Working buffers for accumulating num_bptt steps before storing as segment
-        T = self.total_len
+        T = self.seg_len
         self.work_o = [np.zeros((T + 1, self.obs_dim), dtype=np.float32) for _ in range(self.num_envs)]
         self.work_a = [np.zeros((T,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32) for _ in range(self.num_envs)]
         self.work_r = [np.zeros((T,), dtype=np.float32) for _ in range(self.num_envs)]
@@ -77,7 +76,7 @@ class RecurrentReplayBuffer:
 
             # Check if we should finalize this segment
             should_finalize = False
-            if t + 1 >= self.total_len:
+            if t + 1 >= self.seg_len:
                 # Segment is full
                 should_finalize = True
             elif terminations[i] > 0.5 or truncations[i] > 0.5:
@@ -95,7 +94,7 @@ class RecurrentReplayBuffer:
         
         # Create segment with proper padding/masking
         length = t
-        T = self.total_len
+        T = self.seg_len
         o = np.zeros((T + 1, self.obs_dim), dtype=np.float32)
         a = np.zeros((T,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32)
         r = np.zeros((T,), dtype=np.float32)
@@ -117,7 +116,7 @@ class RecurrentReplayBuffer:
             pass
         
         # For padded steps, mark as terminal to prevent bootstrap
-        if length < self.total_len:
+        if length < self.seg_len:
             term[length:] = 1.0
 
         # Store segment in circular buffer using vectorized operations
@@ -153,22 +152,47 @@ class RecurrentReplayBuffer:
 
     def size(self) -> int:
         return self.num_stored_segments
-    def can_sample(self, batch_size: int) -> bool:
-        return self.num_stored_segments >= batch_size
-    def sample(self, batch_size: int) -> Dict[str, Any]:
-        assert self.num_stored_segments >= batch_size, f"Not enough segments in buffer: {self.num_stored_segments} < {batch_size}"
-        
-        # Vectorized uniform sampling - no loops!
-        idxs = np.random.choice(self.num_stored_segments, size=batch_size, replace=False)
-        
-        batch = {
-            'o': self.segments_o[idxs],                    # [B, T+1, obs_dim]
-            'a': self.segments_a[idxs],                    # [B, T, *action_shape]
-            'r': self.segments_r[idxs],                    # [B, T]
-            'term': self.segments_term[idxs],              # [B, T]
-            'trunc': self.segments_trunc[idxs],            # [B, T]
-            'm': self.segments_m[idxs],                    # [B, T]
-        }
+    def can_sample(self, batch_size: int, num_bptt: int) -> bool:
+        return self.num_stored_segments *(1+(self.seg_len - self.burn_in - num_bptt)/self.min_gap) >= batch_size
+    def sample(self, batch_size: int, num_bptt: int) -> Dict[str, Any] | None:
+        if not self.can_sample(batch_size, num_bptt):
+            return None
+        # 若有足够的segments，则直接均匀采样
+        if self.num_stored_segments >= batch_size:
+            # Vectorized sampling with advanced indexing.
+            # Window length for training steps (L), excluding the final +1 obs.
+            L = int(self.burn_in + num_bptt)
+            max_start = self.seg_len - L
+            if max_start < 0:
+                return None
+
+            # Sample segments (without replacement) and independent start indices (with replacement)
+            idxs = np.random.choice(self.num_stored_segments, size=batch_size, replace=False)
+            start_idxs = np.random.randint(0, max_start + 1, size=batch_size, dtype=np.int32)
+
+            # Build time indices for actions/rewards/etc. (length L) and observations (length L+1)
+            time_idx_a = start_idxs[:, None] + np.arange(L, dtype=np.int32)[None, :]
+            time_idx_o = start_idxs[:, None] + np.arange(L + 1, dtype=np.int32)[None, :]
+
+            # Gather with advanced indexing; trailing dims are preserved automatically
+            o = self.segments_o[idxs[:, None], time_idx_o]          # [B, L+1, obs_dim]
+            a = self.segments_a[idxs[:, None], time_idx_a]          # [B, L, *action_shape]
+            r = self.segments_r[idxs[:, None], time_idx_a]          # [B, L]
+            term = self.segments_term[idxs[:, None], time_idx_a]    # [B, L]
+            trunc = self.segments_trunc[idxs[:, None], time_idx_a]  # [B, L]
+            m = self.segments_m[idxs[:, None], time_idx_a]          # [B, L]
+
+            batch = {
+                'o': o,
+                'a': a,
+                'r': r,
+                'term': term,
+                'trunc': trunc,
+                'm': m,
+            }
+
+        else: #但一开始是也许是不足够的，需要反复从已有的segment中采样，直到达到batch_size
+            raise NotImplementedError("this case is not implemented, please make sure the buffer has enough segments")
         return batch
 
     def finalize_all_working(self):

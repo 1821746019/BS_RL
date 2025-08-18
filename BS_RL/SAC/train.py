@@ -313,16 +313,16 @@ class Trainer:
             action_shape = self.envs.single_action_space.shape
         # Calculate capacity in terms of segments rather than episodes
         # Assuming average episode length, convert buffer_size (in steps) to segments
-        total_len_per_segment = int(self.args.algo.num_bptt + max(self.args.algo.burn_in, 0))
-        capacity_segments = max(self.args.algo.buffer_size // max(total_len_per_segment, 1), 1)
+        capacity_segments = max(self.args.algo.buffer_size // self.args.algo.rb_seg_len, 1)
         self.rb = RecurrentReplayBuffer(
             obs_dim=obs_dim,
             action_shape=action_shape,
             is_discrete_action=self.is_discrete,
             capacity_segments=capacity_segments,
             num_envs=self.args.env.env_num,
-            seg_len=self.args.algo.num_bptt,
-            burn_in=self.args.algo.burn_in
+            seg_len=self.args.algo.rb_seg_len,
+            burn_in=self.args.algo.burn_in,
+            min_gap=self.args.algo.rb_min_gap
         )
 
     def _setup_evaluator(self):
@@ -360,16 +360,15 @@ class Trainer:
                 # Prepare rng on device inside jit to avoid host-device split cost
                 
                 # Determine if we should update and use actor
+                batch_data = self.rb.sample(self.args.algo.batch_size, self.args.algo.num_bptt)
                 do_update = (current_step > self.args.algo.learning_starts and 
-                           self.rb.can_sample(self.args.algo.batch_size) and 
+                           batch_data is not None and 
                            current_step % self.args.algo.update_frequency == 0)
                 do_target_update = False
-                batch_data = None
                 
                 if do_update:
                     update_cnt += 1
                     do_target_update = (current_step // self.args.algo.update_frequency) % max(self.args.algo.target_network_frequency // max(self.args.algo.update_frequency,1), 1) == 0
-                    batch_data = self.rb.sample(self.args.algo.batch_size)
                     # Combined action selection and agent update in single JIT call
                     actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_agent_then_get_action(
                         obs, self.hidden_h, self.hidden_c, batch_data, do_update, do_target_update,
