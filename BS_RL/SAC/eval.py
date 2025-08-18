@@ -16,20 +16,17 @@ class Evaluator:
                  eval_config: EvalConfig,
                  run_name_suffix: str,
                  seed: int,
-                 logger: MetricLogger = None):
+                 logger: MetricLogger):
         self.agent = agent
         self.env_config = env_config
         self.eval_config = eval_config
         self.run_name_suffix = run_name_suffix
         self.seed = seed
         self.logger = logger
-        self.eval_envs = None
-        trading_env_config = copy.deepcopy(self.env_config.trading_env_config)
-        trading_env_config.data_loader_config.mode = "test"
-        self.data_loader = DataLoader(trading_env_config.data_loader_config)
-        self.env_config.trading_env_config = trading_env_config
-        if self.eval_config.cache_env:
-            self.eval_envs = self._make_envs()
+        self.data_loader = DataLoader(DataLoaderConfig())
+        self.env_config.trading_env_config = copy.deepcopy(self.env_config.trading_env_config)
+        self.env_config.trading_env_config.mode = "test"
+        self.eval_envs = self._make_envs()
         
 
     def _make_envs(self):
@@ -54,10 +51,6 @@ class Evaluator:
         print(f"\nStarting evaluation for {num_episodes} episodes at step {current_train_step}...")
 
         eval_envs = self.eval_envs
-        envs_were_created_here = False
-        if eval_envs is None:
-            eval_envs = self._make_envs()
-            envs_were_created_here = True
         
         stats_aggregator = StatsAggregator(num_episodes) #防止默认大小64<num_episodes时下面的代码陷入死循环
         key_eval_actions = jax.random.PRNGKey(self.seed)
@@ -94,7 +87,7 @@ class Evaluator:
             if "final_info" in infos:
                 for i, info in enumerate(infos["final_info"]):
                     if info and "episode" in info:
-                        if i == 0 and self.logger:
+                        if i == 0:
                             self.logger.log_env0_episode(info["episode"], current_train_step, prefix="eval")
                         
                         stats_aggregator.add(info["episode"])
@@ -104,21 +97,14 @@ class Evaluator:
                         if len(stats_aggregator.buffer) >= num_episodes:
                             break
         
-        if envs_were_created_here:
-            eval_envs.close()
-
         eval_metrics = stats_aggregator.get_aggregated_stats()
 
         mean_return = eval_metrics.get("episode_return_mean", 0.0)
         std_return = eval_metrics.get("episode_return_std", 0.0)
         print(f"Evaluation finished: Mean Return={mean_return:.2f} +/- {std_return:.2f}")
-
-        if self.logger:
-            self.logger.log_stats(eval_metrics, current_train_step, "eval_buffered")
+        self.logger.log_stats(eval_metrics, current_train_step, "eval_buffered")
             
         return eval_metrics
 
     def close(self):
-        if self.eval_envs:
-            self.eval_envs.close()
-            self.eval_envs = None
+        self.eval_envs.close()

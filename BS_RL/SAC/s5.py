@@ -287,7 +287,7 @@ def make_DPLR_HiPPO(N):
 
 
 class SequenceLayer(nn.Module):
-    ssm: nn.Module
+    ssm: partial[S5SSM] | type[S5SSM]
     d_model: int
     activation: str = "gelu"
     do_norm: bool = True
@@ -296,7 +296,7 @@ class SequenceLayer(nn.Module):
     step_rescale: float = 1.0
 
     def setup(self):
-        self.seq = self.ssm(step_rescale=self.step_rescale)
+        self.seq = self.ssm(step_rescale=self.step_rescale) # type: ignore
         if self.activation in ["full_glu"]:
             self.out1 = nn.Dense(self.d_model)
             self.out2 = nn.Dense(self.d_model)
@@ -337,7 +337,7 @@ class SequenceLayer(nn.Module):
 
 
 class StackedEncoderModel(nn.Module):
-    ssm: nn.Module
+    ssm: partial[S5SSM] | type[S5SSM]
     d_model: int
     n_layers: int
     activation: str = "gelu"

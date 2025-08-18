@@ -102,8 +102,6 @@ class EvalConfig:
     """Frequency to run evaluation. If > 1, it's absolute steps. If (0, 1], it's fraction of total_timesteps."""
     eval_frequency_abs_steps: Optional[int] = None # Will be populated by Args.__post_init__
     """Absolute step frequency for running evaluation, resolved from eval_frequency."""
-    cache_env: bool = True
-    """Whether to cache the evaluation environment."""
     eval_episodes: int = 16
     """Number of episodes to run for evaluation during checkpointing."""
     greedy_actions: bool = True

@@ -1,4 +1,3 @@
-import copy
 from typing import Callable, Deque, List, Dict, Any, Optional, Iterable
 from TradingEnv import TradingEnv, TradingEnvConfig , DataLoader, Account
 from TradingEnv import wrappers, StartMode
@@ -23,7 +22,7 @@ class CallableFalse:
     def __call__(self, *args, **kwargs):
         """使对象可调用"""
         return None
-class Profiler:
+class Profiler: # type: ignore
     def __init__(self):
         print("pyinstrument Profiler is disabled")
     def __getattr__(self, name: str, /, cached_ret = CallableFalse()) -> CallableFalse:
@@ -126,10 +125,10 @@ class MetricLogger:
             log_dict = {f"{prefix}/{k}_env0": v for k, v in remapped.items()}
             wandb.log(log_dict, step=step)
 
-def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader, capture_video: bool=False, run_name: str=None,capture_episode_trigger: Callable[[int], bool]=None):
+def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader, capture_video: bool=False, run_name: str|None=None,capture_episode_trigger: Callable[[int], bool]|None=None):
    
     def thunk():
-        account = Account(config)
+        account = Account(config, tickers=data_loader.cfg.tickers)
         env = TradingEnv(config, data_loader, account)
         env = wrappers.EpisodeWrapper(env)
         env = wrappers.RandomWrapper(env)
@@ -140,10 +139,10 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
 
     return thunk
 
-def eval_env_maker(config: TradingEnvConfig, data_loader: DataLoader, capture_media: bool=True, run_name: str=None,capture_episode_trigger: Callable[[int], bool]=None):
+def eval_env_maker(config: TradingEnvConfig, data_loader: DataLoader, capture_media: bool=True, run_name: str|None=None,capture_episode_trigger: Callable[[int], bool]|None=None):
    
     def thunk():
-        account = Account(config)
+        account = Account(config, tickers=data_loader.cfg.tickers)
         env = TradingEnv(config, data_loader, account)
         env = wrappers.EpisodeWrapper(env)
         env = wrappers.RandomWrapper(env)
@@ -156,25 +155,25 @@ def eval_env_maker(config: TradingEnvConfig, data_loader: DataLoader, capture_me
 
     return thunk
 
-def gym_train_env_maker(env_id: str, seed: int, capture_video: bool = False, run_name: str = None):
+def gym_train_env_maker(env_id: str, seed: int, capture_video: bool = False, run_name: str|None = None):
     """创建标准gym环境的训练环境制造函数"""
     def thunk():
         env = gymnasium.make(env_id)
-        env = gymnasium.wrappers.RecordEpisodeStatistics(env)
+        env = gymnasium.wrappers.RecordEpisodeStatistics(env) # type: ignore
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
     return thunk
 
-def gym_eval_env_maker(env_id: str, seed: int, capture_video: bool = False, run_name: str = None):
+def gym_eval_env_maker(env_id: str, seed: int, capture_video: bool = False, run_name: str|None = None):
     """创建标准gym环境的评估环境制造函数"""
     def thunk():
         # 如果需要录制视频，指定render_mode
         render_mode = "rgb_array" if capture_video else None
         env = gymnasium.make(env_id, render_mode=render_mode)
-        env = gymnasium.wrappers.RecordEpisodeStatistics(env)
+        env = gymnasium.wrappers.RecordEpisodeStatistics(env) # type: ignore
         if capture_video and run_name:
-            env = gymnasium.wrappers.RecordVideo(env, f"videos/{run_name}")
+            env = gymnasium.wrappers.RecordVideo(env, f"videos/{run_name}") # type: ignore
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -184,7 +183,7 @@ class FiniteCheck(gymnasium.Wrapper):
     def step(self, action):
         obs, r, term, trunc, info = super().step(action)
         assert np.isfinite(obs).all(), "obs contains non-finite"
-        assert np.isfinite(r), "reward non-finite"
+        assert np.isfinite(float(r)), "reward non-finite"
         return obs, r, term, trunc, info
 
 

@@ -17,7 +17,6 @@ class GymTrainer(Trainer):
     
     def _setup_data_loader(self):
         # gym环境不需要DataLoader
-        self.data_loader = None
         print("Gym环境模式：跳过DataLoader设置")
     
     def _setup_environments(self):
@@ -49,11 +48,9 @@ class GymTrainer(Trainer):
                 self.logger = logger
                 self.env_id = env_id
                 self.seed = seed
-                self.eval_envs = None
                 self.data_loader = None  # gym环境不需要DataLoader
                 
-                if self.eval_config.cache_env:
-                    self.eval_envs = self._make_envs()
+                self.eval_envs = self._make_envs()
             
             def _make_envs(self):
                 print("创建评估环境...")

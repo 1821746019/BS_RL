@@ -24,12 +24,13 @@ import joblib
 from BS_RL.SAC.config import Args
 from BS_RL.SAC.common import profile, train_env_maker, MetricLogger, StatsAggregator, jax_profiler
 from BS_RL.SAC.networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
-from BS_RL.SAC.agent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState
+from BS_RL.SAC.agent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState, TrainState
 from BS_RL.SAC.eval import Evaluator
-from TradingEnv import DataLoader
+from TradingEnv import DataLoader, DataLoaderConfig
 from BS_RL.SAC.replay_buffer import RecurrentReplayBuffer
 import wandb
 import optax
+from typing import Optional
 
 def count_params(params):
     return sum(x.size for x in jax.tree_util.tree_leaves(params))
@@ -38,24 +39,24 @@ class Trainer:
     def __init__(self, args: Args):
         self.args = args
         self.num_devices = 1
-        self.run_name_suffix = None
-        self.wandb_run_name = None
-        self.base_output_dir = None
-        self.ckpt_dir = None
+        self.run_name_suffix: str
+        self.wandb_run_name: str
+        self.base_output_dir: Path
+        self.ckpt_dir: Path
         self.initial_global_step = 0
-        self.jax_key: jax.random.PRNGKey
+        self.jax_key: jax.Array
         self.envs: AsyncVectorEnv| SyncVectorEnv
-        self.agent = None
-        self.rb: RecurrentReplayBuffer = None
-        self.actor_state: TrainStateWithBatchStats = None
-        self.qf1_state: CriticTrainState = None
-        self.qf2_state: CriticTrainState = None
-        self.summarizer_state: SummarizerTrainState = None
-        self.log_alpha_state = None
-        self.current_alpha = None
-        self.data_loader = None
-        self.evaluator = None
-        self.logger = None
+        self.agent : RSACAgentDiscrete|RSACAgentContinuous
+        self.rb: RecurrentReplayBuffer
+        self.actor_state: TrainStateWithBatchStats
+        self.qf1_state: CriticTrainState
+        self.qf2_state: CriticTrainState
+        self.summarizer_state: SummarizerTrainState
+        self.log_alpha_state: Optional[TrainState]
+        self.current_alpha: jnp.ndarray
+        self.data_loader: DataLoader
+        self.evaluator: Evaluator
+        self.logger: MetricLogger
         self.is_discrete: bool
         self.hidden_h: jnp.ndarray  # [L, N, H]
         self.hidden_c: jnp.ndarray  # [L, N, H]
@@ -131,7 +132,6 @@ class Trainer:
             monitor_gym=True,
             save_code=True,
             resume="allow" if self.args.train.resume else None,
-            id=wandb.util.generate_id() if not self.restored_ckpt_path else None
         )
         self.logger = MetricLogger(wandb_track=True)
         flat_args_dict = {}
@@ -168,7 +168,7 @@ class Trainer:
 
     def _setup_data_loader(self):
         print("Initializing Trainer's DataLoader...")
-        self.data_loader = DataLoader(self.args.env.trading_env_config.data_loader_config)
+        self.data_loader = DataLoader(DataLoaderConfig())
         print("DataLoader initialized.")
 
     def _setup_environments(self):
@@ -188,12 +188,12 @@ class Trainer:
     def _setup_agent(self):
         obs_shape = self.envs.single_observation_space.shape
         if self.is_discrete:
-            action_dim = self.envs.single_action_space.n
+            action_dim = self.envs.single_action_space.n # type: ignore
             actor_model_cls, critic_model_cls = TradingActorDiscrete, TradingCriticDiscrete
             agent_cls = RSACAgentDiscrete
             print(f"Using RSAC-Share Discrete with action dim: {action_dim}")
         else:
-            action_dim = self.envs.single_action_space.shape[0]
+            action_dim = self.envs.single_action_space.shape[0] # type: ignore
             actor_model_cls, critic_model_cls = TradingActorContinuous, TradingCriticContinuous
             agent_cls = RSACAgentContinuous
             print(f"Using RSAC-Share Continuous with action dim: {action_dim}")
@@ -205,8 +205,8 @@ class Trainer:
             key=key_agent,
             network_config=self.args.network,
             algo_config=self.args.algo,
-            actor_model_cls=actor_model_cls,
-            critic_model_cls=critic_model_cls
+            actor_model_cls=actor_model_cls, # type: ignore
+            critic_model_cls=critic_model_cls # type: ignore
         )
         self.actor_state = self.agent.actor_state
         self.qf1_state = self.agent.qf1_state
@@ -294,8 +294,8 @@ class Trainer:
                     opt_state=loaded_contents['summarizer_opt_state'],
                     target_params=loaded_contents['summarizer_target_params']
                 )
-                if self.args.algo.autotune and 'log_alpha_params' in loaded_contents:
-                    self.log_alpha_state = self.log_alpha_state.replace(
+                if self.log_alpha_state and 'log_alpha_params' in loaded_contents:
+                    self.log_alpha_state = self.log_alpha_state.replace( 
                         params=loaded_contents['log_alpha_params'],
                         opt_state=loaded_contents['log_alpha_opt_state']
                     )
@@ -321,7 +321,7 @@ class Trainer:
             is_discrete_action=self.is_discrete,
             capacity_segments=capacity_segments,
             num_envs=self.args.env.env_num,
-            num_bptt=self.args.algo.num_bptt,
+            seg_len=self.args.algo.num_bptt,
             burn_in=self.args.algo.burn_in
         )
 
@@ -526,7 +526,7 @@ class Trainer:
                     wandb.log_artifact(artifact, aliases=aliases)
                 
                 rb_path = os.path.join(saved_path, "replay_buffer.joblib.gz")
-                joblib.dump(self.rb, rb_path, compress='gzip')
+                joblib.dump(self.rb, rb_path, compress=6)
 
                 prng_states = {
                     'random_state': random.getstate(),

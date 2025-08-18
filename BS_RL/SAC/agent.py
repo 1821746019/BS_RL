@@ -185,7 +185,7 @@ class RSACAgentBase:
     def __init__(self,
                  action_dim: int,
                  observation_space_shape,
-                 key: jax.random.PRNGKey,
+                 key: jax.Array,
                  network_config: NetworkConfig,
                  algo_config: AlgoConfig,
                  actor_model_cls,
@@ -219,10 +219,11 @@ class RSACAgentBase:
 
         self._create_models_and_states(key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls)
 
-        self.log_alpha_state = None
+        self.log_alpha_state: TrainState
         self.target_entropy = 0.0
         if algo_config.autotune:
-            self._setup_autotune(key_log_alpha)
+            log_alpha_params = {'log_alpha': jnp.zeros(())}
+            self.log_alpha_state = TrainState.create(apply_fn=None, params=log_alpha_params, tx=self.alpha_optimizer)
             self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
         else:
             self.current_alpha = jnp.array(algo_config.alpha)
@@ -242,13 +243,10 @@ class RSACAgentBase:
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls):
         raise NotImplementedError
 
-    def _setup_autotune(self, key_log_alpha):
-        log_alpha_params = {'log_alpha': jnp.zeros(())}
-        self.log_alpha_state = TrainState.create(apply_fn=None, params=log_alpha_params, tx=self.alpha_optimizer)
 
     def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
                       obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
-                      key: jax.random.PRNGKey, deterministic: bool = False):
+                      key: jax.Array, deterministic: bool = False):
         raise NotImplementedError
 
     def _update(self, states, batch, key):
@@ -262,7 +260,7 @@ class RSACAgentDiscrete(RSACAgentBase):
     def __init__(self,
                  action_dim: int,
                  observation_space_shape,
-                 key: jax.random.PRNGKey,
+                 key: jax.Array,
                  network_config: NetworkConfig,
                  algo_config: AlgoConfig,
                  actor_model_cls=TradingActorDiscrete,
@@ -317,7 +315,7 @@ class RSACAgentDiscrete(RSACAgentBase):
     @partial(jax_jit, static_argnums=(0, 7))
     def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
                       obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
-                      key: jax.random.PRNGKey, deterministic: bool = False):
+                      key: jax.Array, deterministic: bool = False):
         market = obs[..., :self.market_feature_dim]
         agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0))
         seq = market[:, None, :]
@@ -344,7 +342,7 @@ class RSACAgentDiscrete(RSACAgentBase):
                 summarizer_state: SummarizerTrainState,
                 log_alpha_state: Optional[TrainState],
                 batch: dict,
-                key: jax.random.PRNGKey):
+                key: jax.Array):
         o = batch['o']
         a = batch['a']
         r = batch['r']
@@ -508,7 +506,7 @@ class RSACAgentContinuous(RSACAgentBase):
     def __init__(self,
                  action_dim: int,
                  observation_space_shape,
-                 key: jax.random.PRNGKey,
+                 key: jax.Array,
                  network_config: NetworkConfig,
                  algo_config: AlgoConfig,
                  actor_model_cls=TradingActorContinuous,
@@ -561,7 +559,7 @@ class RSACAgentContinuous(RSACAgentBase):
     @partial(jax_jit, static_argnums=(0, 7))
     def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
                       obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
-                      key: jax.random.PRNGKey, deterministic: bool = False):
+                      key: jax.Array, deterministic: bool = False):
         market = obs[..., :self.market_feature_dim]
         agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0))
         seq = market[:, None, :]
@@ -590,7 +588,7 @@ class RSACAgentContinuous(RSACAgentBase):
                 summarizer_state: SummarizerTrainState,
                 log_alpha_state: Optional[TrainState],
                 batch: dict,
-                key: jax.random.PRNGKey):
+                key: jax.Array):
         o = batch['o']
         a = batch['a']  # [B, T, A]
         r = batch['r']
