@@ -67,7 +67,6 @@ class Trainer:
         self._handle_resume_and_directory_setup()
         self._setup_wandb()
         self._setup_seeds_and_keys()
-        self._setup_data_loader()
         self._setup_environments()
         self._setup_agent()
         self._setup_replay_buffer()
@@ -166,19 +165,14 @@ class Trainer:
             np.random.seed(self.args.train.seed)
             self.jax_key = jax.random.PRNGKey(self.args.train.seed)
 
-    def _setup_data_loader(self):
-        print("Initializing Trainer's DataLoader...")
-        self.data_loader = DataLoader(DataLoaderConfig())
-        print("DataLoader initialized.")
-
     def _setup_environments(self):
         print("Creating training environments...")
         vec_env_cls = AsyncVectorEnv if self.args.train.async_vector_env else SyncVectorEnv
         self.envs = vec_env_cls(
             [train_env_maker(
-                seed=self.args.train.seed + i,
                 config=self.args.env.trading_env_config,
-                data_loader=self.data_loader
+                data_loader_cfg=self.args.env.data_loader_cfg,
+                random_choose_tickers= self.args.env.env_num > 1
             ) for i in range(self.args.env.env_num)]
         )
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
@@ -336,7 +330,7 @@ class Trainer:
             eval_config=self.args.eval,
             run_name_suffix=self.run_name_suffix,
             logger=self.logger,
-            seed=self.args.train.seed + 1
+            seed=self.args.train.seed + self.args.env.env_num + 1 # 训练VectorEnv中env的seed依次是arange(seed, seed + i)
         )
 
     def train(self):

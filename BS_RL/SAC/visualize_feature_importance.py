@@ -151,11 +151,11 @@ def main(args: Args):
     print(f"Found latest checkpoint: {latest_ckpt_path_str}")
 
     # Setup environment to get observation and action specs
-    data_loader = DataLoader(args.env.trading_env_config.data_loader_config)
+    data_loader_cfg = DataLoaderConfig()
     env = train_env_maker(
         seed=args.env.seed,
         config=args.env.trading_env_config,
-        data_loader=data_loader
+        data_loader_cfg=data_loader_cfg
     )()
 
     obs_shape = env.observation_space.shape

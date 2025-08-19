@@ -7,7 +7,7 @@ import numpy as np
 from .agent import RSACAgent
 from .common import eval_env_maker, MetricLogger, StatsAggregator
 from .config import EnvConfig, EvalConfig
-from TradingEnv import DataLoader, DataLoaderConfig, TradingEnvConfig
+from TradingEnv import DataLoaderConfig, TradingEnvConfig
 
 class Evaluator:
     def __init__(self,
@@ -23,7 +23,6 @@ class Evaluator:
         self.run_name_suffix = run_name_suffix
         self.seed = seed
         self.logger = logger
-        self.data_loader = DataLoader(DataLoaderConfig())
         self.env_config.trading_env_config = copy.deepcopy(self.env_config.trading_env_config)
         self.env_config.trading_env_config.mode = "test"
         self.eval_envs = self._make_envs()
@@ -37,10 +36,8 @@ class Evaluator:
             [
                 eval_env_maker(
                     config=self.env_config.trading_env_config,
-                    data_loader=self.data_loader,
+                    data_loader_cfg=self.env_config.data_loader_cfg,
                     capture_media=self.eval_config.capture_media,
-                    run_name=f"{self.run_name_suffix}_eval",
-                    capture_episode_trigger=lambda e: e == 0
                 )
                 for i in range(self.eval_config.env_num)
             ]

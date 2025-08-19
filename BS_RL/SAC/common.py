@@ -1,5 +1,6 @@
+from copy import deepcopy
 from typing import Callable, Deque, List, Dict, Any, Optional, Iterable
-from TradingEnv import TradingEnv, TradingEnvConfig , DataLoader, Account
+from TradingEnv import TradingEnv, TradingEnvConfig , DataLoader, Account, DataLoaderConfig, DataLoaderWithCache, Ticker
 from TradingEnv import wrappers, StartMode
 import collections
 import jax
@@ -125,10 +126,13 @@ class MetricLogger:
             log_dict = {f"{prefix}/{k}_env0": v for k, v in remapped.items()}
             wandb.log(log_dict, step=step)
 
-def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader, capture_video: bool=False, run_name: str|None=None,capture_episode_trigger: Callable[[int], bool]|None=None):
-   
+def train_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, random_choose_tickers: bool=False):
+    if random_choose_tickers:
+        data_loader_cfg = deepcopy(data_loader_cfg)
+        data_loader_cfg.tickers = tuple(np.random.choice(list(Ticker), len(data_loader_cfg.tickers), replace=False))
     def thunk():
-        account = Account(config, tickers=data_loader.cfg.tickers)
+        data_loader = DataLoaderWithCache(data_loader_cfg)
+        account = Account(config, tickers=data_loader_cfg.tickers)
         env = TradingEnv(config, data_loader, account)
         env = wrappers.EpisodeWrapper(env)
         env = wrappers.RandomWrapper(env)
@@ -139,10 +143,11 @@ def train_env_maker(seed: int, config: TradingEnvConfig, data_loader: DataLoader
 
     return thunk
 
-def eval_env_maker(config: TradingEnvConfig, data_loader: DataLoader, capture_media: bool=True, run_name: str|None=None,capture_episode_trigger: Callable[[int], bool]|None=None):
+def eval_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, capture_media: bool=True):
    
     def thunk():
-        account = Account(config, tickers=data_loader.cfg.tickers)
+        data_loader = DataLoaderWithCache(data_loader_cfg)
+        account = Account(config, tickers=data_loader_cfg.tickers)
         env = TradingEnv(config, data_loader, account)
         env = wrappers.EpisodeWrapper(env)
         env = wrappers.RandomWrapper(env)

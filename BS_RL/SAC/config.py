@@ -2,7 +2,7 @@ import os
 os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache" # 设置缓存目录才会启用编译缓存，需在导入jax前设置
 from dataclasses import dataclass, field
 from typing import Optional, Union, Tuple, List
-from TradingEnv import TradingEnvConfig as TradingEnvConfig
+from TradingEnv import TradingEnvConfig as TradingEnvConfig, DataLoaderConfig
 from .nn.ResMLP import ResMLPConfig, ResidualStrategy, ActivationPosition, ResMLPPresets
 from .nn.ResNet1DEncoder import ResNet1DConfig, ResidualBlock1D
 import numpy as np
@@ -13,6 +13,7 @@ USE_JAX_PROFILER = os.getenv("USE_JAX_PROFILER", "false").lower() == "true"
 @dataclass
 class EnvConfig:
     trading_env_config: TradingEnvConfig = field(default_factory=TradingEnvConfig)
+    data_loader_cfg: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     env_num: int = 1 # sac_atari.py uses 1 env
     """the number of parallel game environments"""
 

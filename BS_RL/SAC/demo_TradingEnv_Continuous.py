@@ -16,7 +16,8 @@ if __name__ == "__main__":
     use_SGD = False
     total_timesteps = int(100e6) 
     batch_size = 1
-    env_num = 1  # SAC通常使用单环境
+    env_num = 96
+    async_vector_env = True if env_num > 1 else False
     eval_env_num = 1
     exp_name = f"env_num({env_num})_window({window_size})_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
     eval_episodes = 1
@@ -35,7 +36,7 @@ if __name__ == "__main__":
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,  # 首次运行设为False
             save_dir=f"runs/SAC_{env_id}",
-            async_vector_env=False,  # 单环境无需异步
+            async_vector_env=async_vector_env,
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,
