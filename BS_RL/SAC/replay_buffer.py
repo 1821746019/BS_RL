@@ -152,47 +152,59 @@ class RecurrentReplayBuffer:
 
     def size(self) -> int:
         return self.num_stored_segments
-    def can_sample(self, batch_size: int, num_bptt: int) -> bool:
-        return self.num_stored_segments *(1+(self.seg_len - self.burn_in - num_bptt)/self.min_gap) >= batch_size
+    def can_sample_many(self, batch_size: int, num_bptt: int, num_batches: int = 1) -> bool:
+        return self.num_stored_segments *(1+(self.seg_len - self.burn_in - num_bptt)/self.min_gap) >= batch_size * num_batches
     def sample(self, batch_size: int, num_bptt: int) -> Dict[str, Any] | None:
-        if not self.can_sample(batch_size, num_bptt):
+        return self.sample_many(batch_size, num_bptt, num_batches=1, remove_K_dim_if_one=True)
+
+    def sample_many(self, batch_size: int, num_bptt: int, num_batches: int, remove_K_dim_if_one: bool = False) -> Dict[str, Any] | None:
+        """
+        Vectorized sampling of multiple independent batches to feed multiple update steps per JIT call.
+        Returns a dict of arrays stacked on a leading dimension K=num_batches.
+        Shapes:
+          - o: [K, B, L+1, obs_dim]
+          - a: [K, B, L, *action_shape]
+          - r, term, trunc, m: [K, B, L]
+        """
+        if num_batches <= 0:
             return None
-        # 若有足够的segments，则直接均匀采样
-        if self.num_stored_segments >= batch_size:
-            # Vectorized sampling with advanced indexing.
-            # Window length for training steps (L), excluding the final +1 obs.
-            L = int(self.burn_in + num_bptt)
-            max_start = self.seg_len - L
-            if max_start < 0:
-                return None
+        if not self.can_sample_many(batch_size, num_bptt, num_batches):
+            return None
+        # Window length for training steps (L), excluding the final +1 obs.
+        L = int(self.burn_in + num_bptt)
+        max_start = self.seg_len - L
+        if max_start < 0:
+            return None
 
-            # Sample segments (without replacement) and independent start indices (with replacement)
-            idxs = np.random.choice(self.num_stored_segments, size=batch_size, replace=False)
-            start_idxs = np.random.randint(0, max_start + 1, size=batch_size, dtype=np.int32)
-
-            # Build time indices for actions/rewards/etc. (length L) and observations (length L+1)
-            time_idx_a = start_idxs[:, None] + np.arange(L, dtype=np.int32)[None, :]
-            time_idx_o = start_idxs[:, None] + np.arange(L + 1, dtype=np.int32)[None, :]
-
-            # Gather with advanced indexing; trailing dims are preserved automatically
-            o = self.segments_o[idxs[:, None], time_idx_o]          # [B, L+1, obs_dim]
-            a = self.segments_a[idxs[:, None], time_idx_a]          # [B, L, *action_shape]
-            r = self.segments_r[idxs[:, None], time_idx_a]          # [B, L]
-            term = self.segments_term[idxs[:, None], time_idx_a]    # [B, L]
-            trunc = self.segments_trunc[idxs[:, None], time_idx_a]  # [B, L]
-            m = self.segments_m[idxs[:, None], time_idx_a]          # [B, L]
-
-            batch = {
-                'o': o,
-                'a': a,
-                'r': r,
-                'term': term,
-                'trunc': trunc,
-                'm': m,
-            }
-
-        else: #但一开始是也许是不足够的，需要反复从已有的segment中采样，直到达到batch_size
+        # 若有足够的segments，则不放回采样；不足时保持与 sample 行为一致，抛错
+        if self.num_stored_segments < batch_size:
             raise NotImplementedError("this case is not implemented, please make sure the buffer has enough segments")
+        # Draw indices for [K, B]
+        idxs = np.random.choice(self.num_stored_segments, size=(num_batches, batch_size), replace=False)
+        start_idxs = np.random.randint(0, max_start + 1, size=(num_batches, batch_size), dtype=np.int32)
+
+        # Build time indices
+        time_range_a = np.arange(L, dtype=np.int32)[None, None, :]
+        time_range_o = np.arange(L + 1, dtype=np.int32)[None, None, :]
+        time_idx_a = start_idxs[..., None] + time_range_a  # [K,B,L]
+        time_idx_o = start_idxs[..., None] + time_range_o  # [K,B,L+1]
+
+        # Advanced indexing with broadcasting
+        o = self.segments_o[idxs[..., None], time_idx_o]          # [K,B,L+1, obs_dim]
+        a = self.segments_a[idxs[..., None], time_idx_a]          # [K,B,L, *A]
+        r = self.segments_r[idxs[..., None], time_idx_a]          # [K,B,L]
+        term = self.segments_term[idxs[..., None], time_idx_a]    # [K,B,L]
+        trunc = self.segments_trunc[idxs[..., None], time_idx_a]  # [K,B,L]
+        m = self.segments_m[idxs[..., None], time_idx_a]          # [K,B,L]
+        remove_K_dim = num_batches == 1 and remove_K_dim_if_one
+        batch = {
+            'o': o if not remove_K_dim else o[0],
+            'a': a if not remove_K_dim else a[0],
+            'r': r if not remove_K_dim else r[0],
+            'term': term if not remove_K_dim else term[0],
+            'trunc': trunc if not remove_K_dim else trunc[0],
+            'm': m if not remove_K_dim else m[0],
+        }
         return batch
 
     def finalize_all_working(self):

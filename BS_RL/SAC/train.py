@@ -72,7 +72,6 @@ class Trainer:
         self._setup_replay_buffer()
         self._setup_evaluator()
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
-
     def _setup_paths_and_run_name(self):
         run_name_suffix = f"{self.args.train.exp_name}__{self.args.train.seed}__{int(time.time())}"
         if self.args.train.save_dir:
@@ -354,20 +353,21 @@ class Trainer:
                 # Prepare rng on device inside jit to avoid host-device split cost
                 
                 # Determine if we should update and use actor
-                batch_data = self.rb.sample(self.args.algo.batch_size, self.args.algo.num_bptt)
                 do_update = (current_step > self.args.algo.learning_starts and 
-                           batch_data is not None and 
-                           current_step % self.args.algo.update_frequency == 0)
+                           self.rb.can_sample_many(self.args.algo.batch_size, self.args.algo.num_bptt, self.args.algo.updates_per_call) and current_step % self.args.algo.update_frequency == 0)
                 do_target_update = False
                 
                 if do_update:
                     update_cnt += 1
                     do_target_update = (current_step // self.args.algo.update_frequency) % max(self.args.algo.target_network_frequency // max(self.args.algo.update_frequency,1), 1) == 0
-                    # Combined action selection and agent update in single JIT call
+                    # Prepare multiple batches for multiple updates per JIT call
+                    updates_per_call = max(1, int(self.args.algo.updates_per_call))
+                    batches = self.rb.sample_many(self.args.algo.batch_size, self.args.algo.num_bptt, updates_per_call)
+                    # Combined action selection and multi-update in single JIT call
                     actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_agent_then_get_action(
-                        obs, self.hidden_h, self.hidden_c, batch_data, do_update, do_target_update,
+                        obs, self.hidden_h, self.hidden_c, batches, do_update, do_target_update,
                         self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state,
-                        self.log_alpha_state, self.jax_key,
+                        self.log_alpha_state, self.jax_key, updates_per_call,
                         deterministic=False
                     )
                     # Update states

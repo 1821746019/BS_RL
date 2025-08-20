@@ -39,6 +39,8 @@ class AlgoConfig:
     """the frequency of training updates in environment steps"""
     target_network_frequency: int = 8000 # In environment steps
     """the frequency of updates for the target networks"""
+    updates_per_call: int = 1
+    """number of gradient updates to perform inside a single JIT call to reduce host-device overhead"""
     alpha: float = 0.2
     """Entropy regularization coefficient."""
     autotune: bool = True

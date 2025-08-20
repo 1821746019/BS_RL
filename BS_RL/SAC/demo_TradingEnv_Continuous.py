@@ -14,7 +14,7 @@ if __name__ == "__main__":
     env_id = "TradingEnv"
     window_size = 1 # 防止过拟合，用1
     use_SGD = False
-    total_timesteps = int(100e6) 
+    total_timesteps = int(10e6) 
     batch_size = 1
     env_num = 96
     async_vector_env = True if env_num > 1 else False
@@ -59,7 +59,7 @@ if __name__ == "__main__":
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
-            buffer_size=int(1e6),  # 大缓冲区有助于稳定训练
+            buffer_size=int(3e6),  # 大缓冲区有助于稳定训练
             learning_starts=learning_starts,
             batch_size=batch_size,
             update_frequency=1,  # 每步都更新

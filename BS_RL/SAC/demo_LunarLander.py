@@ -143,7 +143,11 @@ if __name__ == "__main__":
             autotune=True,  # 自动调节熵系数
             target_entropy_scale=1.0,  # 连续动作的标准设置
             adam_eps=1e-4,
+            rb_seg_len=num_bptt,
             num_bptt=num_bptt,
+            burn_in=0,
+            rb_min_gap=1,
+            updates_per_call=8,
         ),
         wandb=WandbConfig(
             track=os.getenv("USE_WANDB", "true").lower() == "true",

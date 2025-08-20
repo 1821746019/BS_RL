@@ -457,15 +457,55 @@ class RSACAgentDiscrete(RSACAgentBase):
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax_jit, static_argnums=(0, 5, 6, 13))
-    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batch: dict, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, deterministic: bool = False):
-        """Combined action selection and agent update to reduce CPU-TPU communication"""
+    @partial(jax_jit, static_argnums=(0, 5, 6, 13, 14))
+    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
+        """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
+
+        batches: if do_update, a dict with leading dim K=updates_per_call; otherwise can be None or a single batch.
+        """
         # Split rng on device to avoid host-device traffic
         key_action, key_update, new_key = jax.random.split(key, 3)
         
-        # 1. First perform agent update if requested
+        # 1. First perform agent update(s) if requested
         if do_update:
-            updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, current_alpha, metrics = self._update(actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, batch, key_update)
+            updated_actor_state, updated_qf1_state, updated_qf2_state = actor_state, qf1_state, qf2_state
+            updated_summarizer_state, updated_log_alpha_state = summarizer_state, log_alpha_state
+            critic_loss_sum = jnp.array(0.0)
+            actor_loss_sum = jnp.array(0.0)
+            alpha_loss_sum = jnp.array(0.0)
+            entropy_sum = jnp.array(0.0)
+            qf1_mean_sum = jnp.array(0.0)
+            qf2_mean_sum = jnp.array(0.0)
+            for i in range(updates_per_call):
+                if batches is None:
+                    break
+                b = {
+                    'o': batches['o'][i],
+                    'a': batches['a'][i],
+                    'r': batches['r'][i],
+                    'term': batches['term'][i],
+                    'trunc': batches['trunc'][i],
+                    'm': batches['m'][i],
+                }
+                updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, current_alpha, metric_i = self._update(
+                    updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, b, key_update
+                )
+                critic_loss_sum += metric_i['critic_loss']
+                actor_loss_sum += metric_i['actor_loss']
+                alpha_loss_sum += metric_i['alpha_loss']
+                entropy_sum += metric_i['entropy']
+                qf1_mean_sum += metric_i['qf1_value_mean']
+                qf2_mean_sum += metric_i['qf2_value_mean']
+            kf = jnp.maximum(1, updates_per_call)
+            metrics = {
+                'critic_loss': critic_loss_sum / kf,
+                'actor_loss': actor_loss_sum / kf,
+                'alpha_loss': alpha_loss_sum / kf,
+                'alpha': current_alpha,
+                'entropy': entropy_sum / kf,
+                'qf1_value_mean': qf1_mean_sum / kf,
+                'qf2_value_mean': qf2_mean_sum / kf,
+            }
         else:
             updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state = actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state
             current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha)
@@ -707,15 +747,58 @@ class RSACAgentContinuous(RSACAgentBase):
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax_jit, static_argnums=(0, 5, 6, 13))
-    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batch, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, deterministic: bool = False):
-        """Combined action selection and agent update to reduce CPU-TPU communication"""
+    @partial(jax_jit, static_argnums=(0, 5, 6, 13, 14))
+    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
+        """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
+
+        batches: if do_update, a dict with leading dim K=updates_per_call; otherwise can be None or a single batch.
+        """
         # Split rng on device to avoid host-device traffic
         key_action, key_update, new_key = jax.random.split(key, 3)
         
-        # 1. First perform agent update if requested
+        # 1. First perform agent update(s) if requested
         if do_update:
-            updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, current_alpha, metrics = self._update(actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, batch, key_update)
+            updated_actor_state, updated_qf1_state, updated_qf2_state = actor_state, qf1_state, qf2_state
+            updated_summarizer_state, updated_log_alpha_state = summarizer_state, log_alpha_state
+            # metrics accumulator
+            critic_loss_sum = jnp.array(0.0)
+            actor_loss_sum = jnp.array(0.0)
+            alpha_loss_sum = jnp.array(0.0)
+            entropy_sum = jnp.array(0.0)
+            qf1_mean_sum = jnp.array(0.0)
+            qf2_mean_sum = jnp.array(0.0)
+            # Iterate K updates; batches has shape [K, ...]
+            for i in range(updates_per_call):
+                if batches is None:
+                    break
+                # Per-update batch slicing along leading K
+                b = {
+                    'o': batches['o'][i],
+                    'a': batches['a'][i],
+                    'r': batches['r'][i],
+                    'term': batches['term'][i],
+                    'trunc': batches['trunc'][i],
+                    'm': batches['m'][i],
+                }
+                updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, current_alpha, metric_i = self._update(
+                    updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state, b, key_update
+                )
+                critic_loss_sum += metric_i['critic_loss']
+                actor_loss_sum += metric_i['actor_loss']
+                alpha_loss_sum += metric_i['alpha_loss']
+                entropy_sum += metric_i['entropy']
+                qf1_mean_sum += metric_i['qf1_value_mean']
+                qf2_mean_sum += metric_i['qf2_value_mean']
+            kf = jnp.maximum(1, updates_per_call)
+            metrics = {
+                'critic_loss': critic_loss_sum / kf,
+                'actor_loss': actor_loss_sum / kf,
+                'alpha_loss': alpha_loss_sum / kf,
+                'alpha': current_alpha,
+                'entropy': entropy_sum / kf,
+                'qf1_value_mean': qf1_mean_sum / kf,
+                'qf2_value_mean': qf2_mean_sum / kf,
+            }
         else:
             updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state = actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state
             current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha)
