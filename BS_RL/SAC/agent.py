@@ -312,7 +312,7 @@ class RSACAgentDiscrete(RSACAgentBase):
         # target entropy for discrete
         self.target_entropy = -self.algo_config.target_entropy_scale * jnp.log(1.0 / self.action_dim)
 
-    @partial(jax_jit, static_argnums=(0, 7))
+    @partial(jax_jit, static_argnums=(0,))
     def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
                       obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
                       key: jax.Array, deterministic: bool = False):
@@ -323,10 +323,12 @@ class RSACAgentDiscrete(RSACAgentBase):
         summary_t = outputs[:, -1, :]
         x = jnp.concatenate([summary_t, agent_feat], axis=-1)
         logits = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x, deterministic=True)
-        if deterministic:
-            actions = jnp.argmax(logits, axis=-1)
-        else:
-            actions = jax.random.categorical(key, logits, axis=-1)
+        det_flag = jnp.asarray(deterministic)
+        def take_argmax(k):
+            return jnp.argmax(logits, axis=-1)
+        def take_sample(k):
+            return jax.random.categorical(k, logits, axis=-1)
+        actions = jax.lax.cond(det_flag, take_argmax, take_sample, key)
         return actions, new_h, new_c
 
     def _split_obs(self, o_seq: jnp.ndarray):
@@ -457,7 +459,7 @@ class RSACAgentDiscrete(RSACAgentBase):
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax_jit, static_argnums=(0, 5, 6, 13, 14))
+    @partial(jax_jit, static_argnums=(0, 5, 6, 13))
     def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
 
@@ -528,17 +530,7 @@ class RSACAgentDiscrete(RSACAgentBase):
             final_qf1_state, final_qf2_state, final_summarizer_state = updated_qf1_state, updated_qf2_state, updated_summarizer_state
         
         # 2. Then perform action selection using potentially updated states
-        market = obs[..., :self.market_feature_dim]
-        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0))
-        seq = market[:, None, :]
-        outputs, (new_h, new_c) = self.summarizer.apply({'params': final_summarizer_state.params}, seq, (hidden_h, hidden_c))
-        summary_t = outputs[:, -1, :]
-        x = jnp.concatenate([summary_t, agent_feat], axis=-1)
-        logits = self.actor_model.apply({'params': updated_actor_state.params, 'batch_stats': updated_actor_state.batch_stats}, x, deterministic=True)
-        if deterministic:
-            actions = jnp.argmax(logits, axis=-1)
-        else:
-            actions = jax.random.categorical(key_action, logits, axis=-1)
+        actions, new_h, new_c = self.select_action(updated_actor_state, final_summarizer_state.params, obs, hidden_h, hidden_c, key_action, deterministic=deterministic)
         
         return actions, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, final_summarizer_state, updated_log_alpha_state, metrics, new_key
 
@@ -596,7 +588,7 @@ class RSACAgentContinuous(RSACAgentBase):
         self.train_summarizer = bool(self.network_config.train_summarizer)
         self.target_entropy = -float(self.action_dim)
 
-    @partial(jax_jit, static_argnums=(0, 7))
+    @partial(jax_jit, static_argnums=(0,))
     def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
                       obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
                       key: jax.Array, deterministic: bool = False):
@@ -608,10 +600,12 @@ class RSACAgentContinuous(RSACAgentBase):
         x = jnp.concatenate([summary_t, agent_feat], axis=-1)
         mean, log_std = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x, deterministic=True)
         dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
-        if deterministic:
-            action = dist.mean()
-        else:
-            action = dist.sample(seed=key)
+        det_flag = jnp.asarray(deterministic)
+        def take_mean(k):
+            return dist.mean()
+        def take_sample(k):
+            return dist.sample(seed=k)
+        action = jax.lax.cond(det_flag, take_mean, take_sample, key)
         squashed = jnp.tanh(action)
         return squashed, new_h, new_c
 
@@ -747,7 +741,7 @@ class RSACAgentContinuous(RSACAgentBase):
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax_jit, static_argnums=(0, 5, 6, 13, 14))
+    @partial(jax_jit, static_argnums=(0, 5, 6, 13))
     def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
 
@@ -821,19 +815,7 @@ class RSACAgentContinuous(RSACAgentBase):
             final_qf1_state, final_qf2_state, final_summarizer_state = updated_qf1_state, updated_qf2_state, updated_summarizer_state
         
         # 2. Then perform action selection using potentially updated states
-        market = obs[..., :self.market_feature_dim]
-        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0))
-        seq = market[:, None, :]
-        outputs, (new_h, new_c) = self.summarizer.apply({'params': final_summarizer_state.params}, seq, (hidden_h, hidden_c))
-        summary_t = outputs[:, -1, :]
-        x = jnp.concatenate([summary_t, agent_feat], axis=-1)
-        mean, log_std = self.actor_model.apply({'params': updated_actor_state.params, 'batch_stats': updated_actor_state.batch_stats}, x, deterministic=True)
-        dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
-        if deterministic:
-            action = dist.mean()
-        else:
-            action = dist.sample(seed=key_action)
-        squashed = jnp.tanh(action)
+        squashed, new_h, new_c = self.select_action(updated_actor_state, final_summarizer_state.params, obs, hidden_h, hidden_c, key_action, deterministic=deterministic)
         
         return squashed, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, final_summarizer_state, updated_log_alpha_state, metrics, new_key
 
