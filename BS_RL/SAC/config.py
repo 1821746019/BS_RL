@@ -56,11 +56,11 @@ class AlgoConfig:
     # RSAC-share specific
     rb_seg_len: int = int(1440*3)
     """Segment length for replay buffer."""
-    num_bptt: int = 1440
-    """Truncated BPTT sequence length (T). Also the fixed segment length for storage."""
+    train_unroll_steps: int = 1440
+    """sequence length for calc loss"""
     burn_in: int = 1440 # 1440m = 1d
     """Number of prefix steps used only to roll LSTM hidden state (excluded from loss)."""
-    rb_min_gap: int = 60
+    rb_min_gap: int = 1
     """Minimum gap between sequences in the same segment."""
 @dataclass
 class WandbConfig:

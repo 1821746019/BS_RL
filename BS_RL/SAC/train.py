@@ -355,7 +355,7 @@ class Trainer:
                 
                 # Determine if we should update and use actor
                 do_update = (current_step > self.args.algo.learning_starts and 
-                           self.rb.can_sample_many(self.args.algo.batch_size, self.args.algo.num_bptt, self.args.algo.updates_per_call) and current_step % self.args.algo.update_frequency == 0)
+                           self.rb.can_sample_many(self.args.algo.batch_size, self.args.algo.train_unroll_steps, self.args.algo.updates_per_call) and current_step % self.args.algo.update_frequency == 0)
                 do_target_update = False
                 
                 if do_update:
@@ -363,7 +363,7 @@ class Trainer:
                     do_target_update = (current_step // self.args.algo.update_frequency) % max(self.args.algo.target_network_frequency // max(self.args.algo.update_frequency,1), 1) == 0
                     # Prepare multiple batches for multiple updates per JIT call
                     updates_per_call = max(1, int(self.args.algo.updates_per_call))
-                    batches = self.rb.sample_many(self.args.algo.batch_size, self.args.algo.num_bptt, updates_per_call)
+                    batches = self.rb.sample_many(self.args.algo.batch_size, self.args.algo.train_unroll_steps, updates_per_call)
                     # Combined action selection and multi-update in single JIT call
                     actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_agent_then_get_action(
                         obs, self.hidden_h, self.hidden_c, batches, do_update, do_target_update,

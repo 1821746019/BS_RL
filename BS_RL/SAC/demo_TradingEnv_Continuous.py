@@ -15,7 +15,7 @@ if __name__ == "__main__":
     window_size = 1 # 防止过拟合，用1
     use_SGD = False
     total_timesteps = int(10e6) 
-    env_num = 32
+    env_num = 1
     batch_size = 4
     updates_per_call = 8
     async_vector_env = True if env_num > 1 else False
@@ -23,10 +23,10 @@ if __name__ == "__main__":
     async_vector_env_eval = True if eval_env_num > 1 else False
     exp_name = f"env_num({env_num})_window({window_size})_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
     eval_episodes = 1
-    
+    train_unroll_steps = 16
     is_test = total_timesteps == int(1e6)
     learning_starts = 1000 if is_test else 10000
-    ckpt_save_frequency = 0.1 if is_test else 0.02
+    ckpt_save_frequency = 0.1 if is_test else 0.1
     eval_frequency = 0.1 if is_test else 0.1 
     
     # 针对TradingEnv优化的网络配置
@@ -45,7 +45,7 @@ if __name__ == "__main__":
             greedy_actions=True,  # 评估时使用确定性动作
             env_num=eval_env_num,
             async_vector_env=async_vector_env_eval,
-            capture_media=True,  # 记录视频
+            capture_media=True,
         ),
         env=EnvConfig(
             trading_env_config=TradingEnvConfig(),
@@ -62,7 +62,7 @@ if __name__ == "__main__":
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
-            buffer_size=int(3e6),  # 大缓冲区有助于稳定训练
+            buffer_size=int(1e6),  # 大缓冲区有助于稳定训练
             learning_starts=learning_starts,
             batch_size=batch_size,
             update_frequency=1,  # 每步都更新
@@ -75,7 +75,8 @@ if __name__ == "__main__":
             target_entropy_scale=1.0,  # 连续动作的标准设置
             adam_eps=1e-4,
             use_SGD=use_SGD,
-            updates_per_call=updates_per_call
+            updates_per_call=updates_per_call,
+            train_unroll_steps=train_unroll_steps
         ),
         wandb=WandbConfig(
             track=True,

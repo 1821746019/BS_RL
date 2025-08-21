@@ -82,7 +82,7 @@ if __name__ == "__main__":
     env_num = 1  # SAC通常使用单环境
     eval_env_num = 10
     eval_episodes = 10
-    num_bptt = 64
+    train_unroll_steps = 64
     is_test = total_timesteps != int(1e6)
     learning_starts = 28400 if is_test else 10000 # 28400用于测试rb性能是否会随segment_len的增大而下降
     ckpt_save_frequency = 0
@@ -143,8 +143,8 @@ if __name__ == "__main__":
             autotune=True,  # 自动调节熵系数
             target_entropy_scale=1.0,  # 连续动作的标准设置
             adam_eps=1e-4,
-            rb_seg_len=num_bptt,
-            num_bptt=num_bptt,
+            rb_seg_len=train_unroll_steps,
+            train_unroll_steps=train_unroll_steps,
             burn_in=0,
             rb_min_gap=1,
             updates_per_call=8,
