@@ -76,8 +76,8 @@ class Evaluator:
                 deterministic=self.eval_config.greedy_actions
             )
             actions_numpy = np.array(jax.device_get(actions_jax))
-            hidden_h = jax.device_get(new_h)
-            hidden_c = jax.device_get(new_c)
+            hidden_h = new_h
+            hidden_c = new_c
 
             next_obs, rewards, terminations, truncations, infos = eval_envs.step(actions_numpy)
             obs = next_obs
