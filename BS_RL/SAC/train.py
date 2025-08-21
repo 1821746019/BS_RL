@@ -6,7 +6,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
 warnings.filterwarnings("ignore", category=UserWarning, module="absl")
 import copy
 import random
-import time
+from datetime import datetime, timezone, timedelta
 from dataclasses import asdict
 from pathlib import Path
 import shutil
@@ -73,7 +73,7 @@ class Trainer:
         self._setup_evaluator()
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
     def _setup_paths_and_run_name(self):
-        run_name_suffix = f"{self.args.train.exp_name}__{self.args.train.seed}__{int(time.time())}"
+        run_name_suffix = f"{self.args.train.exp_name}__{self.args.train.seed}__{datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S UTC+8')}"
         if self.args.train.save_dir:
             self.base_output_dir = Path(self.args.train.save_dir)
             self.wandb_run_name = f"{run_name_suffix}__{self.base_output_dir.name}__{os.environ.get('TUNNEL_NAME', 'unknownDevice')}" if self.base_output_dir.name else run_name_suffix
@@ -171,6 +171,7 @@ class Trainer:
             [train_env_maker(
                 config=self.args.env.trading_env_config,
                 data_loader_cfg=self.args.env.data_loader_cfg,
+                feat_getter=self.args.env.feat_getter,
                 random_choose_tickers= self.args.env.env_num > 1
             ) for i in range(self.args.env.env_num)]
         )
@@ -344,7 +345,7 @@ class Trainer:
         profiler = Profiler()
         jax_profiler.start_trace(self.base_output_dir / "trace")
         update_cnt = 0
-        with tqdm(initial=start_iteration, total=total_iterations, desc="Training") as pbar:
+        with tqdm(initial=self.initial_global_step, total=self.args.algo.total_timesteps, desc="Training") as pbar:
             for loop_iter in range(start_iteration, total_iterations):
                 if update_cnt == 1 and not profiler.is_running :
                     profiler.start() # 首次更新，tpu预热完毕，开始profile
@@ -424,7 +425,7 @@ class Trainer:
                                 self.logger.log_env0_episode(info_item['episode'], current_step, prefix="train")
 
                 if metrics and current_step % (self.args.train.log_freq) == 0:
-                    sps = int(pbar.format_dict['rate'] * self.args.env.env_num) # iter/s * env_num = step/s
+                    sps = int(pbar.format_dict['rate'])
                     pbar_postfix["SPS"] = sps
                     log_data = {}
                     metrics["SPS"] = sps
@@ -444,7 +445,7 @@ class Trainer:
                 self._save_checkpoint(current_step, next_step)
 
                 pbar.set_postfix(pbar_postfix, refresh=False) #不立即刷新提升性能 4.73/37.15
-                pbar.update(1)
+                pbar.update(self.args.env.env_num)
         profiler.stop()
         profiler.print()
         jax_profiler.stop_trace()

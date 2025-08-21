@@ -1,4 +1,5 @@
 from copy import deepcopy
+import dataclasses
 from typing import Callable, Deque, List, Dict, Any, Optional, Iterable
 from TradingEnv import TradingEnv, TradingEnvConfig , DataLoader, Account, DataLoaderConfig, DataLoaderWithCache, Ticker
 from TradingEnv import wrappers, StartMode
@@ -8,6 +9,7 @@ import numpy as np
 import wandb
 import gymnasium
 from BS_RL.SAC.config import ENABLE_PROFILE, USE_JAX_PROFILER
+from TradingEnv.feature import norm_OHLCV
 jax_jit: Any = jax.jit # 为了让调用jitWrapped函数时IDE能提供正常的IntelliSense
 
 try:
@@ -126,16 +128,17 @@ class MetricLogger:
             log_dict = {f"{prefix}/{k}_env0": v for k, v in remapped.items()}
             wandb.log(log_dict, step=step)
 
-def train_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, random_choose_tickers: bool=False):
+def train_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, feat_getter: Callable, random_choose_tickers: bool=False):
     if random_choose_tickers:
-        data_loader_cfg = deepcopy(data_loader_cfg)
-        data_loader_cfg.tickers = tuple(np.random.choice(list(Ticker), len(data_loader_cfg.tickers), replace=False))
+        tickers_new = tuple(np.random.choice(list(Ticker), len(data_loader_cfg.tickers), replace=False))
+        data_loader_cfg = dataclasses.replace(data_loader_cfg, tickers=tickers_new)
     def thunk():
-        data_loader = DataLoaderWithCache(data_loader_cfg)
+        data_loader = DataLoaderWithCache(data_loader_cfg, feat_getter)
         account = Account(config, tickers=data_loader_cfg.tickers)
         env = TradingEnv(config, data_loader, account)
         env = wrappers.EpisodeWrapper(env)
         env = wrappers.RandomWrapper(env)
+        env = wrappers.LossLimit(env)
         env = wrappers.ObsWrapper(env)
         # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
         # env = FiniteCheck(env)
@@ -143,16 +146,17 @@ def train_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig,
 
     return thunk
 
-def eval_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, capture_media: bool=True):
+def eval_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, feat_getter: Callable, capture_media: bool=True):
    
     def thunk():
-        data_loader = DataLoaderWithCache(data_loader_cfg)
+        data_loader = DataLoaderWithCache(data_loader_cfg, feat_getter)
         account = Account(config, tickers=data_loader_cfg.tickers)
         env = TradingEnv(config, data_loader, account)
         env = wrappers.EpisodeWrapper(env)
         env = wrappers.RandomWrapper(env)
         if capture_media:
             env = wrappers.EpisodeRender(env)
+        env = wrappers.LossLimit(env)
         env = wrappers.ObsWrapper(env)
         # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
         # env = FiniteCheck(env)

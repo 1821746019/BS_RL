@@ -15,24 +15,25 @@ if __name__ == "__main__":
     window_size = 1 # 防止过拟合，用1
     use_SGD = False
     total_timesteps = int(10e6) 
-    batch_size = 1
-    env_num = 96
+    env_num = 32
+    batch_size = 4
+    updates_per_call = 8
     async_vector_env = True if env_num > 1 else False
     eval_env_num = 1
+    async_vector_env_eval = True if eval_env_num > 1 else False
     exp_name = f"env_num({env_num})_window({window_size})_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
     eval_episodes = 1
     
     is_test = total_timesteps == int(1e6)
-    learning_starts = 10000 if not is_test else 1000
-    ckpt_save_frequency = 0.01 if not is_test else 0.1 
-    eval_frequency = 0.01 if not is_test else 0.1  
+    learning_starts = 1000 if is_test else 10000
+    ckpt_save_frequency = 0.1 if is_test else 0.02
+    eval_frequency = 0.1 if is_test else 0.1 
     
     # 针对TradingEnv优化的网络配置
     
     args = Args(
         train=TrainConfig(
             exp_name=exp_name,
-            save_model=True,
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,  # 首次运行设为False
             save_dir=f"runs/SAC_{env_id}",
@@ -43,7 +44,7 @@ if __name__ == "__main__":
             eval_episodes=eval_episodes,
             greedy_actions=True,  # 评估时使用确定性动作
             env_num=eval_env_num,
-            async_vector_env=False,
+            async_vector_env=async_vector_env_eval,
             capture_media=True,  # 记录视频
         ),
         env=EnvConfig(
@@ -51,8 +52,10 @@ if __name__ == "__main__":
             env_num=env_num,
         ),
         network=NetworkConfig(
-            actor_net_arch=[128, 128, 128],
-            critic_net_arch=[128, 128, 128],
+            actor_net_arch=[96, 96, 96],
+            critic_net_arch=[96, 96, 96],
+            s5_hidden_dim=192,
+            s5_num_layers=3,
             # 不需要时间序列编码器，直接用MLP
             shape_tickers_positions=(0, 0),  # 不使用
             encoder_type="none",  # 标记为不使用编码器
@@ -71,7 +74,8 @@ if __name__ == "__main__":
             autotune=True,  # 自动调节熵系数
             target_entropy_scale=1.0,  # 连续动作的标准设置
             adam_eps=1e-4,
-            use_SGD=use_SGD
+            use_SGD=use_SGD,
+            updates_per_call=updates_per_call
         ),
         wandb=WandbConfig(
             track=True,

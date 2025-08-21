@@ -37,6 +37,7 @@ class Evaluator:
                 eval_env_maker(
                     config=self.env_config.trading_env_config,
                     data_loader_cfg=self.env_config.data_loader_cfg,
+                    feat_getter=self.env_config.feat_getter,
                     capture_media=self.eval_config.capture_media,
                 )
                 for i in range(self.eval_config.env_num)
