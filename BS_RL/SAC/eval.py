@@ -8,7 +8,7 @@ from .agent import RSACAgent
 from .common import eval_env_maker, MetricLogger, StatsAggregator
 from .config import EnvConfig, EvalConfig
 from TradingEnv import DataLoaderConfig, TradingEnvConfig
-
+from datetime import datetime, timedelta
 class Evaluator:
     def __init__(self,
                  agent: RSACAgent,
@@ -31,18 +31,37 @@ class Evaluator:
     def _make_envs(self):
         print("Creating evaluation environments...")
         eval_vec_env_cls = gym.vector.AsyncVectorEnv if self.eval_config.async_vector_env else gym.vector.SyncVectorEnv
-        
-        return eval_vec_env_cls(
-            [
-                eval_env_maker(
-                    config=self.env_config.trading_env_config,
-                    data_loader_cfg=self.env_config.data_loader_cfg,
-                    feat_getter=self.env_config.feat_getter,
-                    capture_media=self.eval_config.capture_media,
-                )
-                for i in range(self.eval_config.env_num)
-            ]
-        )
+        # Parse start/end once
+        start_str, end_str = self.env_config.trading_env_config.test_timerange
+        start_dt = datetime.strptime(start_str, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_str, "%Y-%m-%d")
+        total_days = max(0, (end_dt - start_dt).days)
+        env_num = max(1, self.eval_config.env_num)
+        # Use integer-day slices and ensure >= 1 day
+        slice_days = max(1, total_days // env_num) if total_days > 0 else 1
+        envs = []
+        for i in range(env_num):
+            trading_env_cfg = copy.deepcopy(self.env_config.trading_env_config)
+            start_i = start_dt + timedelta(days=i * slice_days)
+            end_i = start_dt + timedelta(days=(i + 1) * slice_days)
+            # Stop if start exceeds or meets global end
+            if start_i >= end_dt:
+                break
+            # Clamp end_i to global end
+            if end_i > end_dt:
+                end_i = end_dt
+            # Ensure non-empty interval
+            if start_i >= end_i:
+                break
+            trading_env_cfg.test_timerange = (start_i.strftime("%Y-%m-%d"), end_i.strftime("%Y-%m-%d"))
+            env = eval_env_maker(
+                config=trading_env_cfg,
+                data_loader_cfg=self.env_config.data_loader_cfg,
+                feat_getter=self.env_config.feat_getter,
+                capture_media=self.eval_config.capture_media,
+            )
+            envs.append(env)
+        return eval_vec_env_cls(envs)
 
     def evaluate(self, actor_state_eval, summarizer_params_eval, current_train_step: int):
         num_episodes = self.eval_config.eval_episodes

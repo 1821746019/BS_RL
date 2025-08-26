@@ -19,15 +19,15 @@ if __name__ == "__main__":
     batch_size = 4
     updates_per_call = 8
     async_vector_env = True if env_num > 1 else False
-    eval_env_num = 1
+    eval_env_num = 48
     async_vector_env_eval = True if eval_env_num > 1 else False
     exp_name = f"env_num({env_num})_window({window_size})_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
     eval_episodes = 1
     train_unroll_steps = 16
     is_test = total_timesteps == int(1e6)
-    learning_starts = 1000 if is_test else 10000
+    learning_starts = 1000 if is_test else 30000
     ckpt_save_frequency = 0.1 if is_test else 0.1
-    eval_frequency = 0.1 if is_test else 0.1 
+    eval_frequency = 0.1 if is_test else 0.1
     
     # 针对TradingEnv优化的网络配置
     
