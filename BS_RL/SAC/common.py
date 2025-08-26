@@ -136,9 +136,9 @@ def train_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig,
         data_loader = DataLoaderWithCache(data_loader_cfg, feat_getter)
         account = Account(config, tickers=data_loader_cfg.tickers)
         env = TradingEnv(config, data_loader, account)
+        env = wrappers.LossLimit(env)
         env = wrappers.EpisodeWrapper(env)
         env = wrappers.RandomWrapper(env)
-        env = wrappers.LossLimit(env)
         env = wrappers.ObsWrapper(env)
         # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
         # env = FiniteCheck(env)
@@ -152,11 +152,11 @@ def eval_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, 
         data_loader = DataLoaderWithCache(data_loader_cfg, feat_getter)
         account = Account(config, tickers=data_loader_cfg.tickers)
         env = TradingEnv(config, data_loader, account)
+        env = wrappers.LossLimit(env)
         env = wrappers.EpisodeWrapper(env)
         env = wrappers.RandomWrapper(env)
         if capture_media:
             env = wrappers.EpisodeRender(env)
-        env = wrappers.LossLimit(env)
         env = wrappers.ObsWrapper(env)
         # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
         # env = FiniteCheck(env)
