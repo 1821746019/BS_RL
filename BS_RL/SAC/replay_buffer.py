@@ -176,11 +176,12 @@ class RecurrentReplayBuffer:
         if max_start < 0:
             return None
 
-        # 若有足够的segments，则不放回采样；不足时保持与 sample 行为一致，抛错
-        if self.num_stored_segments < batch_size:
-            raise NotImplementedError("this case is not implemented, please make sure the buffer has enough segments")
+        # 若有足够的segments，则不放回采样；不足时允许重复采样
+        replace = False
+        if self.num_stored_segments < num_batches * batch_size:
+            replace = True
         # Draw indices for [K, B]
-        idxs = np.random.choice(self.num_stored_segments, size=(num_batches, batch_size), replace=False)
+        idxs = np.random.choice(self.num_stored_segments, size=(num_batches, batch_size), replace=replace)
         start_idxs = np.random.randint(0, max_start + 1, size=(num_batches, batch_size), dtype=np.int32)
 
         # Build time indices

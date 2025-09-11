@@ -78,11 +78,11 @@ class GymTrainer(Trainer):
 if __name__ == "__main__":
     # LunarLanderContinuous参数配置
     total_timesteps = int(1e6)  # 100万步，足够测试收敛性
-    batch_size = int(256)
+    batch_size = int(32)
     env_num = 1  # SAC通常使用单环境
     eval_env_num = 10
     eval_episodes = 10
-    train_unroll_steps = 64
+    train_unroll_steps = 8
     is_test = total_timesteps != int(1e6)
     learning_starts = 28400 if is_test else 10000 # 28400用于测试rb性能是否会随segment_len的增大而下降
     ckpt_save_frequency = 0

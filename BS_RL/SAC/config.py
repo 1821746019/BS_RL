@@ -54,7 +54,7 @@ class AlgoConfig:
     use_SGD: bool = False
     """whether to use SGD instead of AdamW"""
     # RSAC-share specific
-    rb_seg_len: int = int(1440*3)
+    rb_seg_len: int = int(1440*7)
     """Segment length for replay buffer."""
     train_unroll_steps: int = 1440
     """sequence length for calc loss"""

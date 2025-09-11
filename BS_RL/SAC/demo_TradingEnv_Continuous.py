@@ -15,7 +15,7 @@ if __name__ == "__main__":
     window_size = 1 # 防止过拟合，用1
     use_SGD = False
     total_timesteps = int(10e6) 
-    env_num = 1
+    env_num = 32
     batch_size = 4
     updates_per_call = 8
     async_vector_env = True if env_num > 1 else False
@@ -52,9 +52,9 @@ if __name__ == "__main__":
             env_num=env_num,
         ),
         network=NetworkConfig(
-            actor_net_arch=[96, 96, 96],
-            critic_net_arch=[96, 96, 96],
-            s5_hidden_dim=192,
+            actor_net_arch=[128, 128, 128],
+            critic_net_arch=[128, 128, 128],
+            s5_hidden_dim=256,
             s5_num_layers=3,
             # 不需要时间序列编码器，直接用MLP
             shape_tickers_positions=(0, 0),  # 不使用
@@ -62,7 +62,7 @@ if __name__ == "__main__":
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
-            buffer_size=int(1e6),  # 大缓冲区有助于稳定训练
+            buffer_size=int(10e6),  # 大缓冲区有助于稳定训练
             learning_starts=learning_starts,
             batch_size=batch_size,
             update_frequency=1,  # 每步都更新
