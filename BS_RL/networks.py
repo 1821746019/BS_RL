@@ -111,6 +111,10 @@ class ActorCritic(nn.Module):
         
         if not is_batched_sequence:
             summarizer_output = summarizer_output[:, -1, :] # (B, 1, H) -> (B, H)
+        else:
+            # For sequence input, summarizer returns [B, T+1, H], we need [B, T, H] to match agent_features
+            # Skip the first timestep (initial state) and take the rest
+            summarizer_output = summarizer_output[:, 1:, :] # (B, T+1, H) -> (B, T, H)
 
         # Actor and Critic features
         features = jnp.concatenate([summarizer_output, agent_features], axis=-1)

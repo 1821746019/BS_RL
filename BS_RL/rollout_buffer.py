@@ -58,26 +58,34 @@ class RolloutBuffer:
         self.full = False
 
     def get(self, num_minibatches):
-        num_samples = self.num_envs * self.num_steps
-        assert num_samples % num_minibatches == 0, "num_samples must be divisible by num_minibatches"
-        minibatch_size = num_samples // num_minibatches
+        # For recurrent models, we need to group by environments to preserve trajectory structure
+        assert self.num_envs % num_minibatches == 0, "num_envs must be divisible by num_minibatches"
+        envs_per_batch = self.num_envs // num_minibatches
         
-        # Flatten the data
-        obs = self.observations.swapaxes(0, 1).reshape((num_samples,) + self.obs_shape)
+        # Flatten the data but keep trajectory structure: [num_steps, num_envs, ...] -> [num_envs * num_steps, ...]
+        obs = self.observations.swapaxes(0, 1).reshape((self.num_envs * self.num_steps,) + self.obs_shape)
         if self.is_discrete_action:
-            actions = self.actions.swapaxes(0, 1).reshape(num_samples)
+            actions = self.actions.swapaxes(0, 1).reshape(self.num_envs * self.num_steps)
         else:
-            actions = self.actions.swapaxes(0, 1).reshape((num_samples,) + self.action_shape)
-        log_probs = self.log_probs.swapaxes(0, 1).reshape(num_samples)
-        advantages = self.advantages.swapaxes(0, 1).reshape(num_samples)
-        returns = self.returns.swapaxes(0, 1).reshape(num_samples)
-        values = self.values.swapaxes(0, 1).reshape(num_samples)
+            actions = self.actions.swapaxes(0, 1).reshape((self.num_envs * self.num_steps,) + self.action_shape)
+        log_probs = self.log_probs.swapaxes(0, 1).reshape(self.num_envs * self.num_steps)
+        advantages = self.advantages.swapaxes(0, 1).reshape(self.num_envs * self.num_steps)
+        returns = self.returns.swapaxes(0, 1).reshape(self.num_envs * self.num_steps)
+        values = self.values.swapaxes(0, 1).reshape(self.num_envs * self.num_steps)
 
-        indices = np.random.permutation(num_samples)
-
-        for start_idx in range(0, num_samples, minibatch_size):
-            end_idx = start_idx + minibatch_size
-            mb_indices = indices[start_idx:end_idx]
+        # Create indices that preserve trajectory structure: [num_steps, num_envs]
+        env_indices = np.arange(self.num_envs)
+        flat_indices = np.arange(self.num_envs * self.num_steps).reshape(self.num_steps, self.num_envs)
+        
+        # Shuffle environments but keep trajectories intact
+        np.random.shuffle(env_indices)
+        
+        for start_env in range(0, self.num_envs, envs_per_batch):
+            end_env = start_env + envs_per_batch
+            mb_env_indices = env_indices[start_env:end_env]
+            # Get all timesteps for these environments
+            mb_indices = flat_indices[:, mb_env_indices].ravel()
+            
             yield {
                 'obs': obs[mb_indices],
                 'actions': actions[mb_indices],
@@ -85,4 +93,5 @@ class RolloutBuffer:
                 'advantages': advantages[mb_indices],
                 'returns': returns[mb_indices],
                 'values': values[mb_indices],
+                'env_indices': mb_env_indices,  # 返回对应的环境索引
             }

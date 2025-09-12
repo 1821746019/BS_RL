@@ -98,16 +98,26 @@ class PPOAgent:
 
         def ppo_loss(params, batch_stats, obs, actions, log_probs_old, advantages, returns, values_old):
             
-            # This is a bit tricky for recurrent model.
-            # We assume for now that the initial hidden state is for the start of the sequence.
+            # For recurrent PPO, we need to reshape data to sequence format
+            # obs shape: [batch_size, obs_dim] -> [batch_size // num_steps, num_steps, obs_dim]
+            batch_size = obs.shape[0]
+            num_envs = batch_size // self.algo_config.num_steps
+            
+            # Reshape to sequence format for recurrent model
+            obs_seq = obs.reshape(num_envs, self.algo_config.num_steps, -1)
+            actions_seq = actions.reshape(num_envs, self.algo_config.num_steps, -1) if actions.ndim > 1 else actions.reshape(num_envs, self.algo_config.num_steps)
+            
             _, pi, values_pred = self.ac_model.apply(
                 {'params': params, 'batch_stats': batch_stats},
-                initial_hidden_state, # This is an approximation
-                obs,
+                initial_hidden_state,
+                obs_seq,  # Now properly shaped as [B, T, D]
                 deterministic=True
             )
-            log_probs_new = pi.log_prob(actions)
+            
+            # Flatten back for loss computation
+            log_probs_new = pi.log_prob(actions_seq).reshape(-1)
             entropy = pi.entropy().mean()
+            values_pred = values_pred.reshape(-1)
 
             # Policy loss
             logratio = log_probs_new - log_probs_old

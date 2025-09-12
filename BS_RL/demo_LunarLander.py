@@ -76,7 +76,7 @@ class GymTrainer(Trainer):
 
 if __name__ == "__main__":
     # LunarLanderContinuous参数配置
-    total_timesteps = int(1e6)  # 100万步，足够测试收敛性
+    total_timesteps = int(5e6)  # 100万步，足够测试收敛性
     num_steps = 128
     env_num = 128
     num_minibatches = 4
@@ -86,7 +86,7 @@ if __name__ == "__main__":
     is_test = total_timesteps != int(1e6)
     ckpt_save_frequency = 0
     eval_frequency = 0 if is_test else 0.1
-    
+    async_vector_env = False
     # 针对LunarLanderContinuous优化的网络配置
     # 观察空间: 8维向量 (位置、速度、角度、角速度、腿接触等)
     # 动作空间: 2维连续 (主引擎推力 + 侧向引擎推力)
@@ -98,7 +98,7 @@ if __name__ == "__main__":
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,
             save_dir=f"runs/LunarLanderContinuous_PPO",
-            async_vector_env=True,
+            async_vector_env=async_vector_env,
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,

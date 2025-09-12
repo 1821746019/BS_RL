@@ -267,6 +267,9 @@ class Trainer:
                 if update == 1 and not profiler.is_running:
                     profiler.start()
 
+                # Store initial hidden state for this rollout (needed for recurrent PPO update)
+                rollout_initial_hidden_state = self.hidden_state
+
                 # Collect rollouts
                 for step in range(self.args.algo.num_steps):
                     current_step = (update * self.args.algo.num_steps + step) * self.args.env.env_num
@@ -311,14 +314,22 @@ class Trainer:
                     for batch in self.rb.get(self.args.algo.num_minibatches):
                         self.jax_key, update_key = jax.random.split(self.jax_key)
                         
-                        # For recurrent PPO, this is an approximation. A better way would be to store hidden states per minibatch.
-                        # For now, we pass a zero initial state for each minibatch update.
-                        initial_hidden_state_for_update = self.agent.ac_model.get_initial_state(batch['obs'].shape[0])
-
+                        # Extract corresponding slice of hidden state for this minibatch
+                        # Use the environment indices returned by rollout buffer
+                        env_indices = batch['env_indices']
+                        h_batch, c_batch = rollout_initial_hidden_state
+                        minibatch_hidden_state = (
+                            h_batch[:, env_indices, :],  # [layers, envs_per_batch, hidden_dim]
+                            c_batch[:, env_indices, :]
+                        )
+                        
+                        # Remove env_indices from batch before passing to agent
+                        agent_batch = {k: v for k, v in batch.items() if k != 'env_indices'}
+                        
                         self.train_state, metrics = self.agent.update(
                             self.train_state,
-                            initial_hidden_state_for_update, 
-                            batch,
+                            minibatch_hidden_state, 
+                            agent_batch,
                             update_key
                         )
 
