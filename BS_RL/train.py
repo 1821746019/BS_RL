@@ -1,5 +1,5 @@
 from functools import partial
-from BS_RL.SAC.common import Profiler
+from BS_RL.common import Profiler
 import os
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
@@ -21,13 +21,13 @@ import tyro
 from flax.training import checkpoints
 from tqdm.auto import tqdm
 import joblib
-from BS_RL.SAC.config import Args
-from BS_RL.SAC.common import profile, train_env_maker, MetricLogger, StatsAggregator, jax_profiler
-from BS_RL.SAC.networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
-from BS_RL.SAC.agent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState, TrainState
-from BS_RL.SAC.eval import Evaluator
+from BS_RL.config import Args
+from BS_RL.common import profile, train_env_maker, MetricLogger, StatsAggregator, jax_profiler
+from BS_RL.networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
+from BS_RL.agent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState, TrainState
+from BS_RL.eval import Evaluator
 from TradingEnv import DataLoader, DataLoaderConfig
-from BS_RL.SAC.replay_buffer import RecurrentReplayBuffer
+from BS_RL.replay_buffer import RecurrentReplayBuffer
 import wandb
 import optax
 from typing import Optional

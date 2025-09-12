@@ -1,10 +1,10 @@
 import numpy as np
 import tyro
 import gymnasium as gym
-from BS_RL.SAC.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
-from BS_RL.SAC.nn.ResMLP import ResMLPConfig, ResidualStrategy
-from BS_RL.SAC.train import Trainer
-from BS_RL.SAC.common import gym_train_env_maker, gym_eval_env_maker
+from BS_RL.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
+from BS_RL.nn.ResMLP import ResMLPConfig, ResidualStrategy
+from BS_RL.train import Trainer
+from BS_RL.common import gym_train_env_maker, gym_eval_env_maker
 import os
 from TradingEnv import TradingEnvConfig
 
@@ -37,7 +37,7 @@ class GymTrainer(Trainer):
             return
         print("设置评估器（gym模式）...")
         
-        from BS_RL.SAC.eval import Evaluator
+        from BS_RL.eval import Evaluator
         
         class GymEvaluator(Evaluator):
             def __init__(self, agent, env_config, eval_config, run_name_suffix, logger, env_id, seed):

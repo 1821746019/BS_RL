@@ -1,8 +1,8 @@
-from BS_RL.SAC.common import valid_step_to_gamma
+from BS_RL.common import valid_step_to_gamma
 import numpy as np
 import tyro
-from BS_RL.SAC.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
-from BS_RL.SAC.train import train
+from BS_RL.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
+from BS_RL.train import train
 import os
 from TradingEnv import TradingEnvConfig as TradingEnvConfig, RewardSchema
 if __name__ == "__main__":
