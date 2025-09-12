@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from jax.nn.initializers import lecun_normal, normal
 from jax.numpy.linalg import eigh
-
+from typing import Optional
 
 def log_step_initializer(dt_min=0.001, dt_max=0.1):
     def init(key, shape):
@@ -369,3 +369,97 @@ class StackedEncoderModel(nn.Module):
     def initialize_carry(batch_size, hidden_size, n_layers):
         return [jnp.zeros((1, batch_size, hidden_size), dtype=jnp.complex64) for _ in range(n_layers)]
 
+class S5Summarizer(nn.Module):
+    hidden_dim: int
+    num_layers: int = 1
+    delta_min: float = 0.001
+    delta_max: float = 0.1
+
+    def setup(self):
+        H = self.hidden_dim
+        if H % 2 != 0:
+            raise ValueError(f"S5Summarizer.hidden_dim must be even for conjugate symmetry, got {H}")
+        P = H // 2  # ensure H = 2P to pack complex state
+        # Build DPLR HiPPO
+        Lambda, _, _, V, _ = make_DPLR_HiPPO(P)
+        Vinv = jnp.conj(jnp.transpose(V))
+        ssm_init_fn = init_S5SSM(
+            H=H,
+            P=P,
+            Lambda_re_init=jnp.real(Lambda),
+            Lambda_im_init=jnp.imag(Lambda),
+            V=V,
+            Vinv=Vinv,
+            C_init="lecun_normal",
+            discretization="zoh",
+            dt_min=self.delta_min,
+            dt_max=self.delta_max,
+            conj_sym=True,
+            clip_eigs=False,
+            bidirectional=False,
+        )
+        self.encoder = nn.Dense(H, name="in_proj")
+        self.s5_stack = StackedEncoderModel(
+            ssm=ssm_init_fn,
+            d_model=H,
+            n_layers=self.num_layers,
+            activation="full_glu",
+            do_norm=True,
+            prenorm=True,
+            do_gtrxl_norm=True,
+        )
+
+    def _pack_hidden_real_to_complex(self, h_real: jnp.ndarray) -> jnp.ndarray:
+        """h_real: [B, H] -> complex [1, B, P] where H=2P"""
+        H = h_real.shape[-1]
+        P = H // 2
+        real = h_real[..., :P]
+        imag = h_real[..., P: P * 2]
+        h_complex = real + 1j * imag
+        return h_complex[None, ...]
+
+    def _unpack_hidden_complex_to_real(self, h_complex: jnp.ndarray) -> jnp.ndarray:
+        """h_complex: [1, B, P] -> real [B, H] with H=2P"""
+        real = jnp.real(h_complex[0])
+        imag = jnp.imag(h_complex[0])
+        return jnp.concatenate([real, imag], axis=-1)
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, initial_state: Optional[tuple[jnp.ndarray, jnp.ndarray]] = None):
+        """
+        x: [B, T, D]
+        Returns:
+          outputs: [B, T+1, H]
+          final_state: (h, c_dummy) with shapes [L,B,H]
+        """
+        B, T, _ = x.shape
+        H = self.hidden_dim
+        L = self.num_layers
+
+        x_proj = self.encoder(x)  # [B, T, H]
+        # Transpose to [T, B, H] for S5 stack
+        x_tbH = jnp.swapaxes(x_proj, 0, 1)
+
+        # Prepare initial hidden states per S5 layer as complex [1,B,P]
+        if initial_state is None:
+            h0_layers = [jnp.zeros((1, B, max(H // 2, 1)), dtype=jnp.complex64) for _ in range(L)]
+        else:
+            h_init, _ = initial_state  # [L, B, H]
+            h0_layers = [self._pack_hidden_real_to_complex(h_init[i]) for i in range(L)]
+
+        # Resets: zeros [T, B]
+        d_tb = jnp.zeros((T, B), dtype=jnp.float32)
+
+        # Apply S5 stack
+        new_h_layers, y_tbH = self.s5_stack(h0_layers, x_tbH, d_tb)
+
+        # Convert new hidden back to real [L, B, H]
+        final_h_real = jnp.stack([self._unpack_hidden_complex_to_real(hc) for hc in new_h_layers], axis=0)
+
+        # To outputs [B, T+1, H] with prepended initial top layer hidden
+        top_init = final_h_real[-1] * 0.0  # default zeros for t=0
+        if initial_state is not None:
+            top_init = initial_state[0][-1]
+        y_bTH = jnp.swapaxes(y_tbH, 0, 1)
+        outputs = jnp.concatenate([top_init[:, None, :], y_bTH], axis=1)
+        return outputs, (final_h_real, jnp.zeros_like(final_h_real))
