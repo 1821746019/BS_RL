@@ -4,7 +4,7 @@ import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
-from .agent import RSACAgent
+from .SACAgent import RSACAgent
 from .common import eval_env_maker, MetricLogger, StatsAggregator
 from .config import EnvConfig, EvalConfig
 from TradingEnv import DataLoaderConfig, TradingEnvConfig

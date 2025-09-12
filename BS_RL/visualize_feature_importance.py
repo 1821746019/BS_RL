@@ -16,7 +16,7 @@ from TradingEnv.Config import DataLoaderConfig
 import warnings
 from TradingEnv import DataLoader
 from .common import train_env_maker
-from .agent import SACAgentContinuous
+from .SACAgent import SACAgentContinuous
 from .networks import TradingActorContinuous, TradingCriticContinuous
 
 warnings.filterwarnings("ignore", category=UserWarning, module="absl")

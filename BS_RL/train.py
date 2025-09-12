@@ -24,7 +24,7 @@ import joblib
 from BS_RL.config import Args
 from BS_RL.common import profile, train_env_maker, MetricLogger, StatsAggregator, jax_profiler
 from BS_RL.networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
-from BS_RL.agent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState, TrainState
+from BS_RL.SACAgent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState, TrainState
 from BS_RL.eval import Evaluator
 from TradingEnv import DataLoader, DataLoaderConfig
 from BS_RL.replay_buffer import RecurrentReplayBuffer
