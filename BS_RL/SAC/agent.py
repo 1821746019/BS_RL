@@ -265,7 +265,7 @@ class RSACAgentDiscrete(RSACAgentBase):
                  algo_config: AlgoConfig,
                  actor_model_cls=TradingActorDiscrete,
                  critic_model_cls=TradingCriticDiscrete):
-        super().__init__(action_dim, observation_space_shape, key, network_config, algo_config, actor_model_cls, critic_model_cls, True, norm_limit=MAX_NORM)
+        super().__init__(action_dim, observation_space_shape, key, network_config, algo_config, actor_model_cls, critic_model_cls, True, norm_limit=algo_config.max_grad_norm if hasattr(algo_config, 'max_grad_norm') else MAX_NORM)
 
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls):
         # Shared summarizer and target summarizer
@@ -459,95 +459,16 @@ class RSACAgentDiscrete(RSACAgentBase):
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax_jit, static_argnums=(0, 5, 6))
-    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
-        """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
-
-        batches: if do_update, a dict with leading dim K=updates_per_call; otherwise can be None or a single batch.
-        """
-        # Split rng on device to avoid host-device traffic
-        key_action, key_update, new_key = jax.random.split(key, 3)
-        
-        # 1. First perform agent update(s) if requested
-        if do_update:
-            num_updates = jnp.asarray(updates_per_call, dtype=jnp.int32)
-            init_carry = (
-                actor_state,
-                qf1_state,
-                qf2_state,
-                summarizer_state,
-                log_alpha_state,
-                jnp.array(0.0),  # critic_loss_sum
-                jnp.array(0.0),  # actor_loss_sum
-                jnp.array(0.0),  # alpha_loss_sum
-                jnp.array(0.0),  # entropy_sum
-                jnp.array(0.0),  # qf1_mean_sum
-                jnp.array(0.0),  # qf2_mean_sum
-                jnp.array(0.0),  # current_alpha placeholder
-            )
-
-            def body_fun(i, carry):
-                (a_state, q1_state, q2_state, s_state, la_state,
-                 cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha) = carry
-                b = {
-                    'o': batches['o'][i],
-                    'a': batches['a'][i],
-                    'r': batches['r'][i],
-                    'term': batches['term'][i],
-                    'trunc': batches['trunc'][i],
-                    'm': batches['m'][i],
-                }
-                a_state_n, q1_state_n, q2_state_n, s_state_n, la_state_n, cur_alpha_n, metric_i = self._update(
-                    a_state, q1_state, q2_state, s_state, la_state, b, key_update
-                )
-                cl_sum = cl_sum + metric_i['critic_loss']
-                al_sum = al_sum + metric_i['actor_loss']
-                aloss_sum = aloss_sum + metric_i['alpha_loss']
-                ent_sum = ent_sum + metric_i['entropy']
-                qf1m_sum = qf1m_sum + metric_i['qf1_value_mean']
-                qf2m_sum = qf2m_sum + metric_i['qf2_value_mean']
-                return (a_state_n, q1_state_n, q2_state_n, s_state_n, la_state_n,
-                        cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha_n)
-
-            (updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state,
-             critic_loss_sum, actor_loss_sum, alpha_loss_sum, entropy_sum, qf1_mean_sum, qf2_mean_sum, current_alpha) = \
-                jax.lax.fori_loop(0, num_updates, body_fun, init_carry)
-
-            kf = jnp.maximum(1, num_updates)
-            metrics = {
-                'critic_loss': critic_loss_sum / kf,
-                'actor_loss': actor_loss_sum / kf,
-                'alpha_loss': alpha_loss_sum / kf,
-                'alpha': current_alpha,
-                'entropy': entropy_sum / kf,
-                'qf1_value_mean': qf1_mean_sum / kf,
-                'qf2_value_mean': qf2_mean_sum / kf,
-            }
-        else:
-            updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state = actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state
-            current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha)
-            metrics = {}
-        
-        # Apply target network updates if requested
-        if do_update and do_target_update:
-            tau = self.algo_config.tau
-            final_qf1_state = updated_qf1_state.replace(
-                target_params=optax.incremental_update(updated_qf1_state.params, updated_qf1_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(updated_qf1_state.batch_stats, updated_qf1_state.target_batch_stats, tau) if updated_qf1_state.batch_stats is not None else updated_qf1_state.target_batch_stats
-            )
-            final_qf2_state = updated_qf2_state.replace(
-                target_params=optax.incremental_update(updated_qf2_state.params, updated_qf2_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(updated_qf2_state.batch_stats, updated_qf2_state.target_batch_stats, tau) if updated_qf2_state.batch_stats is not None else updated_qf2_state.target_batch_stats
-            )
-            new_target = optax.incremental_update(updated_summarizer_state.params, updated_summarizer_state.target_params, tau)
-            final_summarizer_state = updated_summarizer_state.replace(target_params=new_target)
-        else:
-            final_qf1_state, final_qf2_state, final_summarizer_state = updated_qf1_state, updated_qf2_state, updated_summarizer_state
-        
-        # 2. Then perform action selection using potentially updated states
-        actions, new_h, new_c = self.select_action(updated_actor_state, final_summarizer_state.params, obs, hidden_h, hidden_c, key_action, deterministic=deterministic)
-        
-        return actions, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, final_summarizer_state, updated_log_alpha_state, metrics, new_key
+    @partial(jax_jit, static_argnums=(0,))
+    def update_step_on_policy(self,
+                              actor_state: TrainStateWithBatchStats,
+                              qf1_state: CriticTrainState,
+                              qf2_state: CriticTrainState,
+                              summarizer_state: SummarizerTrainState,
+                              log_alpha_state: TrainState,
+                              batch: dict,
+                              key):
+        return self._update(actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, batch, key)
 
 class RSACAgentContinuous(RSACAgentBase):
     def __init__(self,
@@ -558,7 +479,7 @@ class RSACAgentContinuous(RSACAgentBase):
                  algo_config: AlgoConfig,
                  actor_model_cls=TradingActorContinuous,
                  critic_model_cls=TradingCriticContinuous):
-        super().__init__(action_dim, observation_space_shape, key, network_config, algo_config, actor_model_cls, critic_model_cls, False, norm_limit=MAX_NORM)
+        super().__init__(action_dim, observation_space_shape, key, network_config, algo_config, actor_model_cls, critic_model_cls, False, norm_limit=algo_config.max_grad_norm if hasattr(algo_config, 'max_grad_norm') else MAX_NORM)
 
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, actor_model_cls, critic_model_cls):
         if self.network_config.use_s5_summarizer:
@@ -756,94 +677,15 @@ class RSACAgentContinuous(RSACAgentBase):
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax_jit, static_argnums=(0, 5, 6))
-    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
-        """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
-
-        batches: if do_update, a dict with leading dim K=updates_per_call; otherwise can be None or a single batch.
-        """
-        # Split rng on device to avoid host-device traffic
-        key_action, key_update, new_key = jax.random.split(key, 3)
-        
-        # 1. First perform agent update(s) if requested
-        if do_update:
-            num_updates = jnp.asarray(updates_per_call, dtype=jnp.int32)
-            init_carry = (
-                actor_state,
-                qf1_state,
-                qf2_state,
-                summarizer_state,
-                log_alpha_state,
-                jnp.array(0.0),  # critic_loss_sum
-                jnp.array(0.0),  # actor_loss_sum
-                jnp.array(0.0),  # alpha_loss_sum
-                jnp.array(0.0),  # entropy_sum
-                jnp.array(0.0),  # qf1_mean_sum
-                jnp.array(0.0),  # qf2_mean_sum
-                jnp.array(0.0),  # current_alpha placeholder
-            )
-
-            def body_fun(i, carry):
-                (a_state, q1_state, q2_state, s_state, la_state,
-                 cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha) = carry
-                b = {
-                    'o': batches['o'][i],
-                    'a': batches['a'][i],
-                    'r': batches['r'][i],
-                    'term': batches['term'][i],
-                    'trunc': batches['trunc'][i],
-                    'm': batches['m'][i],
-                }
-                a_state_n, q1_state_n, q2_state_n, s_state_n, la_state_n, cur_alpha_n, metric_i = self._update(
-                    a_state, q1_state, q2_state, s_state, la_state, b, key_update
-                )
-                cl_sum = cl_sum + metric_i['critic_loss']
-                al_sum = al_sum + metric_i['actor_loss']
-                aloss_sum = aloss_sum + metric_i['alpha_loss']
-                ent_sum = ent_sum + metric_i['entropy']
-                qf1m_sum = qf1m_sum + metric_i['qf1_value_mean']
-                qf2m_sum = qf2m_sum + metric_i['qf2_value_mean']
-                return (a_state_n, q1_state_n, q2_state_n, s_state_n, la_state_n,
-                        cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha_n)
-
-            (updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state,
-             critic_loss_sum, actor_loss_sum, alpha_loss_sum, entropy_sum, qf1_mean_sum, qf2_mean_sum, current_alpha) = \
-                jax.lax.fori_loop(0, num_updates, body_fun, init_carry)
-
-            kf = jnp.maximum(1, num_updates)
-            metrics = {
-                'critic_loss': critic_loss_sum / kf,
-                'actor_loss': actor_loss_sum / kf,
-                'alpha_loss': alpha_loss_sum / kf,
-                'alpha': current_alpha,
-                'entropy': entropy_sum / kf,
-                'qf1_value_mean': qf1_mean_sum / kf,
-                'qf2_value_mean': qf2_mean_sum / kf,
-            }
-        else:
-            updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state = actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state
-            current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha)
-            metrics = {}
-        
-        # Apply target network updates if requested
-        if do_update and do_target_update:
-            tau = self.algo_config.tau
-            final_qf1_state = updated_qf1_state.replace(
-                target_params=optax.incremental_update(updated_qf1_state.params, updated_qf1_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(updated_qf1_state.batch_stats, updated_qf1_state.target_batch_stats, tau) if updated_qf1_state.batch_stats is not None else updated_qf1_state.target_batch_stats
-            )
-            final_qf2_state = updated_qf2_state.replace(
-                target_params=optax.incremental_update(updated_qf2_state.params, updated_qf2_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(updated_qf2_state.batch_stats, updated_qf2_state.target_batch_stats, tau) if updated_qf2_state.batch_stats is not None else updated_qf2_state.target_batch_stats
-            )
-            new_target = optax.incremental_update(updated_summarizer_state.params, updated_summarizer_state.target_params, tau)
-            final_summarizer_state = updated_summarizer_state.replace(target_params=new_target)
-        else:
-            final_qf1_state, final_qf2_state, final_summarizer_state = updated_qf1_state, updated_qf2_state, updated_summarizer_state
-        
-        # 2. Then perform action selection using potentially updated states
-        squashed, new_h, new_c = self.select_action(updated_actor_state, final_summarizer_state.params, obs, hidden_h, hidden_c, key_action, deterministic=deterministic)
-        
-        return squashed, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, final_summarizer_state, updated_log_alpha_state, metrics, new_key
+    @partial(jax_jit, static_argnums=(0,))
+    def update_step_on_policy(self,
+                              actor_state: TrainStateWithBatchStats,
+                              qf1_state: CriticTrainState,
+                              qf2_state: CriticTrainState,
+                              summarizer_state: SummarizerTrainState,
+                              log_alpha_state: TrainState,
+                              batch: dict,
+                              key):
+        return self._update(actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state, batch, key)
 
 RSACAgent = Union[RSACAgentDiscrete, RSACAgentContinuous]

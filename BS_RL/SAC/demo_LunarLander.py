@@ -131,11 +131,11 @@ if __name__ == "__main__":
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
-            buffer_size=int(1e6),
-            learning_starts=learning_starts,
-            batch_size=batch_size,
-            update_frequency=1,  # 每步都更新
-            target_network_frequency=1,  # 软更新，每步更新
+            # buffer_size=int(1e6),
+            # learning_starts=learning_starts,
+            # batch_size=batch_size,
+            # update_frequency=1,  # 每步都更新
+            # target_network_frequency=1,  # 软更新，每步更新
             gamma=0.99,
             tau=0.005,  # 连续动作用软更新，官方推荐的超参
             policy_lr=3e-4,
@@ -143,11 +143,7 @@ if __name__ == "__main__":
             autotune=True,  # 自动调节熵系数
             target_entropy_scale=1.0,  # 连续动作的标准设置
             adam_eps=1e-4,
-            rb_seg_len=train_unroll_steps,
-            train_unroll_steps=train_unroll_steps,
-            burn_in=0,
-            rb_min_gap=1,
-            updates_per_call=8,
+            update_epochs=1,
         ),
         wandb=WandbConfig(
             track=os.getenv("USE_WANDB", "true").lower() == "true",

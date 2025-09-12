@@ -27,7 +27,7 @@ from BS_RL.SAC.networks import TradingActorDiscrete, TradingCriticDiscrete, Trad
 from BS_RL.SAC.agent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState, TrainState
 from BS_RL.SAC.eval import Evaluator
 from TradingEnv import DataLoader, DataLoaderConfig
-from BS_RL.SAC.replay_buffer import RecurrentReplayBuffer
+from BS_RL.SAC.replay_buffer import RolloutBuffer
 import wandb
 import optax
 from typing import Optional
@@ -47,7 +47,7 @@ class Trainer:
         self.jax_key: jax.Array
         self.envs: AsyncVectorEnv| SyncVectorEnv
         self.agent : RSACAgentDiscrete|RSACAgentContinuous
-        self.rb: RecurrentReplayBuffer
+        self.rb: RolloutBuffer
         self.actor_state: TrainStateWithBatchStats
         self.qf1_state: CriticTrainState
         self.qf2_state: CriticTrainState
@@ -88,8 +88,8 @@ class Trainer:
 
     def _setup_jax_devices(self):
         print(f"JAX running on: {jax.devices()}")
-        self.batch_size_per_device = self.args.algo.batch_size
-        print(f"Using global batch size: {self.args.algo.batch_size}")
+        # self.batch_size_per_device = self.args.algo.batch_size
+        # print(f"Using global batch size: {self.args.algo.batch_size}")
 
     def _handle_resume_and_directory_setup(self):
         restored_ckpt_path = None
@@ -299,24 +299,15 @@ class Trainer:
                 self.initial_global_step = 0
 
     def _setup_replay_buffer(self):
-        print("Creating recurrent replay buffer with segment-based storage.")
+        print("Creating on-policy rollout buffer.")
         obs_dim = int(np.prod(self.envs.single_observation_space.shape)) if len(self.envs.single_observation_space.shape) == 1 else self.envs.single_observation_space.shape[-1]
-        if self.is_discrete:
-            action_shape = ()
-        else:
-            action_shape = self.envs.single_action_space.shape
-        # Calculate capacity in terms of segments rather than episodes
-        # Assuming average episode length, convert buffer_size (in steps) to segments
-        capacity_segments = max(self.args.algo.buffer_size // self.args.algo.rb_seg_len, 1)
-        self.rb = RecurrentReplayBuffer(
+        action_shape = () if self.is_discrete else self.envs.single_action_space.shape
+        self.rb = RolloutBuffer(
             obs_dim=obs_dim,
             action_shape=action_shape,
             is_discrete_action=self.is_discrete,
-            capacity_segments=capacity_segments,
             num_envs=self.args.env.env_num,
-            seg_len=self.args.algo.rb_seg_len,
-            burn_in=self.args.algo.burn_in,
-            min_gap=self.args.algo.rb_min_gap
+            num_steps=self.args.algo.num_steps,
         )
 
     def _setup_evaluator(self):
@@ -335,117 +326,136 @@ class Trainer:
 
     def train(self):
         obs, _ = self.envs.reset(seed=self.args.train.seed + self.initial_global_step)
-        # initialize first obs in rb working buffers
-        # environment step loop will populate
         train_stats_aggregator = StatsAggregator()
         pbar_postfix = collections.OrderedDict()
 
-        total_iterations = self.args.algo.total_timesteps // self.args.env.env_num
-        start_iteration = self.initial_global_step // self.args.env.env_num
+        total_updates = self.args.algo.total_timesteps // (self.args.env.env_num * self.args.algo.num_steps)
         profiler = Profiler()
         jax_profiler.start_trace(self.base_output_dir / "trace")
-        update_cnt = 0
         with tqdm(initial=self.initial_global_step, total=self.args.algo.total_timesteps, desc="Training") as pbar:
-            for loop_iter in range(start_iteration, total_iterations):
-                if update_cnt == 1 and not profiler.is_running :
-                    profiler.start() # 首次更新，tpu预热完毕，开始profile
-                current_step = loop_iter * self.args.env.env_num
-                
-                # Prepare rng on device inside jit to avoid host-device split cost
-                
-                # Determine if we should update and use actor
-                do_update = (current_step > self.args.algo.learning_starts and 
-                           self.rb.can_sample_many(self.args.algo.batch_size, self.args.algo.train_unroll_steps, self.args.algo.updates_per_call) and current_step % self.args.algo.update_frequency == 0)
-                do_target_update = False
-                
-                if do_update:
-                    update_cnt += 1
-                    do_target_update = (current_step // self.args.algo.update_frequency) % max(self.args.algo.target_network_frequency // max(self.args.algo.update_frequency,1), 1) == 0
-                    # Prepare multiple batches for multiple updates per JIT call
-                    updates_per_call = max(1, int(self.args.algo.updates_per_call))
-                    batches = self.rb.sample_many(self.args.algo.batch_size, self.args.algo.train_unroll_steps, updates_per_call)
-                    # Combined action selection and multi-update in single JIT call
-                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_agent_then_get_action(
-                        obs, self.hidden_h, self.hidden_c, batches, do_update, do_target_update,
-                        self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state,
-                        self.log_alpha_state, self.jax_key, updates_per_call,
+            for update_idx in range(total_updates):
+                # reset rollout buffer for this collection with current obs
+                self.rb.reset(obs.astype(np.float32))
+                # 1) Collect rollout
+                for t in range(self.args.algo.num_steps):
+                    # select action
+                    key_action, self.jax_key = jax.random.split(self.jax_key)
+                    actions_jax, new_h, new_c = self.agent.select_action(
+                        self.actor_state,
+                        self.summarizer_state.params,
+                        jnp.asarray(obs),
+                        self.hidden_h, self.hidden_c,
+                        key_action,
                         deterministic=False
                     )
-                    # Update states
-                    self.actor_state = new_actor_state
-                    self.qf1_state = new_qf1_state
-                    self.qf2_state = new_qf2_state
-                    self.summarizer_state = new_summarizer_state
-                    if self.args.algo.autotune:
-                        self.log_alpha_state = new_log_alpha_state
-                    self.hidden_h = new_h
-                    self.hidden_c = new_c
-                    actions = np.array(jax.device_get(actions))
-                else:
-                    # Random actions during warmup
-                    actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)])
-                    metrics = None
-                
-                # Environment step
-                next_obs, rewards, terminations, truncations, infos = self.envs.step(actions)
-                
-                # Handle final observations
-                real_next_obs = next_obs.copy()
-                for idx, trunc in enumerate(truncations):
-                    if trunc and "final_observation" in infos and infos["final_observation"][idx] is not None:
-                        real_next_obs[idx] = infos["final_observation"][idx]
-                
-                # Add to replay buffer
-                self.rb.add_batch(obs.astype(np.float32), real_next_obs.astype(np.float32), 
-                                actions.astype(np.int32 if self.is_discrete else np.float32), 
-                                rewards.astype(np.float32), terminations.astype(np.float32), 
-                                truncations.astype(np.float32))
-                
-                # Reset hidden states on done envs
-                done_mask = (terminations | truncations).astype(bool)
-                if done_mask.any():
-                    L, N, H = self.hidden_h.shape
-                    hh = np.array(self.hidden_h)
-                    hh[:, done_mask, :] = 0.0
-                    # 从将np.ndarray的数据转为jnp.ndarray涉及拷贝数据到default_backend上，是异步的，这里提前转比起调jit函数时让自动转, 性能更好
-                    self.hidden_h = jnp.asarray(hh)
-                    if self.hidden_c is not None:
-                        hc = np.array(self.hidden_c)
-                        hc[:, done_mask, :] = 0.0
-                        self.hidden_c = jnp.asarray(hc)
-                
-                obs = next_obs
-                
-                # Logging
-                if "final_info" in infos and self.logger:
-                    for i, info_item in enumerate(infos["final_info"]):
-                        if info_item and "episode" in info_item:
-                            train_stats_aggregator.add(info_item)
-                            if i == 0:
-                                self.logger.log_env0_episode(info_item['episode'], current_step, prefix="train")
+                    actions = np.array(jax.device_get(actions_jax))
 
-                if metrics and current_step % (self.args.train.log_freq) == 0:
-                    sps = int(pbar.format_dict['rate'])
-                    pbar_postfix["SPS"] = sps
-                    log_data = {}
-                    metrics["SPS"] = sps
-                    for k, v in metrics.items():
-                        log_data[f"metrics/{k}"] = v
-                    buffered_stats = train_stats_aggregator.get_aggregated_stats()
-                    if buffered_stats:
-                        for k, v in buffered_stats.items():
-                            log_data[f"train_buffered/{k}"] = v
-                        if 'return_mean' in buffered_stats:
-                            pbar_postfix["return_mean"] = f"{buffered_stats['return_mean']:.2f}"
-                    if self.args.wandb.track:
-                        wandb.log(log_data, step=current_step)
+                    next_obs, rewards, terminations, truncations, infos = self.envs.step(actions)
 
-                next_step = (loop_iter + 1) * self.args.env.env_num
-                self._run_evaluation(current_step, next_step)
-                self._save_checkpoint(current_step, next_step)
+                    # fix final obs
+                    real_next_obs = next_obs.copy()
+                    for idx, trunc in enumerate(truncations):
+                        if trunc and "final_observation" in infos and infos["final_observation"][idx] is not None:
+                            real_next_obs[idx] = infos["final_observation"][idx]
 
-                pbar.set_postfix(pbar_postfix, refresh=False) #不立即刷新提升性能 4.73/37.15
-                pbar.update(self.args.env.env_num)
+                    # store
+                    self.rb.add(
+                        actions.astype(np.int32 if self.is_discrete else np.float32),
+                        rewards.astype(np.float32),
+                        terminations.astype(np.float32),
+                        truncations.astype(np.float32),
+                        real_next_obs.astype(np.float32),
+                    )
+
+                    # reset h on done
+                    done_mask = (terminations | truncations).astype(bool)
+                    if done_mask.any():
+                        L, N, H = self.hidden_h.shape
+                        hh = np.array(self.hidden_h)
+                        hh[:, done_mask, :] = 0.0
+                        self.hidden_h = jnp.asarray(hh)
+                        if self.hidden_c is not None:
+                            hc = np.array(self.hidden_c)
+                            hc[:, done_mask, :] = 0.0
+                            self.hidden_c = jnp.asarray(hc)
+
+                    obs = next_obs
+
+                    # log episodic
+                    if "final_info" in infos and self.logger:
+                        for i, info_item in enumerate(infos["final_info"]):
+                            if info_item and "episode" in info_item:
+                                train_stats_aggregator.add(info_item)
+                                if i == 0:
+                                    self.logger.log_env0_episode(info_item['episode'], update_idx, prefix="train")
+
+                    # progress bar updates in steps
+                    pbar.update(self.args.env.env_num)
+
+                # 2) Update over rollout
+                rng_np = np.random.RandomState(self.args.train.seed + update_idx)
+                metrics_accum = collections.defaultdict(float)
+                count = 0
+                for epoch in range(self.args.algo.update_epochs):
+                    for minibatch in self.rb.iterate_minibatches(self.args.algo.num_minibatches, rng_np):
+                        key_update, self.jax_key = jax.random.split(self.jax_key)
+                        (self.actor_state,
+                         self.qf1_state,
+                         self.qf2_state,
+                         self.summarizer_state,
+                         self.log_alpha_state,
+                         current_alpha_val,
+                         metrics) = self.agent.update_step_on_policy(
+                            self.actor_state,
+                            self.qf1_state,
+                            self.qf2_state,
+                            self.summarizer_state,
+                            self.log_alpha_state if self.args.algo.autotune else self.log_alpha_state,
+                            minibatch,
+                            key_update
+                        )
+                        for k, v in metrics.items():
+                            metrics_accum[k] += float(v)
+                        count += 1
+
+                if count > 0:
+                    for k in list(metrics_accum.keys()):
+                        metrics_accum[k] /= count
+
+                # soft-update targets once per rollout
+                tau = self.args.algo.tau
+                self.qf1_state = self.qf1_state.replace(
+                    target_params=optax.incremental_update(self.qf1_state.params, self.qf1_state.target_params, tau),
+                    target_batch_stats=optax.incremental_update(self.qf1_state.batch_stats, self.qf1_state.target_batch_stats, tau) if self.qf1_state.batch_stats is not None else self.qf1_state.target_batch_stats
+                )
+                self.qf2_state = self.qf2_state.replace(
+                    target_params=optax.incremental_update(self.qf2_state.params, self.qf2_state.target_params, tau),
+                    target_batch_stats=optax.incremental_update(self.qf2_state.batch_stats, self.qf2_state.target_batch_stats, tau) if self.qf2_state.batch_stats is not None else self.qf2_state.target_batch_stats
+                )
+                self.summarizer_state = self.summarizer_state.replace(
+                    target_params=optax.incremental_update(self.summarizer_state.params, self.summarizer_state.target_params, tau)
+                )
+
+                # logging
+                sps = int(pbar.format_dict['rate']) if pbar.format_dict.get('rate') else 0
+                pbar_postfix["SPS"] = sps
+                log_data = {f"metrics/{k}": v for k, v in metrics_accum.items()}
+                buffered_stats = train_stats_aggregator.get_aggregated_stats()
+                if buffered_stats:
+                    for k, v in buffered_stats.items():
+                        log_data[f"train_buffered/{k}"] = v
+                    if 'return_mean' in buffered_stats:
+                        pbar_postfix["return_mean"] = f"{buffered_stats['return_mean']:.2f}"
+                if self.args.wandb.track:
+                    wandb.log(log_data, step=update_idx)
+
+                # evaluation & checkpointing (in rollout units)
+                current_step = self.initial_global_step + (update_idx + 1) * self.args.env.env_num * self.args.algo.num_steps
+                next_step = self.initial_global_step + ((update_idx + 2) * self.args.env.env_num * self.args.algo.num_steps)
+                self._run_evaluation(current_step - 1, next_step - 1)
+                self._save_checkpoint(current_step - 1, next_step - 1)
+
+                pbar.set_postfix(pbar_postfix, refresh=False)
         profiler.stop()
         profiler.print()
         jax_profiler.stop_trace()
