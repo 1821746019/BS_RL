@@ -23,45 +23,33 @@ class EnvConfig:
 class AlgoConfig:
     total_timesteps: int = 5000000
     """total timesteps of the experiments"""
-    buffer_size: int = int(1e6)
-    """the replay memory buffer size"""
+    learning_rate: float = 3e-4
+    """the learning rate of the optimizer"""
+    num_steps: int = 128
+    """the number of steps to run in each environment per policy rollout"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    tau: float = 1.0  # Original SAC discrete paper and CleanRL use 1.0 for hard updates for discrete
-    """target smoothing coefficient (default: 1.0 for hard update)"""
-    batch_size: int = 256
-    """the batch size of sample from the reply memory"""
-    learning_starts: int = 20000
-    """timestep to start learning"""
-    policy_lr: float = 3e-4
-    """the learning rate of the policy network optimizer"""
-    q_lr: float = 3e-4
-    """the learning rate of the Q network network optimizer"""
-    update_frequency: int = 4
-    """the frequency of training updates in environment steps"""
-    target_network_frequency: int = 8000 # In environment steps
-    """the frequency of updates for the target networks"""
-    updates_per_call: int = 1
-    """number of gradient updates to perform inside a single JIT call to reduce host-device overhead"""
-    alpha: float = 0.2
-    """Entropy regularization coefficient."""
-    autotune: bool = True
-    """automatic tuning of the entropy coefficient"""
-    target_entropy_scale: float = 0.89 # From CleanRL's sac_atari.py
-    """coefficient for scaling the autotune entropy target (e.g., 0.89 for Atari)"""
+    gae_lambda: float = 0.95
+    """the lambda for the general advantage estimation"""
+    num_minibatches: int = 4
+    """the number of mini-batches"""
+    update_epochs: int = 4
+    """the K epochs to update the policy"""
+    clip_coef: float = 0.2
+    """the surrogate clipping coefficient"""
+    ent_coef: float = 0.0
+    """coefficient of the entropy"""
+    vf_coef: float = 0.5
+    """coefficient of the value function"""
+    max_grad_norm: float = 0.5
+    """the maximum norm for the gradient clipping"""
     # JAX-specific Adam epsilon, matching PyTorch default for fair comparison
-    adam_eps: float = 1e-4 # CleanRL used 1e-4 for PyTorch Adam, default optax Adam is 1e-8.
+    adam_eps: float = 1e-5 # PPO used 1e-5
     use_SGD: bool = False
     """whether to use SGD instead of AdamW"""
     # RSAC-share specific
-    rb_seg_len: int = int(1440*7)
-    """Segment length for replay buffer."""
-    train_unroll_steps: int = 1440
-    """sequence length for calc loss"""
     burn_in: int = 1440 # 1440m = 1d
     """Number of prefix steps used only to roll LSTM hidden state (excluded from loss)."""
-    rb_min_gap: int = 1
-    """Minimum gap between sequences in the same segment."""
 @dataclass
 class WandbConfig:
     track: bool = True
@@ -131,6 +119,8 @@ class NetworkConfig:
     critic_dropout_rate: float = 0
     encoder_type: str = "none"  # "none"
     activation:str = "gelu"
+    summarizer_grad_from_actor: bool = False
+    """Whether to allow gradients from actor to update summarizer."""
 
     # RSAC-share specific
     market_feature_dim: int = 0

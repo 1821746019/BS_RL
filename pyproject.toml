@@ -33,6 +33,7 @@ dependencies = [
     "pyinstrument",
     "xprof",
     "tensorflow_probability<=0.25",
+    "distrax", # distrax底层依赖tensorflow_probability？
     # "tf-keras",
     # "tensorflow==2.18",
     # "tensorboard==2.18",

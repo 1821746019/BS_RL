@@ -12,9 +12,13 @@ if __name__ == "__main__":
     encoder="none"
     total_timesteps = int(200e6)
     resume = True
-    batch_size = 256
-    env_id = f"TradingEnv{trading_timeframe}"
     env_num = 96
+    num_steps = 2048
+    batch_size = int(num_steps * env_num)
+    num_minibatches = 32
+    update_epochs = 4
+
+    env_id = f"TradingEnv{trading_timeframe}"
     eval_env_num = 12 # 从48改为12减少评估耗时，若能实现异步评估就更好了
     eval_episodes = eval_env_num
     trading_env_config = TradingEnvConfig(
@@ -23,7 +27,6 @@ if __name__ == "__main__":
         reward_schema=reward_schema
     )
     is_test = total_timesteps!=int(200e6)
-    learning_starts = int(batch_size) if is_test else int(2e4)
     ckpt_save_frequency = None if is_test else 0.01
     eval_frequency = None if is_test else 0.01
     async_vector_env = True # 开启以利用CPU多核。v3-8的CPU主频似乎v4-8低很多，实测SPS会低近1半(900-->500)
@@ -54,21 +57,20 @@ if __name__ == "__main__":
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
-            buffer_size=int(1e5),
-            learning_starts=learning_starts, 
-            batch_size=batch_size,
-            update_frequency=4, # Update more frequently for simpler envs
-            target_network_frequency=int(8e3),
+            learning_rate=3e-4,
+            num_steps=num_steps,
             gamma=valid_step_to_gamma(valid_step), 
-            tau=1, # Softer updates can be better for MLP envs, but 1.0 is also fine
-            policy_lr=3e-4*np.log1p(batch_size/64), 
-            q_lr=3e-4*np.log1p(batch_size/64),
-            autotune=True,
-            target_entropy_scale=0.89*(6/11), # 无操作(1)、多空减减仓(4)、其它的权重视为(1)
-            adam_eps=1e-4
+            gae_lambda=0.95,
+            num_minibatches=num_minibatches,
+            update_epochs=update_epochs,
+            clip_coef=0.2,
+            ent_coef=0.01,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            adam_eps=1e-5
         ),
         wandb=WandbConfig(
-            project_name="SAC_TradingEnv",
+            project_name="PPO_TradingEnv",
             entity=None # Your WandB entity
         )
     )

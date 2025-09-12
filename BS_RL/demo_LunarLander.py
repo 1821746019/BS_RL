@@ -2,7 +2,6 @@ import numpy as np
 import tyro
 import gymnasium as gym
 from BS_RL.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
-from BS_RL.nn.ResMLP import ResMLPConfig, ResidualStrategy
 from BS_RL.train import Trainer
 from BS_RL.common import gym_train_env_maker, gym_eval_env_maker
 import os
@@ -78,13 +77,13 @@ class GymTrainer(Trainer):
 if __name__ == "__main__":
     # LunarLanderContinuous参数配置
     total_timesteps = int(1e6)  # 100万步，足够测试收敛性
-    batch_size = int(32)
-    env_num = 1  # SAC通常使用单环境
+    num_steps = 128
+    env_num = 128
+    num_minibatches = 4
+    update_epochs = 10
     eval_env_num = 10
     eval_episodes = 10
-    train_unroll_steps = 8
     is_test = total_timesteps != int(1e6)
-    learning_starts = 28400 if is_test else 10000 # 28400用于测试rb性能是否会随segment_len的增大而下降
     ckpt_save_frequency = 0
     eval_frequency = 0 if is_test else 0.1
     
@@ -95,11 +94,11 @@ if __name__ == "__main__":
     args = Args(
         train=TrainConfig(
             jax_platform_name="",
-            exp_name="LunarLanderContinuous-RSAC",
+            exp_name="LunarLanderContinuous-PPO",
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,
-            save_dir=f"runs/LunarLanderContinuous_RSAC",
-            async_vector_env=False,
+            save_dir=f"runs/LunarLanderContinuous_PPO",
+            async_vector_env=True,
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,
@@ -128,38 +127,32 @@ if __name__ == "__main__":
             lstm_num_layers=1,
             use_pretrained_summarizer_path=None,
             train_summarizer=True,
+            use_s5_summarizer=False, # LunarLander is not a long sequence problem
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
-            buffer_size=int(1e6),
-            learning_starts=learning_starts,
-            batch_size=batch_size,
-            update_frequency=1,  # 每步都更新
-            target_network_frequency=1,  # 软更新，每步更新
+            learning_rate=3e-4,
+            num_steps=num_steps,
             gamma=0.99,
-            tau=0.005,  # 连续动作用软更新，官方推荐的超参
-            policy_lr=3e-4,
-            q_lr=3e-4,
-            autotune=True,  # 自动调节熵系数
-            target_entropy_scale=1.0,  # 连续动作的标准设置
-            adam_eps=1e-4,
-            rb_seg_len=train_unroll_steps,
-            train_unroll_steps=train_unroll_steps,
+            gae_lambda=0.95,
+            num_minibatches=num_minibatches,
+            update_epochs=update_epochs,
+            clip_coef=0.2,
+            ent_coef=0.0,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            adam_eps=1e-5,
             burn_in=0,
-            rb_min_gap=1,
-            updates_per_call=8,
         ),
         wandb=WandbConfig(
             track=os.getenv("USE_WANDB", "true").lower() == "true",
-            project_name="RSAC-Continuous_LunarLander",
+            project_name="PPO-Continuous_LunarLander",
             entity=None
         )
     )
     
-    print("开始训练RSAC-share在LunarLanderContinuous环境...")
+    print("开始训练PPO-share在LunarLanderContinuous环境...")
     print(f"总步数: {total_timesteps:,}")
-    print(f"批次大小: {batch_size}")
-    print(f"学习开始步数: {learning_starts:,}")
     print(f"预期奖励: > 200 (成功着陆)")
     
     # 使用专门的gym训练器

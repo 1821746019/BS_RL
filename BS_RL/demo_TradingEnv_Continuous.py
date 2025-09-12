@@ -3,9 +3,7 @@ import numpy as np
 import tyro
 import gymnasium as gym
 from BS_RL.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
-from BS_RL.nn.ResMLP import ResMLPConfig, ResidualStrategy
 from BS_RL.train import train
-from BS_RL.common import gym_train_env_maker, gym_eval_env_maker
 import os
 from TradingEnv import TradingEnvConfig
 
@@ -16,16 +14,14 @@ if __name__ == "__main__":
     use_SGD = False
     total_timesteps = int(10e6) 
     env_num = 32
-    batch_size = 4
-    updates_per_call = 8
+    num_steps = 128
+    num_minibatches = 4
     async_vector_env = True if env_num > 1 else False
-    eval_env_num = 48
+    eval_env_num = 16
     async_vector_env_eval = True if eval_env_num > 1 else False
-    exp_name = f"env_num({env_num})_window({window_size})_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
+    exp_name = f"env_num({env_num})_window({window_size})_{env_id}_PPO_{'SGD' if use_SGD else 'AdamW'}"
     eval_episodes = 1
-    train_unroll_steps = 16
     is_test = total_timesteps == int(1e6)
-    learning_starts = 1000 if is_test else 30000
     ckpt_save_frequency = 0.1 if is_test else 0.1
     eval_frequency = 0.1 if is_test else 0.1
     
@@ -36,7 +32,7 @@ if __name__ == "__main__":
             exp_name=exp_name,
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,  # 首次运行设为False
-            save_dir=f"runs/SAC_{env_id}",
+            save_dir=f"runs/PPO_{env_id}",
             async_vector_env=async_vector_env,
         ),
         eval=EvalConfig(
@@ -62,31 +58,26 @@ if __name__ == "__main__":
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
-            buffer_size=int(10e6),  # 大缓冲区有助于稳定训练
-            learning_starts=learning_starts,
-            batch_size=batch_size,
-            update_frequency=1,  # 每步都更新
-            target_network_frequency=1,  # 软更新，每步更新
+            learning_rate=3e-4,
+            num_steps=num_steps,
             gamma=0.99,
-            tau=0.005,  # 连续动作通常用软更新
-            policy_lr=3e-4,
-            q_lr=3e-4,
-            autotune=True,  # 自动调节熵系数
-            target_entropy_scale=1.0,  # 连续动作的标准设置
-            adam_eps=1e-4,
+            gae_lambda=0.95,
+            num_minibatches=num_minibatches,
+            update_epochs=10,
+            clip_coef=0.2,
+            ent_coef=0.0,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            adam_eps=1e-5,
             use_SGD=use_SGD,
-            updates_per_call=updates_per_call,
-            train_unroll_steps=train_unroll_steps
         ),
         wandb=WandbConfig(
             track=True,
-            project_name=f"{env_id}",
+            project_name=f"PPO_{env_id}",
             entity=None
         )
     )
     
     print(f"总步数: {total_timesteps:,}")
-    print(f"批次大小: {batch_size}")
-    print(f"学习开始步数: {learning_starts:,}")
     print(f"使用SGD: {args.algo.use_SGD}")
     train(args)
