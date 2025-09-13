@@ -42,10 +42,13 @@ class Actor(nn.Module):
         features = activation_fn(features)
         
         if self.is_continuous:
-            mean = nn.Dense(self.action_dim, name="mean")(features)
-            log_std = nn.Dense(self.action_dim, name="log_std")(features)
-            log_std = jnp.clip(log_std, LOG_STD_MIN, LOG_STD_MAX)
-            return mean, log_std
+            # Use Beta distribution for bounded actions
+            alpha_logits = nn.Dense(self.action_dim, name="alpha")(features)
+            beta_logits = nn.Dense(self.action_dim, name="beta")(features)
+            # Ensure alpha, beta > 1 for more stable gradients, centered around 0.5
+            alpha = nn.softplus(alpha_logits) + 1.0
+            beta = nn.softplus(beta_logits) + 1.0
+            return alpha, beta
         else:
             logits = nn.Dense(self.action_dim)(features)
             return logits
@@ -127,8 +130,17 @@ class ActorCritic(nn.Module):
         
         # --- Actor ---
         if self.is_continuous:
-            mean, log_std = self.actor(actor_features, deterministic=deterministic)
-            pi = distrax.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
+            alpha, beta = self.actor(actor_features, deterministic=deterministic)
+            # Create Beta distribution and transform from [0,1] to [-1,1]
+            base_dist = distrax.Beta(alpha=alpha, beta=beta)
+            # Make it independent across action dimensions so log_prob sums over dimensions
+            base_dist = distrax.Independent(base_dist, reinterpreted_batch_ndims=1)
+            # Linear transformation: x_new = 2 * x_old - 1, maps [0,1] -> [-1,1]
+            # Use Block to apply ScalarAffine to each dimension independently
+            pi = distrax.Transformed(
+                distribution=base_dist,
+                bijector=distrax.Block(distrax.ScalarAffine(shift=-1.0, scale=2.0), ndims=1)
+            )
         else:
             logits = self.actor(actor_features, deterministic=deterministic)
             pi = distrax.Categorical(logits=logits)
