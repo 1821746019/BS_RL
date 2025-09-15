@@ -64,7 +64,7 @@ if __name__ == "__main__":
             policy_lr=3e-4*np.log1p(batch_size/64), 
             q_lr=3e-4*np.log1p(batch_size/64),
             autotune=True,
-            target_entropy_scale=0.89*(6/11), # 无操作(1)、多空减减仓(4)、其它的权重视为(1)
+            target_entropy_scale_for_disc=0.89*(6/11), # 无操作(1)、多空减减仓(4)、其它的权重视为(1)
             adam_eps=1e-4
         ),
         wandb=WandbConfig(

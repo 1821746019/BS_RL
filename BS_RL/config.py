@@ -47,7 +47,8 @@ class AlgoConfig:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
-    target_entropy_scale: float = 0.89 # From CleanRL's sac_atari.py
+    target_entropy_scale_for_disc: float = 0.89 # From CleanRL's sac_atari.py
+    target_entropy_scale_for_cont: float = 1 # 连续动作的标准设置，官方推荐将target_entropy设为-action_dim，所以设为1即不缩放
     """coefficient for scaling the autotune entropy target (e.g., 0.89 for Atari)"""
     # JAX-specific Adam epsilon, matching PyTorch default for fair comparison
     adam_eps: float = 1e-4 # CleanRL used 1e-4 for PyTorch Adam, default optax Adam is 1e-8.

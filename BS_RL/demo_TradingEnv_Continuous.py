@@ -72,7 +72,6 @@ if __name__ == "__main__":
             policy_lr=3e-4,
             q_lr=3e-4,
             autotune=True,  # 自动调节熵系数
-            target_entropy_scale=1.0,  # 连续动作的标准设置
             adam_eps=1e-4,
             use_SGD=use_SGD,
             updates_per_call=updates_per_call,

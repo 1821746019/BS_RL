@@ -72,9 +72,9 @@ class RSACAgent:
             self.current_alpha = jnp.array(algo_config.alpha)
         
         if self.is_discrete:
-            self.target_entropy = -self.algo_config.target_entropy_scale * jnp.log(1.0 / self.action_dim)
+            self.target_entropy = -self.algo_config.target_entropy_scale_for_disc * jnp.log(1.0 / self.action_dim)
         else:
-            self.target_entropy = -float(self.action_dim) * self.algo_config.target_entropy_scale
+            self.target_entropy = -float(self.action_dim) * self.algo_config.target_entropy_scale_for_cont
 
     def _init_model_with_batch_stats(self, model, key, *args, **kwargs):
         variables = model.init({'params': key, 'dropout': key}, *args, **kwargs)
