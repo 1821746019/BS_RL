@@ -634,7 +634,7 @@ class S5Summarizer(nn.Module):
             discretization="zoh",
             dt_min=self.delta_min,
             dt_max=self.delta_max,
-            conj_sym=True,
+            conj_sym=False, # 为True有bug，应该是官方代码的问题。TypeError: dot_general requires contracting dimensions to have the same shape, got (128,) and (256,).
             clip_eigs=False,
             bidirectional=False,
         )
