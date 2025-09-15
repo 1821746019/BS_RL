@@ -23,8 +23,8 @@ from tqdm.auto import tqdm
 import joblib
 from BS_RL.config import Args
 from BS_RL.common import profile, train_env_maker, MetricLogger, StatsAggregator, jax_profiler
-from BS_RL.networks import TradingActorDiscrete, TradingCriticDiscrete, TradingActorContinuous, TradingCriticContinuous
-from BS_RL.SACAgent import RSACAgentDiscrete, RSACAgentContinuous, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState, TrainState
+from BS_RL.networks import Actor, Critic
+from BS_RL.SACAgent import RSACAgent, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState, TrainState
 from BS_RL.eval import Evaluator
 from TradingEnv import DataLoader, DataLoaderConfig
 from BS_RL.replay_buffer import RecurrentReplayBuffer
@@ -46,7 +46,7 @@ class Trainer:
         self.initial_global_step = 0
         self.jax_key: jax.Array
         self.envs: AsyncVectorEnv| SyncVectorEnv
-        self.agent : RSACAgentDiscrete|RSACAgentContinuous
+        self.agent : RSACAgent
         self.rb: RecurrentReplayBuffer
         self.actor_state: TrainStateWithBatchStats
         self.qf1_state: CriticTrainState
@@ -183,24 +183,18 @@ class Trainer:
         obs_shape = self.envs.single_observation_space.shape
         if self.is_discrete:
             action_dim = self.envs.single_action_space.n # type: ignore
-            actor_model_cls, critic_model_cls = TradingActorDiscrete, TradingCriticDiscrete
-            agent_cls = RSACAgentDiscrete
-            print(f"Using RSAC-Share Discrete with action dim: {action_dim}")
+            print(f"Discrete action space detected with action dim: {action_dim}")
         else:
             action_dim = self.envs.single_action_space.shape[0] # type: ignore
-            actor_model_cls, critic_model_cls = TradingActorContinuous, TradingCriticContinuous
-            agent_cls = RSACAgentContinuous
-            print(f"Using RSAC-Share Continuous with action dim: {action_dim}")
 
         key_agent, self.jax_key = jax.random.split(self.jax_key)
-        self.agent = agent_cls(
+        self.agent = RSACAgent(
             action_dim=action_dim,
             observation_space_shape=obs_shape,
             key=key_agent,
             network_config=self.args.network,
             algo_config=self.args.algo,
-            actor_model_cls=actor_model_cls, # type: ignore
-            critic_model_cls=critic_model_cls # type: ignore
+            is_discrete=self.is_discrete
         )
         self.actor_state = self.agent.actor_state
         self.qf1_state = self.agent.qf1_state

@@ -1,7 +1,7 @@
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-from typing import List, Callable, Sequence
+from typing import List, Callable, Sequence, Optional
 from .config import NetworkConfig
 from .nn.ResNet1DEncoder import ResNet1DEncoder
 from .nn.Simba import SimbaMLPResidualBlock, RSNorm, SimbaMLP
@@ -21,72 +21,58 @@ class FeatExtractor(nn.Module):
     dropout_rate: float = 0.1
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
-        # 对x(obs)应用RSNorm
-        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
         x = SimbaMLP(net_arch=self.net_arch, dropout_rate=self.dropout_rate)(x, deterministic=deterministic)
         return x
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
     
-class TradingActorContinuous(nn.Module):
+class Actor(nn.Module):
     network_config: NetworkConfig
     action_dim: int
+    is_discrete: bool
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         # x is [B, H+agent_feat]
-        x = FeatExtractor(net_arch=self.network_config.actor_net_arch, dropout_rate=self.network_config.actor_dropout_rate)(x, deterministic=deterministic)
-        x = nn.LayerNorm()(x)
-        x = nn.gelu(x)
-        mean = nn.Dense(self.action_dim, name="mean")(x)
-        log_std = nn.Dense(self.action_dim, name="log_std")(x)
-        log_std = jnp.clip(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        
-        return mean, log_std
-
-class TradingCriticContinuous(nn.Module):
-    network_config: NetworkConfig
-    
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, action: jnp.ndarray, deterministic: bool):
-        # x is [B, H+agent_feat]
-        x = FeatExtractor(net_arch=self.network_config.actor_net_arch, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
-        x = nn.LayerNorm()(x)
-        x = nn.gelu(x)
-        x = jnp.concatenate([x, action], axis=-1)
-        # 将市场账户仓位特征和action拼接后，多用一层处理，
-        x = SimbaMLP(net_arch=[self.network_config.actor_net_arch[0]], dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
-        x = nn.LayerNorm()(x)
-        x = nn.gelu(x)
-        q_value = nn.Dense(1)(x).squeeze(-1)
-        
-        return q_value
-
-class TradingActorDiscrete(nn.Module):
-    network_config: NetworkConfig
-    action_dim: int
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool):
-        activation_fn = get_activation(self.network_config.activation)
-        # x is [B, H+agent_feat]
-        features = FeatExtractor(net_arch=self.network_config.actor_net_arch, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
+        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
+        features = FeatExtractor(net_arch=self.network_config.actor_net_arch, dropout_rate=self.network_config.actor_dropout_rate)(x, deterministic=deterministic)
         features = nn.LayerNorm(name="final_norm")(features)
+        activation_fn = get_activation(self.network_config.activation)
         features = activation_fn(features)
-        logits = nn.Dense(self.action_dim)(features)
-        return logits
 
-class TradingCriticDiscrete(nn.Module):
+        if self.is_discrete:
+            logits = nn.Dense(self.action_dim)(features)
+            return logits
+        else:
+            mean = nn.Dense(self.action_dim, name="mean")(features)
+            log_std = nn.Dense(self.action_dim, name="log_std")(features)
+            log_std = jnp.clip(log_std, LOG_STD_MIN, LOG_STD_MAX)
+            return mean, log_std
+
+class Critic(nn.Module):
     network_config: NetworkConfig
     action_dim: int
-    
+    is_discrete: bool
+
     @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool):
-        activation_fn = get_activation(self.network_config.activation)
+    def __call__(self, x: jnp.ndarray, deterministic: bool, action: Optional[jnp.ndarray] = None):
         # x is [B, H+agent_feat]
-        features = FeatExtractor(net_arch=self.network_config.actor_net_arch, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
+        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
+        features = FeatExtractor(net_arch=self.network_config.critic_net_arch, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
         features = nn.LayerNorm(name="final_norm")(features)
+        activation_fn = get_activation(self.network_config.activation)
         features = activation_fn(features)
-        q_values = nn.Dense(self.action_dim)(features)
-        return q_values
+        
+        if self.is_discrete:
+            q_values = nn.Dense(self.action_dim)(features)
+            return q_values
+        else:
+            assert action is not None, "Action must be provided for continuous critic"
+            # The continuous critic in original code has different structure
+            x = jnp.concatenate([features, action], axis=-1)
+            x = SimbaMLP(net_arch=[self.network_config.critic_net_arch[0]], dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
+            x = nn.LayerNorm()(x)
+            x = activation_fn(x)
+            q_value = nn.Dense(1)(x).squeeze(-1)
+            return q_value
