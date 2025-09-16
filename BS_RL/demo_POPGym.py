@@ -80,18 +80,18 @@ class GymTrainer(Trainer):
 
 if __name__ == "__main__":
     # POPGym RepeatPreviousHard-v0 参数配置
-    total_timesteps = int(0.5e6)
+    total_timesteps = int(1e6)
     env_num = 16
     eval_env_num = 16
     eval_episodes = 16
-    rb_seg_len = 200 # 最长回合长度
-    batch_size = round(256 / rb_seg_len)
-    burn_in = 5 # 智能体必须准确地“说出”它在5步之前看到的那个数字
+    rb_seg_len = 155 # 最长回合长度
+    batch_size = 8 #round(256 / rb_seg_len) *
+    burn_in = 5 # 智能体必须准确地“说出”它在5步之前看到的那个数字，开始5步agent是不知道答案的
     train_unroll_steps = rb_seg_len - burn_in
     learning_starts = 10000
     is_test = False
     ckpt_save_frequency = 0
-    eval_frequency = 0 if is_test else 0.05
+    eval_frequency = 0 if is_test else 0.1
     updates_per_call = 16
     # 针对POPGym优化的网络配置
     # 观察空间: Box(0, 1, (1,), float32)
@@ -129,6 +129,7 @@ if __name__ == "__main__":
             market_feature_dim=1,  # POPGym obs dim
             agent_feature_dim=0,
             use_pretrained_summarizer_path=None,
+            use_s5_summarizer=True,
             train_summarizer=True,
         ),
         algo=AlgoConfig(
@@ -165,6 +166,7 @@ if __name__ == "__main__":
     
     # 使用专门的gym训练器
     trainer = GymTrainer(args, env_id="popgym-RepeatPreviousHard-v0")
+    # trainer = GymTrainer(args, env_id="CartPole-v1")
     trainer.setup()
     trainer.train() 
 

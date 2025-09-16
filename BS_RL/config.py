@@ -33,6 +33,8 @@ class AlgoConfig:
     """the batch size of sample from the reply memory"""
     learning_starts: int = 20000
     """timestep to start learning"""
+    summarizer_lr: float = 1e-5
+    """the learning rate of the summarizer network optimizer"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
     q_lr: float = 3e-4
@@ -47,6 +49,11 @@ class AlgoConfig:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+    # Added alpha bounds to stabilize autotuning
+    alpha_min: float = 0 # 探索温度下限，设为0等于不设置。1e-6
+    """Minimum alpha when autotune is enabled (clamped)."""
+    alpha_max: float = 1.0 # 1 can avoid alpha value explosion for CartPole-v1
+    """Maximum alpha when autotune is enabled (clamped)."""
     target_entropy_scale_for_disc: float = 0.89 # From CleanRL's sac_atari.py
     target_entropy_scale_for_cont: float = 1 # 连续动作的标准设置，官方推荐将target_entropy设为-action_dim，所以设为1即不缩放
     """coefficient for scaling the autotune entropy target (e.g., 0.89 for Atari)"""
@@ -86,7 +93,7 @@ class TrainConfig:
     resume: bool = False
     """Whether to resume training from the latest checkpoint in save_dir/ckpts/."""
     log_freq: int = 100
-    "Frequency to log metrics to terminal and wandb"
+    """Frequency to log metrics to terminal and wandb"""
     ckpt_save_frequency: Union[float, int] = 0.01
     """Frequency to save a checkpoint. If > 1, it's absolute steps. If (0, 1], it's fraction of total_timesteps."""
     ckpt_save_frequency_abs_steps: Optional[int] = None # Will be populated by Args.__post_init__
@@ -97,7 +104,7 @@ class TrainConfig:
     """whether to use async vector env"""
     seed: int = 996
     np_rng: np.random.Generator = field(init=False)
-    "无需外部传参初始化, 在post_init中用seed初始化"
+    """无需外部传参初始化, 在post_init中用seed初始化"""
     def __post_init__(self):
         if self.jax_platform_name is None:
             # 自动选择可用后端

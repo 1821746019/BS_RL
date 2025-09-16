@@ -51,7 +51,10 @@ class RSACAgent:
         self.actor_optimizer = optimizer
         self.critic_optimizer = optimizer
         self.alpha_optimizer = optimizer
-        self.summarizer_optimizer = optimizer
+        self.summarizer_optimizer = optax.chain(
+            optax.clip_by_global_norm(self.norm_limit),
+            optax.sgd(learning_rate=self.algo_config.summarizer_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.summarizer_lr, eps=self.algo_config.adam_eps),
+        )
 
         self.obs_dim = obs_dim
         self.market_feature_dim = self.network_config.market_feature_dim if self.network_config.market_feature_dim > 0 else self.obs_dim - self.network_config.agent_feature_dim
@@ -410,8 +413,11 @@ class RSACAgent:
             
             alpha_loss_val, alpha_grads = jax.value_and_grad(alpha_loss_fn)(log_alpha_state.params)
             log_alpha_state_updated = log_alpha_state.apply_gradients(grads=alpha_grads)
+            # clamp updated log_alpha and alpha
+            alpha_clamped = jnp.clip(jnp.exp(log_alpha_state_updated.params['log_alpha']), self.algo_config.alpha_min, self.algo_config.alpha_max)
+            log_alpha_state_updated = log_alpha_state_updated.replace(params={'log_alpha': jnp.log(alpha_clamped)})
             log_alpha_state_to_return = log_alpha_state_updated
-            current_alpha_to_return = jnp.exp(log_alpha_state_updated.params['log_alpha'])
+            current_alpha_to_return = alpha_clamped
 
         metrics = {
             'critic_loss': critic_loss_val,
