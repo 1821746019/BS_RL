@@ -29,7 +29,7 @@ class SummarizerTrainState(TrainState):
 class RSACAgent:
     def __init__(self,
                  action_dim: int,
-                 observation_space_shape,
+                 obs_dim: int,
                  key: jax.Array,
                  network_config: NetworkConfig,
                  algo_config: AlgoConfig,
@@ -53,7 +53,7 @@ class RSACAgent:
         self.alpha_optimizer = optimizer
         self.summarizer_optimizer = optimizer
 
-        self.obs_dim = int(jnp.prod(jnp.array(observation_space_shape))) if len(observation_space_shape) == 1 else observation_space_shape[-1]
+        self.obs_dim = obs_dim
         self.market_feature_dim = self.network_config.market_feature_dim if self.network_config.market_feature_dim > 0 else self.obs_dim - self.network_config.agent_feature_dim
         self.agent_feature_dim = self.network_config.agent_feature_dim
         if self.market_feature_dim + self.agent_feature_dim != self.obs_dim:
@@ -178,6 +178,8 @@ class RSACAgent:
     def select_action(self, actor_state: TrainState, summarizer_params: flax.core.FrozenDict,
                       obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
                       key: jax.Array, deterministic: bool = False):
+        if obs.ndim == 1 and self.obs_dim == 1:
+            obs = obs[:, None] # obs为标量时应视作长度为1的1D数组，Reshape from (N,) to (N, 1) if obs is a squeezed 1D array for envs with obs_dim=1
         market = obs[..., :self.market_feature_dim]
         agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0))
         seq = market[:, None, :]

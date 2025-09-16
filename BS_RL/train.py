@@ -179,9 +179,12 @@ class Trainer:
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
         if not self.is_discrete:
             print("Continuous action space detected.")
+        obs_shape = self.envs.single_observation_space.shape
+        # 有些环境的观测可能是多维的。比如，一个自定义环境的观测可能是 (10, 2)，代表 10 个时间步，每个时间步有 2 个特征。在这种情况下，如果智能体的循环网络（RNN/LSTM）一次只处理一个时间步的数据，那么它关心的特征维度就是 2。shape[-1] 恰好能取出这个最后的维度 2
+        # 约定:观测数据是向量形式的，并且最后一个维度代表了特征数。
+        self.obs_dim = 1 if len(obs_shape) == 0 else obs_shape[-1]
 
     def _setup_agent(self):
-        obs_shape = self.envs.single_observation_space.shape
         if self.is_discrete:
             action_dim = self.envs.single_action_space.n # type: ignore
             print(f"Discrete action space detected with action dim: {action_dim}")
@@ -191,7 +194,7 @@ class Trainer:
         key_agent, self.jax_key = jax.random.split(self.jax_key)
         self.agent = RSACAgent(
             action_dim=action_dim,
-            observation_space_shape=obs_shape,
+            obs_dim=self.obs_dim,
             key=key_agent,
             network_config=self.args.network,
             algo_config=self.args.algo,
@@ -288,7 +291,6 @@ class Trainer:
 
     def _setup_replay_buffer(self):
         print("Creating recurrent replay buffer with segment-based storage.")
-        obs_dim = int(np.prod(self.envs.single_observation_space.shape)) if len(self.envs.single_observation_space.shape) == 1 else self.envs.single_observation_space.shape[-1]
         if self.is_discrete:
             action_shape = ()
         else:
@@ -297,7 +299,7 @@ class Trainer:
         # Assuming average episode length, convert buffer_size (in steps) to segments
         capacity_segments = max(self.args.algo.buffer_size // self.args.algo.rb_seg_len, 1)
         self.rb = RecurrentReplayBuffer(
-            obs_dim=obs_dim,
+            obs_dim=self.obs_dim,
             action_shape=action_shape,
             is_discrete_action=self.is_discrete,
             capacity_segments=capacity_segments,

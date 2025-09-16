@@ -7,11 +7,12 @@ from BS_RL.train import Trainer
 from BS_RL.common import gym_train_env_maker, gym_eval_env_maker
 import os
 from TradingEnv import TradingEnvConfig
+import popgym
 
 class GymTrainer(Trainer):
     """适配标准gym环境的训练器"""
     
-    def __init__(self, args: Args, env_id: str = "LunarLanderContinuous-v2"):
+    def __init__(self, args: Args, env_id: str):
         super().__init__(args)
         self.env_id = env_id
     
@@ -31,8 +32,9 @@ class GymTrainer(Trainer):
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
         action_type = "离散" if self.is_discrete else "连续"
         print(f"检测到{action_type}动作空间")
-        self.obs_dim = self.envs.single_observation_space.shape[-1]
-        
+        obs_shape = self.envs.single_observation_space.shape
+        self.obs_dim = 1 if len(obs_shape) == 0 else obs_shape[-1]
+    
     def _setup_evaluator(self):
         if self.args.eval.eval_episodes <= 0:
             return
@@ -77,29 +79,31 @@ class GymTrainer(Trainer):
         )
 
 if __name__ == "__main__":
-    # LunarLanderContinuous参数配置
-    total_timesteps = int(1e6)  # 100万步，足够测试收敛性
-    batch_size = int(32)
-    env_num = 1  # SAC通常使用单环境
-    eval_env_num = 10
-    eval_episodes = 10
-    train_unroll_steps = 8
-    is_test = total_timesteps != int(1e6)
-    learning_starts = 28400 if is_test else 10000 # 28400用于测试rb性能是否会随segment_len的增大而下降
+    # POPGym RepeatPreviousHard-v0 参数配置
+    total_timesteps = int(0.5e6)
+    env_num = 16
+    eval_env_num = 16
+    eval_episodes = 16
+    rb_seg_len = 200 # 最长回合长度
+    batch_size = round(256 / rb_seg_len)
+    burn_in = 5 # 智能体必须准确地“说出”它在5步之前看到的那个数字
+    train_unroll_steps = rb_seg_len - burn_in
+    learning_starts = 10000
+    is_test = False
     ckpt_save_frequency = 0
-    eval_frequency = 0 if is_test else 0.1
-    
-    # 针对LunarLanderContinuous优化的网络配置
-    # 观察空间: 8维向量 (位置、速度、角度、角速度、腿接触等)
-    # 动作空间: 2维连续 (主引擎推力 + 侧向引擎推力)
+    eval_frequency = 0 if is_test else 0.05
+    updates_per_call = 16
+    # 针对POPGym优化的网络配置
+    # 观察空间: Box(0, 1, (1,), float32)
+    # 动作空间: Discrete(3)
     
     args = Args(
         train=TrainConfig(
             jax_platform_name="",
-            exp_name="LunarLanderContinuous-RSAC",
+            exp_name="POPGym-RepeatPreviousHard-RSAC",
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,
-            save_dir=f"runs/LunarLanderContinuous_RSAC",
+            save_dir=f"runs/POPGym_RepeatPreviousHard_RSAC",
             async_vector_env=False,
         ),
         eval=EvalConfig(
@@ -108,7 +112,7 @@ if __name__ == "__main__":
             greedy_actions=True,  # 评估时使用确定性动作
             env_num=eval_env_num,
             async_vector_env=False,
-            capture_media=True,  # 记录视频
+            capture_media=False,  # POPGym环境通常非可视化
         ),
         env=EnvConfig(
             trading_env_config=TradingEnvConfig(),  # 提供默认配置，但不会使用
@@ -116,17 +120,14 @@ if __name__ == "__main__":
         ),
         network=NetworkConfig(
             # summarizer输入就是原观察（本demo使用向量），不使用额外编码器
-            shape_tickers_positions=(0, 0),
             encoder_type="none",
             actor_net_arch=[64, 64],
             critic_net_arch=[64, 64],
             actor_dropout_rate=0.0,
             critic_dropout_rate=0.0,
             # RSAC-share
-            market_feature_dim=8,  # LunarLander obs dim
+            market_feature_dim=1,  # POPGym obs dim
             agent_feature_dim=0,
-            lstm_hidden_dim=128,
-            lstm_num_layers=1,
             use_pretrained_summarizer_path=None,
             train_summarizer=True,
         ),
@@ -136,33 +137,75 @@ if __name__ == "__main__":
             learning_starts=learning_starts,
             batch_size=batch_size,
             update_frequency=1,  # 每步都更新
-            target_network_frequency=1,  # 软更新，每步更新
+            target_network_frequency=1000,  # 硬更新频率
             gamma=0.99,
-            tau=0.005,  # 连续动作用软更新，官方推荐的超参
+            tau=1.0,  # 离散动作用硬更新
             policy_lr=3e-4,
             q_lr=3e-4,
             autotune=True,  # 自动调节熵系数
             adam_eps=1e-4,
-            rb_seg_len=train_unroll_steps,
+            rb_seg_len=rb_seg_len,
             train_unroll_steps=train_unroll_steps,
-            burn_in=0,
+            burn_in=burn_in,
             rb_min_gap=1,
-            updates_per_call=8,
+            updates_per_call=updates_per_call,
         ),
         wandb=WandbConfig(
             track=os.getenv("USE_WANDB", "true").lower() == "true",
-            project_name="RSAC-Continuous_LunarLander",
+            project_name="RSAC-POPGym-RepeatPreviousHard",
             entity=None
         )
     )
     
-    print("开始训练RSAC-share在LunarLanderContinuous环境...")
+    print("开始训练RSAC-share在POPGym RepeatPreviousHard-v0环境...")
     print(f"总步数: {total_timesteps:,}")
     print(f"批次大小: {batch_size}")
     print(f"学习开始步数: {learning_starts:,}")
-    print(f"预期奖励: > 200 (成功着陆)")
+    print(f"预期成功率: > 0.8")
     
     # 使用专门的gym训练器
-    trainer = GymTrainer(args, env_id="LunarLanderContinuous-v2")
+    trainer = GymTrainer(args, env_id="popgym-RepeatPreviousHard-v0")
     trainer.setup()
     trainer.train() 
+
+"""
+popgym-RepeatPreviousHard-v0 这个“游戏”的玩法和其背后的核心挑战。
+
+这并非一个传统意义上给人玩的游戏，而是一个为训练人工智能（特别是强化学习智能体）设计的“环境”或“任务”。它的核心是考验智能体的短期记忆能力。
+
+游戏规则
+可以把这个游戏想象成一个简单的记忆力测试：
+
+输入（Observation）: 系统会一步一步地给智能体展示一个随机数字（或符号）。
+
+目标（Objective）: 在当前的这一步，智能体必须准确地“说出”它在5步之前看到的那个数字。
+
+奖励（Reward）: 如果智能体回答正确，它会得到奖励；如果回答错误，则没有奖励。
+
+一个具体的例子：
+假设游戏按顺序给智能体展示了以下数字序列：
+
+[9, 2, 5, 1, 7, 4, 6, ...]
+
+第1步到第5步: 智能体看到了 9, 2, 5, 1, 7。在这些步骤里，因为它没有“5步前”的记忆，所以无论它输出什么都无法获得奖励。它的任务是默默记住这些数字。
+
+第6步: 系统展示了数字 4。此时，智能体必须回忆起5步前（即第1步）看到的数字，也就是 9。如果它输出了 9，就得分。
+
+第7步: 系统展示了数字 6。智能体必须回忆起5步前（即第2步）看到的数字，也就是 2。如果它输出了 2，就得分。
+
+...以此类推，直到整个回合（总共200步）结束。
+
+核心挑战：为什么叫 "Hard" 并且属于 "Popgym"？
+这个任务的难点在于环境的部分可观测性 (Partially Observable)，这也是 Popgym 库所有环境的共同特点。
+
+视野局限: 智能体在任何一步都只能看到当前的数字。它无法像我们玩游戏时一样看到屏幕上完整的历史记录。
+
+内在记忆: 为了完成任务，智能体不能是一个简单的“反应机器”（看到X就做Y）。它必须在内部建立并维持一个记忆机制，例如一个长度为5的队列（Queue）。每看到一个新数字，就将其存入记忆，并挤掉最旧的那个。
+
+持续运作: 这个“存入-挤出-回忆”的过程必须在整个回合中持续、准确地进行，任何一步的记忆错乱都可能导致后续的连续失败。
+
+本质剖析
+这个任务的本质是从一个持续的数据流中，分离出信号和噪声，并根据一个固定的时间延迟（time-delay）进行信息召回。它迫使智能体学习一种非常基础但至关重要的能力：状态的表征与维持。智能体必须学会，当前所见的 4 并不是它行动的依据，而仅仅是一个更新其内部“世界模型”（在这里即为短期记忆）的信号。真正的行动依据，是它自己维持的、关于5步之前的那个内部记忆。
+
+简单来说，这个游戏就是在强迫AI学会“记事儿”，而且是记清楚“什么时候、发生了什么事”。
+"""

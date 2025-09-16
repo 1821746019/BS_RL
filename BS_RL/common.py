@@ -179,7 +179,10 @@ def gym_eval_env_maker(env_id: str, seed: int, capture_video: bool = False, run_
     def thunk():
         # 如果需要录制视频，指定render_mode
         render_mode = "rgb_array" if capture_video else None
-        env = gymnasium.make(env_id, render_mode=render_mode)
+        try:
+            env = gymnasium.make(env_id, render_mode=render_mode)
+        except Exception as e: # some envs don't support render_mode params
+            env = gymnasium.make(env_id)
         env = gymnasium.wrappers.RecordEpisodeStatistics(env) # type: ignore
         if capture_video and run_name:
             env = gymnasium.wrappers.RecordVideo(env, f"videos/{run_name}") # type: ignore
