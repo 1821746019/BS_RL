@@ -149,6 +149,32 @@ class RSACAgent:
             tx=optax.sgd(1e-4)  # Dummy optimizer, not used
         )
 
+    def _norm_obs(self, rsnorm_state: TrainStateWithBatchStats, obs: jnp.ndarray, update_stats: bool):
+        def _update(state, observation):
+            norm_obs, new_vars = self.rsnorm_model.apply(
+                {'params': state.params, 'batch_stats': state.batch_stats},
+                observation,
+                update_stats=True,
+                mutable=['batch_stats']
+            )
+            new_state = state.replace(batch_stats=new_vars['batch_stats'])
+            return new_state, norm_obs
+
+        def _no_update(state, observation):
+            norm_obs = self.rsnorm_model.apply(
+                {'params': state.params, 'batch_stats': state.batch_stats},
+                observation,
+                update_stats=False
+            )
+            return state, norm_obs
+
+        return jax.lax.cond(
+            update_stats,
+            _update,
+            _no_update,
+            rsnorm_state,
+            obs
+        )
 
     @partial(jax_jit, static_argnums=(0,))
     def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
@@ -181,6 +207,30 @@ class RSACAgent:
             squashed = jnp.tanh(actions)
             return squashed, new_h, new_c
 
+    @partial(jax_jit, static_argnums=(0, 8))
+    def select_action_for_eval(self,
+                               actor_state: TrainStateWithBatchStats,
+                               summarizer_params: flax.core.FrozenDict,
+                               rsnorm_state: TrainStateWithBatchStats,
+                               obs: jnp.ndarray,
+                               hidden_h: jnp.ndarray,
+                               hidden_c: jnp.ndarray,
+                               key: jax.Array,
+                               deterministic: bool = True):
+        key_action, new_key = jax.random.split(key)
+        _, norm_obs = self._norm_obs(rsnorm_state, obs, update_stats=False)
+
+        actions, new_h, new_c = self.select_action(
+            actor_state,
+            summarizer_params,
+            norm_obs,
+            hidden_h,
+            hidden_c,
+            key_action,
+            deterministic=deterministic
+        )
+        return actions, new_h, new_c, new_key
+
     def _split_obs(self, o_seq: jnp.ndarray):
         market = o_seq[..., :self.market_feature_dim]
         agent_feat = o_seq[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros(o_seq.shape[:-1] + (0,))
@@ -204,10 +254,7 @@ class RSACAgent:
         m = batch['m']
         B, T = r.shape[0], r.shape[1]
         
-        o_normalized = self.rsnorm_model.apply(
-            {'params': rsnorm_state.params, 'batch_stats': rsnorm_state.batch_stats},
-            o, use_running_average=True,
-        )
+        _, o_normalized = self._norm_obs(rsnorm_state, o, update_stats=False)
         market_o, agent_o = self._split_obs(o_normalized)
 
         summaries, _ = self.summarizer.apply({'params': summarizer_state.params}, market_o)
@@ -381,7 +428,7 @@ class RSACAgent:
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
     @partial(jax_jit, static_argnums=(0, 5, 6))
-    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, rsnorm_state: TrainStateWithBatchStats, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
+    def update_then_select_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, rsnorm_state: TrainStateWithBatchStats, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
 
         batches: if do_update, a dict with leading dim K=updates_per_call; otherwise can be None or a single batch.
@@ -389,20 +436,9 @@ class RSACAgent:
         # Split rng on device to avoid host-device traffic
         key_action, key_update, new_key = jax.random.split(key, 3)
         
-        # 0. Normalize obs for action selection and update rsnorm_state if in training
-        def update_rsnorm(rs_state):
-            norm_obs, new_vars = self.rsnorm_model.apply({'params': rs_state.params, 'batch_stats': rs_state.batch_stats}, obs, use_running_average=False, mutable=['batch_stats'])
-            return rs_state.replace(batch_stats=new_vars['batch_stats']), norm_obs
-
-        def no_update_rsnorm(rs_state):
-            norm_obs = self.rsnorm_model.apply({'params': rs_state.params, 'batch_stats': rs_state.batch_stats}, obs, use_running_average=True)
-            return rs_state, norm_obs
-
-        updated_rsnorm_state, norm_obs_for_action = jax.lax.cond(
-            jnp.asarray(not deterministic),
-            update_rsnorm,
-            no_update_rsnorm,
-            rsnorm_state
+        # If put _norm_obs in select_action, the first update will use raw obs to calc loss, which cause instability. So put _norm_obs here to make update func(loss calc) use the newest rsnorm_state
+        updated_rsnorm_state, norm_obs_for_action = self._norm_obs(
+            rsnorm_state, obs, update_stats=jnp.asarray(not deterministic)
         )
 
         # 1. First perform agent update(s) if requested

@@ -85,22 +85,15 @@ class Evaluator:
         hidden_c = jnp.zeros((L, N, H), dtype=jnp.float32)
 
         while len(stats_aggregator.buffer) < num_episodes:
-            key_eval_actions, key_step = jax.random.split(key_eval_actions)
-            
-            # Normalize observations using the agent's RSNorm state without updating it
-            norm_obs = self.agent.rsnorm_model.apply(
-                {'params': rsnorm_state_eval.params, 'batch_stats': rsnorm_state_eval.batch_stats},
-                jnp.asarray(obs), 
-                use_running_average=True
-            )
-
-            actions_jax, new_h, new_c = self.agent.select_action(
-                actor_state_eval, 
+            actions_jax, new_h, new_c, key_eval_actions = self.agent.select_action_for_eval(
+                actor_state_eval,
                 summarizer_params_eval,
-                norm_obs,
-                hidden_h, hidden_c,
-                key_step, 
-                deterministic=self.eval_config.greedy_actions
+                rsnorm_state_eval,
+                jnp.asarray(obs),
+                hidden_h,
+                hidden_c,
+                key_eval_actions,
+                deterministic=self.eval_config.greedy_actions,
             )
             actions_numpy = np.array(jax.device_get(actions_jax))
             hidden_h = new_h

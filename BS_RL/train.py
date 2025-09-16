@@ -363,7 +363,7 @@ class Trainer:
                     updates_per_call = max(1, int(self.args.algo.updates_per_call))
                     batches = self.rb.sample_many(self.args.algo.batch_size, self.args.algo.train_unroll_steps, updates_per_call)
                     # Combined action selection and multi-update in single JIT call
-                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_rsnorm_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_agent_then_get_action(
+                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_rsnorm_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_then_select_action(
                         obs, self.hidden_h, self.hidden_c, batches, do_update, do_target_update,
                         self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state,
                         self.rsnorm_state, self.log_alpha_state, self.jax_key, updates_per_call,

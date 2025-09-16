@@ -64,11 +64,11 @@ class RSNorm(nn.Module):
     epsilon: float = 1e-8
     
     @nn.compact
-    def __call__(self, obs, use_running_average=False):
+    def __call__(self, obs, update_stats: bool = False):
         """
         Args:
             obs: The input observation batch.
-            use_running_average: If True, normalize only with current statistics without updating (for evaluation).
+            update_stats: If True, update running statistics.
         """
         # Define state variables to track and put them in the 'batch_stats' collection
         running_mean = self.variable('batch_stats', 'mean', lambda: jnp.zeros(obs.shape[-1], dtype=jnp.float32))
@@ -76,7 +76,7 @@ class RSNorm(nn.Module):
         count = self.variable('batch_stats', 'count', lambda: jnp.array(1.0, dtype=jnp.float32))
 
         # Update statistics in training mode
-        if not use_running_average:
+        if update_stats:
             # Stats are only updated with live data [N, F], which is 2D.
             assert obs.ndim == 2, f"RSNorm statistics should only be updated with 2D live data, but got shape {obs.shape}"
             batch_mean = jnp.mean(obs, axis=0, dtype=jnp.float32)
