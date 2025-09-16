@@ -52,6 +52,7 @@ class Trainer:
         self.qf1_state: CriticTrainState
         self.qf2_state: CriticTrainState
         self.summarizer_state: SummarizerTrainState
+        self.rsnorm_state: TrainStateWithBatchStats
         self.log_alpha_state: Optional[TrainState]
         self.current_alpha: jnp.ndarray
         self.data_loader: DataLoader
@@ -200,6 +201,7 @@ class Trainer:
         self.qf1_state = self.agent.qf1_state
         self.qf2_state = self.agent.qf2_state
         self.summarizer_state = self.agent.summarizer_state
+        self.rsnorm_state = self.agent.rsnorm_state
         self.log_alpha_state = self.agent.log_alpha_state if self.args.algo.autotune else None
         self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha']) if self.args.algo.autotune and self.log_alpha_state else jnp.array(self.args.algo.alpha)
 
@@ -248,6 +250,7 @@ class Trainer:
                     'summarizer_params': self.summarizer_state.params,
                     'summarizer_opt_state': self.summarizer_state.opt_state,
                     'summarizer_target_params': self.summarizer_state.target_params,
+                    'rsnorm_batch_stats': self.rsnorm_state.batch_stats,
                 }
                 if self.args.algo.autotune:
                     restore_target['log_alpha_params'] = self.log_alpha_state.params
@@ -282,6 +285,7 @@ class Trainer:
                     opt_state=loaded_contents['summarizer_opt_state'],
                     target_params=loaded_contents['summarizer_target_params']
                 )
+                self.rsnorm_state = self.rsnorm_state.replace(batch_stats=loaded_contents['rsnorm_batch_stats'])
                 if self.log_alpha_state and 'log_alpha_params' in loaded_contents:
                     self.log_alpha_state = self.log_alpha_state.replace( 
                         params=loaded_contents['log_alpha_params'],
@@ -359,10 +363,10 @@ class Trainer:
                     updates_per_call = max(1, int(self.args.algo.updates_per_call))
                     batches = self.rb.sample_many(self.args.algo.batch_size, self.args.algo.train_unroll_steps, updates_per_call)
                     # Combined action selection and multi-update in single JIT call
-                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_agent_then_get_action(
+                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_rsnorm_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_agent_then_get_action(
                         obs, self.hidden_h, self.hidden_c, batches, do_update, do_target_update,
                         self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state,
-                        self.log_alpha_state, self.jax_key, updates_per_call,
+                        self.rsnorm_state, self.log_alpha_state, self.jax_key, updates_per_call,
                         deterministic=False
                     )
                     # Update states
@@ -370,6 +374,7 @@ class Trainer:
                     self.qf1_state = new_qf1_state
                     self.qf2_state = new_qf2_state
                     self.summarizer_state = new_summarizer_state
+                    self.rsnorm_state = new_rsnorm_state
                     if self.args.algo.autotune:
                         self.log_alpha_state = new_log_alpha_state
                     self.hidden_h = new_h
@@ -461,6 +466,7 @@ class Trainer:
         eval_metrics = self.evaluator.evaluate(
             actor_state_eval=self.actor_state,
             summarizer_params_eval=self.summarizer_state.params,
+            rsnorm_state_eval=self.rsnorm_state,
             current_train_step=current_step
         )
         
@@ -491,6 +497,7 @@ class Trainer:
                 'summarizer_params': self.summarizer_state.params,
                 'summarizer_opt_state': self.summarizer_state.opt_state,
                 'summarizer_target_params': self.summarizer_state.target_params,
+                'rsnorm_batch_stats': self.rsnorm_state.batch_stats,
             }
             if self.args.algo.autotune and self.log_alpha_state:
                 save_target['log_alpha_params'] = self.log_alpha_state.params

@@ -63,7 +63,7 @@ class Evaluator:
             envs.append(env)
         return eval_vec_env_cls(envs)
 
-    def evaluate(self, actor_state_eval, summarizer_params_eval, current_train_step: int):
+    def evaluate(self, actor_state_eval, summarizer_params_eval, rsnorm_state_eval, current_train_step: int):
         num_episodes = self.eval_config.eval_episodes
         print(f"\nStarting evaluation for {num_episodes} episodes at step {current_train_step}...")
 
@@ -86,10 +86,18 @@ class Evaluator:
 
         while len(stats_aggregator.buffer) < num_episodes:
             key_eval_actions, key_step = jax.random.split(key_eval_actions)
+            
+            # Normalize observations using the agent's RSNorm state without updating it
+            norm_obs = self.agent.rsnorm_model.apply(
+                {'params': rsnorm_state_eval.params, 'batch_stats': rsnorm_state_eval.batch_stats},
+                jnp.asarray(obs), 
+                use_running_average=True
+            )
+
             actions_jax, new_h, new_c = self.agent.select_action(
                 actor_state_eval, 
                 summarizer_params_eval,
-                jnp.asarray(obs), 
+                norm_obs,
                 hidden_h, hidden_c,
                 key_step, 
                 deterministic=self.eval_config.greedy_actions

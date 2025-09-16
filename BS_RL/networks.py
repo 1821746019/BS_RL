@@ -35,7 +35,6 @@ class Actor(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         # x is [B, H+agent_feat]
-        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
         features = FeatExtractor(net_arch=self.network_config.actor_net_arch, dropout_rate=self.network_config.actor_dropout_rate)(x, deterministic=deterministic)
         features = nn.LayerNorm(name="final_norm")(features)
         activation_fn = get_activation(self.network_config.activation)
@@ -58,7 +57,6 @@ class Critic(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool, action: Optional[jnp.ndarray] = None):
         # x is [B, H+agent_feat]
-        x = RSNorm(name="rs_norm")(obs=x, use_running_average=deterministic)
         features = FeatExtractor(net_arch=self.network_config.critic_net_arch, dropout_rate=self.network_config.critic_dropout_rate)(x, deterministic=deterministic)
         features = nn.LayerNorm(name="final_norm")(features)
         activation_fn = get_activation(self.network_config.activation)

@@ -77,6 +77,8 @@ class RSNorm(nn.Module):
 
         # Update statistics in training mode
         if not use_running_average:
+            # Stats are only updated with live data [N, F], which is 2D.
+            assert obs.ndim == 2, f"RSNorm statistics should only be updated with 2D live data, but got shape {obs.shape}"
             batch_mean = jnp.mean(obs, axis=0, dtype=jnp.float32)
             batch_var = jnp.var(obs, axis=0)
             batch_count = obs.shape[0]

@@ -14,6 +14,7 @@ from .config import AlgoConfig, NetworkConfig
 from .networks import Actor, Critic
 from .nn.s5 import init_S5SSM, make_DPLR_HiPPO, StackedEncoderModel, S5Summarizer
 from .nn.lstm import LSTMSummarizer
+from .nn.Simba import RSNorm
 MAX_NORM = 0.4
 class TrainStateWithBatchStats(TrainState):
     batch_stats: Optional[flax.core.FrozenDict] = None
@@ -43,7 +44,7 @@ class RSACAgent:
         self.network_config = network_config
         self.norm_limit = norm_limit
         self.is_discrete = is_discrete
-        key_actor, key_qf1, key_qf2, key_summarizer, key_log_alpha = jax.random.split(key, 5)
+        key_actor, key_qf1, key_qf2, key_summarizer, key_rsnorm, key_log_alpha = jax.random.split(key, 6)
 
         optimizer = optax.chain(
             optax.clip_by_global_norm(self.norm_limit),
@@ -61,7 +62,7 @@ class RSACAgent:
             self.market_feature_dim = self.obs_dim
             self.agent_feature_dim = 0
 
-        self._create_models_and_states(key_actor, key_qf1, key_qf2, key_summarizer)
+        self._create_models_and_states(key_actor, key_qf1, key_qf2, key_summarizer, key_rsnorm)
 
         self.log_alpha_state: TrainState
         if algo_config.autotune:
@@ -88,7 +89,7 @@ class RSACAgent:
         else:
             return model.apply(variables, *args, deterministic=deterministic, **kwargs)
 
-    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer):
+    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, key_rsnorm):
         # Shared summarizer and target summarizer
         if self.network_config.use_s5_summarizer:
             print("Using S5 Summarizer.")
@@ -137,6 +138,17 @@ class RSACAgent:
 
         self.train_summarizer = bool(self.network_config.train_summarizer)
 
+        # RSNorm for observations
+        self.rsnorm_model = RSNorm()
+        dummy_obs = jnp.zeros((1, self.obs_dim))
+        rsnorm_params, rsnorm_batch_stats = self._init_model_with_batch_stats(self.rsnorm_model, key_rsnorm, dummy_obs, use_running_average=False)
+        self.rsnorm_state = TrainStateWithBatchStats.create(
+            apply_fn=self.rsnorm_model.apply,
+            params=rsnorm_params,
+            batch_stats=rsnorm_batch_stats,
+            tx=optax.sgd(1e-4)  # Dummy optimizer, not used
+        )
+
 
     @partial(jax_jit, static_argnums=(0,))
     def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
@@ -180,6 +192,7 @@ class RSACAgent:
                 qf1_state: CriticTrainState,
                 qf2_state: CriticTrainState,
                 summarizer_state: SummarizerTrainState,
+                rsnorm_state: TrainStateWithBatchStats,
                 log_alpha_state: Optional[TrainState],
                 batch: dict,
                 key: jax.Array):
@@ -190,7 +203,12 @@ class RSACAgent:
         trunc = batch['trunc']
         m = batch['m']
         B, T = r.shape[0], r.shape[1]
-        market_o, agent_o = self._split_obs(o)
+        
+        o_normalized = self.rsnorm_model.apply(
+            {'params': rsnorm_state.params, 'batch_stats': rsnorm_state.batch_stats},
+            o, use_running_average=True,
+        )
+        market_o, agent_o = self._split_obs(o_normalized)
 
         summaries, _ = self.summarizer.apply({'params': summarizer_state.params}, market_o)
         s_t = summaries[:, 1:-1, :]
@@ -363,7 +381,7 @@ class RSACAgent:
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
     @partial(jax_jit, static_argnums=(0, 5, 6))
-    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
+    def update_agent_then_get_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, rsnorm_state: TrainStateWithBatchStats, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
 
         batches: if do_update, a dict with leading dim K=updates_per_call; otherwise can be None or a single batch.
@@ -371,6 +389,22 @@ class RSACAgent:
         # Split rng on device to avoid host-device traffic
         key_action, key_update, new_key = jax.random.split(key, 3)
         
+        # 0. Normalize obs for action selection and update rsnorm_state if in training
+        def update_rsnorm(rs_state):
+            norm_obs, new_vars = self.rsnorm_model.apply({'params': rs_state.params, 'batch_stats': rs_state.batch_stats}, obs, use_running_average=False, mutable=['batch_stats'])
+            return rs_state.replace(batch_stats=new_vars['batch_stats']), norm_obs
+
+        def no_update_rsnorm(rs_state):
+            norm_obs = self.rsnorm_model.apply({'params': rs_state.params, 'batch_stats': rs_state.batch_stats}, obs, use_running_average=True)
+            return rs_state, norm_obs
+
+        updated_rsnorm_state, norm_obs_for_action = jax.lax.cond(
+            jnp.asarray(not deterministic),
+            update_rsnorm,
+            no_update_rsnorm,
+            rsnorm_state
+        )
+
         # 1. First perform agent update(s) if requested
         if do_update:
             num_updates = jnp.asarray(updates_per_call, dtype=jnp.int32)
@@ -401,7 +435,7 @@ class RSACAgent:
                     'm': batches['m'][i],
                 }
                 a_state_n, q1_state_n, q2_state_n, s_state_n, la_state_n, cur_alpha_n, metric_i = self._update(
-                    a_state, q1_state, q2_state, s_state, la_state, b, key_update
+                    a_state, q1_state, q2_state, s_state, updated_rsnorm_state, la_state, b, key_update
                 )
                 cl_sum = cl_sum + metric_i['critic_loss']
                 al_sum = al_sum + metric_i['actor_loss']
@@ -448,6 +482,6 @@ class RSACAgent:
             final_qf1_state, final_qf2_state, final_summarizer_state = updated_qf1_state, updated_qf2_state, updated_summarizer_state
         
         # 2. Then perform action selection using potentially updated states
-        actions, new_h, new_c = self.select_action(updated_actor_state, final_summarizer_state.params, obs, hidden_h, hidden_c, key_action, deterministic=deterministic)
+        actions, new_h, new_c = self.select_action(updated_actor_state, final_summarizer_state.params, norm_obs_for_action, hidden_h, hidden_c, key_action, deterministic=deterministic)
         
-        return actions, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, final_summarizer_state, updated_log_alpha_state, metrics, new_key
+        return actions, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, final_summarizer_state, updated_rsnorm_state, updated_log_alpha_state, metrics, new_key
