@@ -21,8 +21,6 @@ class TrainStateWithBatchStats(TrainState):
 
 class CriticTrainState(TrainState):
     target_params: flax.core.FrozenDict
-    batch_stats: Optional[flax.core.FrozenDict] = None
-    target_batch_stats: Optional[flax.core.FrozenDict] = None
 
 class SummarizerTrainState(TrainState):
     target_params: flax.core.FrozenDict
@@ -77,9 +75,9 @@ class RSACAgent:
         else:
             self.target_entropy = -float(self.action_dim) * self.algo_config.target_entropy_scale_for_cont
 
-    def _init_model_with_batch_stats(self, model, key, *args, **kwargs):
+    def _init_model_with_batch_stats(self, model: nn.Module, key, *args, **kwargs):
         variables = model.init({'params': key, 'dropout': key}, *args, **kwargs)
-        params = variables['params']
+        params = variables.get('params', flax.core.FrozenDict()) # RSNorm没有param故用.get
         batch_stats = variables.get('batch_stats')
         return params, batch_stats
 
@@ -118,30 +116,30 @@ class RSACAgent:
 
         # Actor head
         self.actor_model = Actor(network_config=self.network_config, action_dim=self.action_dim, is_discrete=self.is_discrete)
-        actor_params, actor_batch_stats = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, summarizer_hidden_dim + self.agent_feature_dim)), deterministic=True)
-        self.actor_state = TrainStateWithBatchStats.create(apply_fn=self.actor_model.apply, params=actor_params, batch_stats=actor_batch_stats, tx=self.actor_optimizer)
+        actor_params, _ = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, summarizer_hidden_dim + self.agent_feature_dim)), deterministic=True)
+        self.actor_state = TrainState.create(apply_fn=self.actor_model.apply, params=actor_params, tx=self.actor_optimizer)
 
         # Critic heads (two critics)
         self.critic_model = Critic(network_config=self.network_config, action_dim=self.action_dim, is_discrete=self.is_discrete)
         dummy_critic_input = jnp.zeros((1, summarizer_hidden_dim + self.agent_feature_dim))
         
         if self.is_discrete:
-            qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, dummy_critic_input, deterministic=True)
-            qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, dummy_critic_input, deterministic=True)
+            qf1_params, _ = self._init_model_with_batch_stats(self.critic_model, key_qf1, dummy_critic_input, deterministic=True)
+            qf2_params, _ = self._init_model_with_batch_stats(self.critic_model, key_qf2, dummy_critic_input, deterministic=True)
         else:
             dummy_action = jnp.zeros((1, self.action_dim))
-            qf1_params, qf1_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf1, dummy_critic_input, action=dummy_action, deterministic=True)
-            qf2_params, qf2_batch_stats = self._init_model_with_batch_stats(self.critic_model, key_qf2, dummy_critic_input, action=dummy_action, deterministic=True)
+            qf1_params, _ = self._init_model_with_batch_stats(self.critic_model, key_qf1, dummy_critic_input, action=dummy_action, deterministic=True)
+            qf2_params, _ = self._init_model_with_batch_stats(self.critic_model, key_qf2, dummy_critic_input, action=dummy_action, deterministic=True)
 
-        self.qf1_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf1_params, batch_stats=qf1_batch_stats, target_params=qf1_params, target_batch_stats=qf1_batch_stats, tx=self.critic_optimizer)
-        self.qf2_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf2_params, batch_stats=qf2_batch_stats, target_params=qf2_params, target_batch_stats=qf2_batch_stats, tx=self.critic_optimizer)
+        self.qf1_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf1_params, target_params=qf1_params, tx=self.critic_optimizer)
+        self.qf2_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf2_params, target_params=qf2_params, tx=self.critic_optimizer)
 
         self.train_summarizer = bool(self.network_config.train_summarizer)
 
         # RSNorm for observations
         self.rsnorm_model = RSNorm()
         dummy_obs = jnp.zeros((1, self.obs_dim))
-        rsnorm_params, rsnorm_batch_stats = self._init_model_with_batch_stats(self.rsnorm_model, key_rsnorm, dummy_obs, use_running_average=False)
+        rsnorm_params, rsnorm_batch_stats = self._init_model_with_batch_stats(self.rsnorm_model, key_rsnorm, dummy_obs, update_stats=False)
         self.rsnorm_state = TrainStateWithBatchStats.create(
             apply_fn=self.rsnorm_model.apply,
             params=rsnorm_params,
@@ -177,7 +175,7 @@ class RSACAgent:
         )
 
     @partial(jax_jit, static_argnums=(0,))
-    def select_action(self, actor_state: TrainStateWithBatchStats, summarizer_params: flax.core.FrozenDict,
+    def select_action(self, actor_state: TrainState, summarizer_params: flax.core.FrozenDict,
                       obs: jnp.ndarray, hidden_h: jnp.ndarray, hidden_c: jnp.ndarray,
                       key: jax.Array, deterministic: bool = False):
         market = obs[..., :self.market_feature_dim]
@@ -189,7 +187,7 @@ class RSACAgent:
         det_flag = jnp.asarray(deterministic)
 
         if self.is_discrete:
-            logits = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x, deterministic=True)
+            logits = self.actor_model.apply({'params': actor_state.params}, x, deterministic=True)
             def take_argmax(k):
                 return jnp.argmax(logits, axis=-1)
             def take_sample(k):
@@ -197,7 +195,7 @@ class RSACAgent:
             actions = jax.lax.cond(det_flag, take_argmax, take_sample, key)
             return actions, new_h, new_c
         else:
-            mean, log_std = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x, deterministic=True)
+            mean, log_std = self.actor_model.apply({'params': actor_state.params}, x, deterministic=True)
             dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
             def take_mean(k):
                 return dist.mean()
@@ -209,7 +207,7 @@ class RSACAgent:
 
     @partial(jax_jit, static_argnums=(0, 8))
     def select_action_for_eval(self,
-                               actor_state: TrainStateWithBatchStats,
+                               actor_state: TrainState,
                                summarizer_params: flax.core.FrozenDict,
                                rsnorm_state: TrainStateWithBatchStats,
                                obs: jnp.ndarray,
@@ -238,7 +236,7 @@ class RSACAgent:
 
     @partial(jax_jit, static_argnums=(0,))
     def _update(self,
-                actor_state: TrainStateWithBatchStats,
+                actor_state: TrainState,
                 qf1_state: CriticTrainState,
                 qf2_state: CriticTrainState,
                 summarizer_state: SummarizerTrainState,
@@ -271,20 +269,20 @@ class RSACAgent:
             current_alpha = self.current_alpha
 
         if self.is_discrete:
-            def critic_loss_fn(q1_params, q1_bs, q2_params, q2_bs, summarizer_params):
-                next_logits = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
+            def critic_loss_fn(q1_params, q2_params, summarizer_params):
+                next_logits = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
                 next_logits = next_logits.reshape(B, T, -1)
                 next_probs = nn.softmax(next_logits, axis=-1)
                 next_log_probs = nn.log_softmax(next_logits, axis=-1)
 
-                q1_next = self.critic_model.apply({'params': qf1_state.target_params, 'batch_stats': qf1_state.target_batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True).reshape(B, T, -1)
-                q2_next = self.critic_model.apply({'params': qf2_state.target_params, 'batch_stats': qf2_state.target_batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True).reshape(B, T, -1)
+                q1_next = self.critic_model.apply({'params': qf1_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True).reshape(B, T, -1)
+                q2_next = self.critic_model.apply({'params': qf2_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True).reshape(B, T, -1)
                 min_q_next = jnp.minimum(q1_next, q2_next)
                 v_next = jnp.sum(next_probs * (min_q_next - current_alpha * next_log_probs), axis=-1)
                 target = r + (1.0 - term) * self.algo_config.gamma * v_next
 
-                q1_all, new_q1_vars = self.critic_model.apply({'params': q1_params, 'batch_stats': q1_bs}, x_t.reshape(-1, x_t.shape[-1]), deterministic=False, mutable=['batch_stats'])
-                q2_all, new_q2_vars = self.critic_model.apply({'params': q2_params, 'batch_stats': q2_bs}, x_t.reshape(-1, x_t.shape[-1]), deterministic=False, mutable=['batch_stats'])
+                q1_all = self.critic_model.apply({'params': q1_params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=False)
+                q2_all = self.critic_model.apply({'params': q2_params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=False)
                 q1_all = q1_all.reshape(B, T, -1)
                 q2_all = q2_all.reshape(B, T, -1)
                 a_idx = a[..., None]
@@ -298,10 +296,10 @@ class RSACAgent:
                 loss = 0.5 * (mse1 + mse2)
                 qf1_value_mean = (q1_taken * m).sum() / (m.sum() + 1e-8)
                 qf2_value_mean = (q2_taken * m).sum() / (m.sum() + 1e-8)
-                return loss, (new_q1_vars, new_q2_vars, qf1_value_mean, qf2_value_mean)
+                return loss, (qf1_value_mean, qf2_value_mean)
         else: # continuous
-            def critic_loss_fn(q1_params, q1_bs, q2_params, q2_bs, summarizer_params):
-                mean_tp1, log_std_tp1 = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
+            def critic_loss_fn(q1_params, q2_params, summarizer_params):
+                mean_tp1, log_std_tp1 = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
                 mean_tp1 = mean_tp1.reshape(B, T, -1)
                 log_std_tp1 = log_std_tp1.reshape(B, T, -1)
                 dist_tp1 = tfd.MultivariateNormalDiag(loc=mean_tp1, scale_diag=jnp.exp(log_std_tp1))
@@ -310,13 +308,13 @@ class RSACAgent:
                 log_prob = dist_tp1.log_prob(u)
                 log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(u) ** 2 + 1e-6), axis=-1)
 
-                q1_next = self.critic_model.apply({'params': qf1_state.target_params, 'batch_stats': qf1_state.target_batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), action=squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(B, T)
-                q2_next = self.critic_model.apply({'params': qf2_state.target_params, 'batch_stats': qf2_state.target_batch_stats}, x_tp1.reshape(-1, x_tp1.shape[-1]), action=squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(B, T)
+                q1_next = self.critic_model.apply({'params': qf1_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), action=squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(B, T)
+                q2_next = self.critic_model.apply({'params': qf2_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), action=squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(B, T)
                 min_q_next = jnp.minimum(q1_next, q2_next)
                 target = r + (1.0 - term) * self.algo_config.gamma * (min_q_next - current_alpha * log_prob)
 
-                q1_cur, new_q1_vars = self.critic_model.apply({'params': q1_params, 'batch_stats': q1_bs}, x_t.reshape(-1, x_t.shape[-1]), action=a.reshape(-1, a.shape[-1]), deterministic=False, mutable=['batch_stats'])
-                q2_cur, new_q2_vars = self.critic_model.apply({'params': q2_params, 'batch_stats': q2_bs}, x_t.reshape(-1, x_t.shape[-1]), action=a.reshape(-1, a.shape[-1]), deterministic=False, mutable=['batch_stats'])
+                q1_cur = self.critic_model.apply({'params': q1_params}, x_t.reshape(-1, x_t.shape[-1]), action=a.reshape(-1, a.shape[-1]), deterministic=False)
+                q2_cur = self.critic_model.apply({'params': q2_params}, x_t.reshape(-1, x_t.shape[-1]), action=a.reshape(-1, a.shape[-1]), deterministic=False)
                 q1_cur = q1_cur.reshape(B, T)
                 q2_cur = q2_cur.reshape(B, T)
 
@@ -327,12 +325,12 @@ class RSACAgent:
                 loss = 0.5 * (mse1 + mse2)
                 qf1_value_mean = (q1_cur * m).sum() / (m.sum() + 1e-8)
                 qf2_value_mean = (q2_cur * m).sum() / (m.sum() + 1e-8)
-                return loss, (new_q1_vars, new_q2_vars, qf1_value_mean, qf2_value_mean)
+                return loss, (qf1_value_mean, qf2_value_mean)
 
-        (critic_loss_val, (new_q1_vars, new_q2_vars, qf1_value_mean, qf2_value_mean)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1,2,3,4))(qf1_state.params, qf1_state.batch_stats, qf2_state.params, qf2_state.batch_stats, summarizer_state.params)
-        g_q1_params, g_q1_bs, g_q2_params, g_q2_bs, g_sum_params = critic_grads
-        qf1_state_new = qf1_state.apply_gradients(grads=g_q1_params).replace(batch_stats=new_q1_vars['batch_stats'])
-        qf2_state_new = qf2_state.apply_gradients(grads=g_q2_params).replace(batch_stats=new_q2_vars['batch_stats'])
+        (critic_loss_val, (qf1_value_mean, qf2_value_mean)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1,2))(qf1_state.params, qf2_state.params, summarizer_state.params)
+        g_q1_params, g_q2_params, g_sum_params = critic_grads
+        qf1_state_new = qf1_state.apply_gradients(grads=g_q1_params)
+        qf2_state_new = qf2_state.apply_gradients(grads=g_q2_params)
         if self.train_summarizer:
             summarizer_state_new = summarizer_state.apply_gradients(grads=g_sum_params)
         else:
@@ -342,30 +340,27 @@ class RSACAgent:
         x_t_detached = jnp.concatenate([s_t_detached, agent_o[:, :-1, :]], axis=-1)
 
         if self.is_discrete:
-            def actor_loss_fn(actor_params, actor_bs):
-                outputs, new_actor_vars = self.actor_model.apply(
-                    {'params': actor_params, 'batch_stats': actor_bs},
+            def actor_loss_fn(actor_params):
+                logits = self.actor_model.apply(
+                    {'params': actor_params},
                     x_t_detached.reshape(-1, x_t_detached.shape[-1]),
                     deterministic=False,
-                    mutable=['batch_stats']
-                )
-                logits = outputs.reshape(B, T, -1)
+                ).reshape(B, T, -1)
                 probs = nn.softmax(logits, axis=-1)
                 log_probs = nn.log_softmax(logits, axis=-1)
-                q1_all = self.critic_model.apply({'params': qf1_state_new.params, 'batch_stats': qf1_state_new.batch_stats}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
-                q2_all = self.critic_model.apply({'params': qf2_state_new.params, 'batch_stats': qf2_state_new.batch_stats}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
+                q1_all = self.critic_model.apply({'params': qf1_state_new.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
+                q2_all = self.critic_model.apply({'params': qf2_state_new.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
                 min_q = jnp.minimum(q1_all, q2_all)
                 actor_loss_t = jnp.sum(probs * (current_alpha * log_probs - min_q), axis=-1)
                 actor_loss = (actor_loss_t * m).sum() / (m.sum() + 1e-8)
                 entropy = (-jnp.sum((probs + 1e-8) * log_probs, axis=-1) * m).sum() / (m.sum() + 1e-8)
-                return actor_loss, (entropy, new_actor_vars)
+                return actor_loss, entropy
         else: # continuous
-            def actor_loss_fn(actor_params, actor_bs):
-                (mean, log_std), new_actor_vars = self.actor_model.apply(
-                    {'params': actor_params, 'batch_stats': actor_bs},
+            def actor_loss_fn(actor_params):
+                mean, log_std = self.actor_model.apply(
+                    {'params': actor_params},
                     x_t_detached.reshape(-1, x_t_detached.shape[-1]),
                     deterministic=False,
-                    mutable=['batch_stats']
                 )
                 mean = mean.reshape(B, T, -1)
                 log_std = log_std.reshape(B, T, -1)
@@ -375,23 +370,23 @@ class RSACAgent:
                 log_prob = dist.log_prob(u)
                 log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(u) ** 2 + 1e-6), axis=-1)
 
-                q1_pi = self.critic_model.apply({'params': qf1_state_new.params, 'batch_stats': qf1_state_new.batch_stats}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), action=squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(B, T)
-                q2_pi = self.critic_model.apply({'params': qf2_state_new.params, 'batch_stats': qf2_state_new.batch_stats}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), action=squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(B, T)
+                q1_pi = self.critic_model.apply({'params': qf1_state_new.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), action=squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(B, T)
+                q2_pi = self.critic_model.apply({'params': qf2_state_new.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), action=squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(B, T)
                 min_q = jnp.minimum(q1_pi, q2_pi)
                 loss_t = (current_alpha * log_prob - min_q)
                 loss = (loss_t * m).sum() / (m.sum() + 1e-8)
                 entropy = (-(log_prob) * m).sum() / (m.sum() + 1e-8)
-                return loss, (entropy, new_actor_vars)
+                return loss, entropy
 
-        (actor_loss_val, (entropy_val, new_actor_vars)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params, actor_state.batch_stats)
-        actor_state_new = actor_state.apply_gradients(grads=actor_grads).replace(batch_stats=new_actor_vars['batch_stats'])
+        (actor_loss_val, entropy_val), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
+        actor_state_new = actor_state.apply_gradients(grads=actor_grads)
 
         alpha_loss_val = jnp.array(0.0)
         log_alpha_state_to_return = log_alpha_state
         current_alpha_to_return = current_alpha
         if self.algo_config.autotune:
             if self.is_discrete:
-                logits_det = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
+                logits_det = self.actor_model.apply({'params': actor_state.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
                 log_probs_det = nn.log_softmax(logits_det, axis=-1)
                 probs_det = nn.softmax(logits_det, axis=-1)
                 def alpha_loss_fn(log_alpha_params):
@@ -401,7 +396,7 @@ class RSACAgent:
                     loss = (jnp.sum(loss_t, axis=-1) * m).sum() / (m.sum() + 1e-8)
                     return loss
             else: # continuous
-                mean_det, log_std_det = self.actor_model.apply({'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True)
+                mean_det, log_std_det = self.actor_model.apply({'params': actor_state.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True)
                 mean_det = mean_det.reshape(B, T, -1)
                 log_std_det = log_std_det.reshape(B, T, -1)
                 dist_det = tfd.MultivariateNormalDiag(loc=mean_det, scale_diag=jnp.exp(log_std_det))
@@ -428,7 +423,7 @@ class RSACAgent:
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
     @partial(jax_jit, static_argnums=(0, 5, 6))
-    def update_then_select_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainStateWithBatchStats, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, rsnorm_state: TrainStateWithBatchStats, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
+    def update_then_select_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, rsnorm_state: TrainStateWithBatchStats, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
 
         batches: if do_update, a dict with leading dim K=updates_per_call; otherwise can be None or a single batch.
@@ -438,7 +433,7 @@ class RSACAgent:
         
         # If put _norm_obs in select_action, the first update will use raw obs to calc loss, which cause instability. So put _norm_obs here to make update func(loss calc) use the newest rsnorm_state
         updated_rsnorm_state, norm_obs_for_action = self._norm_obs(
-            rsnorm_state, obs, update_stats=jnp.asarray(not deterministic)
+            rsnorm_state, obs, update_stats=jnp.logical_not(deterministic)
         )
 
         # 1. First perform agent update(s) if requested
@@ -505,12 +500,10 @@ class RSACAgent:
         if do_update and do_target_update:
             tau = self.algo_config.tau
             final_qf1_state = updated_qf1_state.replace(
-                target_params=optax.incremental_update(updated_qf1_state.params, updated_qf1_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(updated_qf1_state.batch_stats, updated_qf1_state.target_batch_stats, tau) if updated_qf1_state.batch_stats is not None else updated_qf1_state.target_batch_stats
+                target_params=optax.incremental_update(updated_qf1_state.params, updated_qf1_state.target_params, tau)
             )
             final_qf2_state = updated_qf2_state.replace(
-                target_params=optax.incremental_update(updated_qf2_state.params, updated_qf2_state.target_params, tau),
-                target_batch_stats=optax.incremental_update(updated_qf2_state.batch_stats, updated_qf2_state.target_batch_stats, tau) if updated_qf2_state.batch_stats is not None else updated_qf2_state.target_batch_stats
+                target_params=optax.incremental_update(updated_qf2_state.params, updated_qf2_state.target_params, tau)
             )
             new_target = optax.incremental_update(updated_summarizer_state.params, updated_summarizer_state.target_params, tau)
             final_summarizer_state = updated_summarizer_state.replace(target_params=new_target)

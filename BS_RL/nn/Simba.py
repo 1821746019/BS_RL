@@ -77,11 +77,16 @@ class RSNorm(nn.Module):
 
         # Update statistics in training mode
         if update_stats:
-            # Stats are only updated with live data [N, F], which is 2D.
-            assert obs.ndim == 2, f"RSNorm statistics should only be updated with 2D live data, but got shape {obs.shape}"
-            batch_mean = jnp.mean(obs, axis=0, dtype=jnp.float32)
-            batch_var = jnp.var(obs, axis=0)
-            batch_count = obs.shape[0]
+            # The shape of `obs` can be 2D or 3D.
+            # - 2D: [num_envs, obs_dim] during live agent-environment interaction. Used to update the statistics.
+            # - 3D: [batch_size, seq_len, obs_dim] from the replay buffer during training updates.
+            # We must handle the 3D case here because of JAX's tracing mechanism for jax.lax.cond,
+            # even though stats are not updated with 3D data in practice.
+            # The goal is to calculate statistics per feature, so we reduce over batch and time axes.
+            axis = (0, 1) if obs.ndim > 2 else 0
+            batch_mean = jnp.mean(obs, axis=axis, dtype=jnp.float32)
+            batch_var = jnp.var(obs, axis=axis)
+            batch_count = obs.shape[0] * obs.shape[1] if obs.ndim > 2 else obs.shape[0]
             
             delta = batch_mean - running_mean.value
             tot_count = count.value + batch_count

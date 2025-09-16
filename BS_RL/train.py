@@ -236,17 +236,12 @@ class Trainer:
                 restore_target = {
                     'actor_params': self.actor_state.params,
                     'actor_opt_state': self.actor_state.opt_state,
-                    'actor_batch_stats': self.actor_state.batch_stats,
                     'qf1_params': self.qf1_state.params,
                     'qf1_opt_state': self.qf1_state.opt_state,
-                    'qf1_batch_stats': self.qf1_state.batch_stats,
                     'qf1_target_params': self.qf1_state.target_params,
-                    'qf1_target_batch_stats': self.qf1_state.target_batch_stats,
                     'qf2_params': self.qf2_state.params,
                     'qf2_opt_state': self.qf2_state.opt_state,
-                    'qf2_batch_stats': self.qf2_state.batch_stats,
                     'qf2_target_params': self.qf2_state.target_params,
-                    'qf2_target_batch_stats': self.qf2_state.target_batch_stats,
                     'summarizer_params': self.summarizer_state.params,
                     'summarizer_opt_state': self.summarizer_state.opt_state,
                     'summarizer_target_params': self.summarizer_state.target_params,
@@ -264,21 +259,16 @@ class Trainer:
                 self.actor_state = self.actor_state.replace(
                     params=loaded_contents['actor_params'],
                     opt_state=loaded_contents['actor_opt_state'],
-                    batch_stats=loaded_contents['actor_batch_stats']
                 )
                 self.qf1_state = self.qf1_state.replace(
                     params=loaded_contents['qf1_params'],
                     opt_state=loaded_contents['qf1_opt_state'],
-                    batch_stats=loaded_contents['qf1_batch_stats'],
                     target_params=loaded_contents['qf1_target_params'],
-                    target_batch_stats=loaded_contents['qf1_target_batch_stats']
                 )
                 self.qf2_state = self.qf2_state.replace(
                     params=loaded_contents['qf2_params'],
                     opt_state=loaded_contents['qf2_opt_state'],
-                    batch_stats=loaded_contents['qf2_batch_stats'],
                     target_params=loaded_contents['qf2_target_params'],
-                    target_batch_stats=loaded_contents['qf2_target_batch_stats']
                 )
                 self.summarizer_state = self.summarizer_state.replace(
                     params=loaded_contents['summarizer_params'],
@@ -483,17 +473,12 @@ class Trainer:
             save_target = {
                 'actor_params': self.actor_state.params,
                 'actor_opt_state': self.actor_state.opt_state,
-                'actor_batch_stats': self.actor_state.batch_stats,
                 'qf1_params': self.qf1_state.params,
                 'qf1_opt_state': self.qf1_state.opt_state,
-                'qf1_batch_stats': self.qf1_state.batch_stats,
                 'qf1_target_params': self.qf1_state.target_params,
-                'qf1_target_batch_stats': self.qf1_state.target_batch_stats,
                 'qf2_params': self.qf2_state.params,
                 'qf2_opt_state': self.qf2_state.opt_state,
-                'qf2_batch_stats': self.qf2_state.batch_stats,
                 'qf2_target_params': self.qf2_state.target_params,
-                'qf2_target_batch_stats': self.qf2_state.target_batch_stats,
                 'summarizer_params': self.summarizer_state.params,
                 'summarizer_opt_state': self.summarizer_state.opt_state,
                 'summarizer_target_params': self.summarizer_state.target_params,
