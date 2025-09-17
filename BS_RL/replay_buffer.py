@@ -9,13 +9,12 @@ class RecurrentReplayBuffer:
                  capacity_segments: int,
                  num_envs: int,
                  seg_len: int,
-                 burn_in: int = 0, min_gap: int = 60):
+                 min_gap: int = 60):
         self.obs_dim = obs_dim
         self.action_shape = action_shape
         self.is_discrete_action = is_discrete_action
         self.capacity_segments = capacity_segments
         self.num_envs = num_envs
-        self.burn_in = int(max(burn_in, 0))
         self.seg_len = seg_len
         self.min_gap = min_gap
         # Storage for segments as multi-dimensional arrays for vectorized operations
@@ -109,11 +108,7 @@ class RecurrentReplayBuffer:
         term[:length] = self.work_term[env_idx][:length]
         trunc[:length] = self.work_trunc[env_idx][:length]
         # mark valid training steps: exclude burn-in prefix
-        if length > self.burn_in:
-            m[self.burn_in:length] = 1.0
-        else:
-            # not enough steps to reach burn-in; keep m as zeros
-            pass
+        m[:length] = 1.0
         
         # For padded steps, mark as terminal to prevent bootstrap
         if length < self.seg_len:
@@ -152,12 +147,12 @@ class RecurrentReplayBuffer:
 
     def size(self) -> int:
         return self.num_stored_segments
-    def can_sample_many(self, batch_size: int, num_bptt: int, num_batches: int = 1) -> bool:
-        return self.num_stored_segments *(1+(self.seg_len - self.burn_in - num_bptt)/self.min_gap) >= batch_size * num_batches
-    def sample(self, batch_size: int, num_bptt: int) -> Dict[str, Any] | None:
-        return self.sample_many(batch_size, num_bptt, num_batches=1, remove_K_dim_if_one=True)
+    def can_sample_many(self, batch_size: int, seq_len: int, num_batches: int = 1) -> bool:
+        return self.num_stored_segments *(1+(self.seg_len - seq_len)/self.min_gap) >= batch_size * num_batches
+    def sample(self, batch_size: int, seq_len: int) -> Dict[str, Any] | None:
+        return self.sample_many(batch_size, seq_len, num_batches=1, remove_K_dim_if_one=True)
 
-    def sample_many(self, batch_size: int, num_bptt: int, num_batches: int, remove_K_dim_if_one: bool = False) -> Dict[str, Any] | None:
+    def sample_many(self, batch_size: int, seq_len: int, num_batches: int, remove_K_dim_if_one: bool = False) -> Dict[str, Any] | None:
         """
         Vectorized sampling of multiple independent batches to feed multiple update steps per JIT call.
         Returns a dict of arrays stacked on a leading dimension K=num_batches.
@@ -168,10 +163,10 @@ class RecurrentReplayBuffer:
         """
         if num_batches <= 0:
             return None
-        if not self.can_sample_many(batch_size, num_bptt, num_batches):
+        if not self.can_sample_many(batch_size, seq_len, num_batches):
             return None
         # Window length for training steps (L), excluding the final +1 obs.
-        L = int(self.burn_in + num_bptt)
+        L = seq_len
         max_start = self.seg_len - L
         if max_start < 0:
             return None
