@@ -80,6 +80,8 @@ class GymTrainer(Trainer):
 
 if __name__ == "__main__":
     # POPGym RepeatPreviousHard-v0 参数配置
+    env_id = "popgym-RepeatPreviousHard-v0" # 该任务要求记忆前5步的数字，即在t时刻时选择t-5观测到的数字
+    # env_id="CartPole-v1") # 完全可观测环境能解决，说明是记忆能力的问题
     total_timesteps = int(1e6)
     env_num = 16
     eval_env_num = 16
@@ -87,7 +89,7 @@ if __name__ == "__main__":
     rb_seg_len = 10 # 最长回合长度似乎是155步
     batch_size = 8 #round(256 / rb_seg_len) *
     burn_in = 5 # 智能体必须准确地“说出”它在5步之前看到的那个数字，开始5步agent是不知道答案的
-    train_unroll_steps = 5
+    train_unroll_steps = 5 # 对于RepeatPreviousHard，反向传播5步就够了
     learning_starts = 10000
     is_test = False
     ckpt_save_frequency = 0
@@ -100,10 +102,10 @@ if __name__ == "__main__":
     args = Args(
         train=TrainConfig(
             jax_platform_name="",
-            exp_name="POPGym-RepeatPreviousHard-RSAC",
+            exp_name=f"RSAC_{env_id}",
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,
-            save_dir=f"runs/POPGym_RepeatPreviousHard_RSAC",
+            save_dir=f"runs/RSAC_{env_id}",
             async_vector_env=False,
         ),
         eval=EvalConfig(
@@ -153,20 +155,19 @@ if __name__ == "__main__":
         ),
         wandb=WandbConfig(
             track=os.getenv("USE_WANDB", "true").lower() == "true",
-            project_name="RSAC-POPGym-RepeatPreviousHard",
+            project_name=f"RSAC_{env_id}",
             entity=None
         )
     )
     
-    print("开始训练RSAC-share在POPGym RepeatPreviousHard-v0环境...")
+    print(f"开始训练RSAC-share在{env_id}环境...")
     print(f"总步数: {total_timesteps:,}")
     print(f"批次大小: {batch_size}")
     print(f"学习开始步数: {learning_starts:,}")
     print(f"预期成功率: > 0.8")
     
     # 使用专门的gym训练器
-    trainer = GymTrainer(args, env_id="popgym-RepeatPreviousHard-v0")
-    # trainer = GymTrainer(args, env_id="CartPole-v1")
+    trainer = GymTrainer(args, env_id=env_id) 
     trainer.setup()
     trainer.train() 
 
