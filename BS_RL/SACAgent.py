@@ -260,12 +260,9 @@ class RSACAgent:
         _, o_normalized = self._norm_obs(rsnorm_state, o, update_stats=False)
         market_o, agent_o = self._split_obs(o_normalized)
 
-        summaries, _ = self.summarizer.apply({'params': summarizer_state.params}, market_o)
-        s_t = summaries[:, 1:-1, :]
+        # Pre-calculate summaries for the target network, which should be detached from grad calculations
         s_tp1_targ, _ = self.summarizer.apply({'params': summarizer_state.target_params}, market_o)
         s_tp1 = s_tp1_targ[:, 2:, :]
-
-        x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
         x_tp1 = jnp.concatenate([s_tp1, agent_o[:, 1:, :]], axis=-1)
 
         if self.algo_config.autotune:
@@ -275,6 +272,10 @@ class RSACAgent:
 
         if self.is_discrete:
             def critic_loss_fn(q1_params, q2_params, summarizer_params):
+                summaries, _ = self.summarizer.apply({'params': summarizer_params}, market_o)
+                s_t = summaries[:, 1:-1, :]
+                x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
+                
                 next_logits = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
                 next_logits = next_logits.reshape(B, T, -1)
                 next_probs = nn.softmax(next_logits, axis=-1)
@@ -304,6 +305,10 @@ class RSACAgent:
                 return loss, (qf1_value_mean, qf2_value_mean)
         else: # continuous
             def critic_loss_fn(q1_params, q2_params, summarizer_params):
+                summaries, _ = self.summarizer.apply({'params': summarizer_params}, market_o)
+                s_t = summaries[:, 1:-1, :]
+                x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
+
                 mean_tp1, log_std_tp1 = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
                 mean_tp1 = mean_tp1.reshape(B, T, -1)
                 log_std_tp1 = log_std_tp1.reshape(B, T, -1)
@@ -341,7 +346,10 @@ class RSACAgent:
         else:
             summarizer_state_new = summarizer_state
 
-        s_t_detached = jax.lax.stop_gradient(s_t)
+        # Re-compute summaries with the updated summarizer state for the actor loss,
+        # and immediately stop the gradient to prevent the actor loss from training the summarizer.
+        summaries_for_actor, _ = self.summarizer.apply({'params': summarizer_state_new.params}, market_o)
+        s_t_detached = jax.lax.stop_gradient(summaries_for_actor[:, 1:-1, :])
         x_t_detached = jnp.concatenate([s_t_detached, agent_o[:, :-1, :]], axis=-1)
 
         if self.is_discrete:

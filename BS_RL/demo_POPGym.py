@@ -84,10 +84,10 @@ if __name__ == "__main__":
     env_num = 16
     eval_env_num = 16
     eval_episodes = 16
-    rb_seg_len = 155 # 最长回合长度
+    rb_seg_len = 10 # 最长回合长度似乎是155步
     batch_size = 8 #round(256 / rb_seg_len) *
     burn_in = 5 # 智能体必须准确地“说出”它在5步之前看到的那个数字，开始5步agent是不知道答案的
-    train_unroll_steps = rb_seg_len - burn_in
+    train_unroll_steps = 5
     learning_starts = 10000
     is_test = False
     ckpt_save_frequency = 0
