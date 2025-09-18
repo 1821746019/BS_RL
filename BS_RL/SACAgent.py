@@ -24,7 +24,7 @@ class CriticTrainState(TrainState):
 
 class SummarizerTrainState(TrainState):
     target_params: flax.core.FrozenDict
-
+CarryType = tuple[TrainState, CriticTrainState, CriticTrainState, SummarizerTrainState, TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
 
 class RSACAgent:
     def __init__(self,
@@ -456,8 +456,8 @@ class RSACAgent:
         }
         return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
 
-    @partial(jax_jit, static_argnums=(0, 5, 6))
-    def update_then_select_action(self, obs, hidden_h, hidden_c, batches, do_update, do_target_update, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, rsnorm_state: TrainStateWithBatchStats, log_alpha_state: TrainState, key, updates_per_call: int, deterministic: bool = False):
+    @partial(jax_jit, static_argnums=(0, 5))
+    def update_then_select_action(self, obs, hidden_h, hidden_c, batches, do_update, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, rsnorm_state: TrainStateWithBatchStats, log_alpha_state: TrainState, key: jax.Array, updates_per_call: int, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
 
         batches: if do_update, a dict with leading dim K=updates_per_call; otherwise can be None or a single batch.
@@ -473,7 +473,7 @@ class RSACAgent:
         # 1. First perform agent update(s) if requested
         if do_update:
             num_updates = jnp.asarray(updates_per_call, dtype=jnp.int32)
-            init_carry = (
+            init_carry: CarryType = (
                 actor_state,
                 qf1_state,
                 qf2_state,
@@ -488,7 +488,7 @@ class RSACAgent:
                 jnp.array(0.0),  # current_alpha placeholder
             )
 
-            def body_fun(i, carry):
+            def body_fun(i, carry: CarryType):
                 (a_state, q1_state, q2_state, s_state, la_state,
                  cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha) = carry
                 b = {
@@ -502,6 +502,28 @@ class RSACAgent:
                 a_state_n, q1_state_n, q2_state_n, s_state_n, la_state_n, cur_alpha_n, metric_i = self._update(
                     a_state, q1_state, q2_state, s_state, updated_rsnorm_state, la_state, b, key_update
                 )
+                
+                # Target network update logic inside the loop
+                target_update_freq = self.algo_config.target_network_frequency // max(1, self.algo_config.update_frequency)
+                
+                def _update_targets(states: Tuple[CriticTrainState, CriticTrainState, SummarizerTrainState]):
+                    q1, q2, s = states
+                    tau = self.algo_config.tau
+                    q1 = q1.replace(target_params=optax.incremental_update(q1.params, q1.target_params, tau))
+                    q2 = q2.replace(target_params=optax.incremental_update(q2.params, q2.target_params, tau))
+                    s = s.replace(target_params=optax.incremental_update(s.params, s.target_params, tau))
+                    return q1, q2, s
+
+                def _no_update_targets(states):
+                    return states
+
+                q1_state_n, q2_state_n, s_state_n = jax.lax.cond(
+                    (a_state_n.step % target_update_freq == 0),
+                    _update_targets,
+                    _no_update_targets,
+                    (q1_state_n, q2_state_n, s_state_n)
+                )
+                
                 cl_sum = cl_sum + metric_i['critic_loss']
                 al_sum = al_sum + metric_i['actor_loss']
                 aloss_sum = aloss_sum + metric_i['alpha_loss']
@@ -530,21 +552,7 @@ class RSACAgent:
             current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha)
             metrics = {}
         
-        # Apply target network updates if requested
-        if do_update and do_target_update:
-            tau = self.algo_config.tau
-            final_qf1_state = updated_qf1_state.replace(
-                target_params=optax.incremental_update(updated_qf1_state.params, updated_qf1_state.target_params, tau)
-            )
-            final_qf2_state = updated_qf2_state.replace(
-                target_params=optax.incremental_update(updated_qf2_state.params, updated_qf2_state.target_params, tau)
-            )
-            new_target = optax.incremental_update(updated_summarizer_state.params, updated_summarizer_state.target_params, tau)
-            final_summarizer_state = updated_summarizer_state.replace(target_params=new_target)
-        else:
-            final_qf1_state, final_qf2_state, final_summarizer_state = updated_qf1_state, updated_qf2_state, updated_summarizer_state
-        
         # 2. Then perform action selection using potentially updated states
-        actions, new_h, new_c = self.select_action(updated_actor_state, final_summarizer_state.params, norm_obs_for_action, hidden_h, hidden_c, key_action, deterministic=deterministic)
+        actions, new_h, new_c = self.select_action(updated_actor_state, updated_summarizer_state.params, norm_obs_for_action, hidden_h, hidden_c, key_action, deterministic=deterministic)
         
-        return actions, new_h, new_c, updated_actor_state, final_qf1_state, final_qf2_state, final_summarizer_state, updated_rsnorm_state, updated_log_alpha_state, metrics, new_key
+        return actions, new_h, new_c, updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_rsnorm_state, updated_log_alpha_state, metrics, new_key

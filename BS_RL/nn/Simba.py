@@ -73,7 +73,7 @@ class RSNorm(nn.Module):
         # Define state variables to track and put them in the 'batch_stats' collection
         running_mean = self.variable('batch_stats', 'mean', lambda: jnp.zeros(obs.shape[-1], dtype=jnp.float32))
         running_var = self.variable('batch_stats', 'var', lambda: jnp.ones(obs.shape[-1], dtype=jnp.float32))
-        count = self.variable('batch_stats', 'count', lambda: jnp.array(1.0, dtype=jnp.float32))
+        count = self.variable('batch_stats', 'count', lambda: jnp.array(0, dtype=jnp.float32))
 
         # Update statistics in training mode
         if update_stats:
