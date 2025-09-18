@@ -284,9 +284,14 @@ class RSACAgent:
             current_alpha = jnp.exp(log_alpha_state.params['log_alpha'])
         else:
             current_alpha = self.current_alpha
-
+        def maybe_freeze_summarizer(summarizer_params):
+            if self.train_summarizer:
+                return summarizer_params
+            else:
+                return jax.lax.stop_gradient(summarizer_params)
         if self.is_discrete:
             def critic_loss_fn(q1_params, q2_params, summarizer_params):
+                summarizer_params = maybe_freeze_summarizer(summarizer_params)
                 summaries, _ = self.summarizer.apply({'params': summarizer_params}, market_o)
                 s_t = summaries[:, 1:-1, :]
                 x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
@@ -320,6 +325,7 @@ class RSACAgent:
                 return loss, (qf1_value_mean, qf2_value_mean)
         else: # continuous
             def critic_loss_fn(q1_params, q2_params, summarizer_params):
+                summarizer_params = maybe_freeze_summarizer(summarizer_params)
                 summaries, _ = self.summarizer.apply({'params': summarizer_params}, market_o)
                 s_t = summaries[:, 1:-1, :]
                 x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
@@ -356,15 +362,12 @@ class RSACAgent:
         g_q1_params, g_q2_params, g_sum_params = critic_grads
         qf1_state_new = qf1_state.apply_gradients(grads=g_q1_params)
         qf2_state_new = qf2_state.apply_gradients(grads=g_q2_params)
-        if self.train_summarizer:
-            summarizer_state_new = summarizer_state.apply_gradients(grads=g_sum_params)
-        else:
-            summarizer_state_new = summarizer_state
+        summarizer_state_new = summarizer_state.apply_gradients(grads=g_sum_params)
 
         # Re-compute summaries with the updated summarizer state for the actor loss,
         # and immediately stop the gradient to prevent the actor loss from training the summarizer.
         summaries_for_actor, _ = self.summarizer.apply({'params': summarizer_state_new.params}, market_o)
-        s_t_detached = jax.lax.stop_gradient(summaries_for_actor[:, 1:-1, :])
+        s_t_detached = summaries_for_actor[:, 1:-1, :]
         x_t_detached = jnp.concatenate([s_t_detached, agent_o[:, :-1, :]], axis=-1)
 
         if self.is_discrete:
