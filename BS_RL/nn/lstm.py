@@ -32,7 +32,7 @@ class LSTMSummarizer(nn.Module):
         """
         x: [B, T, D]
         Returns:
-          outputs: [B, T+1, H] (includes initial top-layer hidden as t=0)
+          outputs: [B, T, H] 
           final_state: (h, c) with shapes [L,B,H]
         """
         B, T, _ = x.shape
@@ -60,5 +60,5 @@ class LSTMSummarizer(nn.Module):
         )
         time_scan = Scanned(hidden_dim=H, num_layers=L, name="time_scan")
         (final_h, final_c), ys = time_scan((h, c), x_proj)  # ys: [B,T,H]
-        outputs = jnp.concatenate([h[-1][:, None, :], ys], axis=1)  # [B,T+1,H]
+        outputs = ys  # [B,T,H]
         return outputs, (final_h, final_c)

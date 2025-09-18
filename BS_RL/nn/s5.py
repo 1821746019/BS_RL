@@ -669,7 +669,7 @@ class S5Summarizer(nn.Module):
         """
         x: [B, T, D]
         Returns:
-          outputs: [B, T+1, H]
+          outputs: [B, T, H]
           final_state: (h, c_dummy) with shapes [L,B,H]
         """
         B, T, _ = x.shape
@@ -695,13 +695,9 @@ class S5Summarizer(nn.Module):
 
         # Convert new hidden back to real [L, B, H]
         final_h_real = jnp.stack([self._unpack_hidden_complex_to_real(hc) for hc in new_h_layers], axis=0)
-
-        # To outputs [B, T+1, H] with prepended initial top layer hidden
-        top_init = final_h_real[-1] * 0.0  # default zeros for t=0
-        if initial_state is not None:
-            top_init = initial_state[0][-1]
+        
         y_bTH = jnp.swapaxes(y_tbH, 0, 1)
-        outputs = jnp.concatenate([top_init[:, None, :], y_bTH], axis=1)
+        outputs = y_bTH
         return outputs, (final_h_real, jnp.zeros_like(final_h_real))
 
 import warnings, jax.numpy as jnp

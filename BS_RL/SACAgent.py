@@ -248,7 +248,7 @@ class RSACAgent:
         B, T = loss_calc_m.shape[0], loss_calc_m.shape[1]
          # Pre-calculate summaries for the target network, which should be detached from grad calculations
         s_tp1_targ, _ = self.summarizer.apply({'params': summarizer_state.target_params}, market_o)
-        s_tp1 = s_tp1_targ[:, 2:, :]
+        s_tp1 = s_tp1_targ[:, 1:, :]
         x_tp1 = jnp.concatenate([s_tp1, agent_o[:, 1:, :]], axis=-1)
         def maybe_freeze_summarizer(params):
             if self.train_summarizer:
@@ -259,7 +259,7 @@ class RSACAgent:
             def critic_loss_fn(q1_params, q2_params, summarizer_params):
                 summarizer_params = maybe_freeze_summarizer(summarizer_params)
                 summaries, _ = self.summarizer.apply({'params': summarizer_params}, market_o)
-                s_t = summaries[:, 1:-1, :]
+                s_t = summaries[:, :-1, :]
                 x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
                 
                 next_logits = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
@@ -293,7 +293,7 @@ class RSACAgent:
             def critic_loss_fn(q1_params, q2_params, summarizer_params):
                 summarizer_params = maybe_freeze_summarizer(summarizer_params)
                 summaries, _ = self.summarizer.apply({'params': summarizer_params}, market_o)
-                s_t = summaries[:, 1:-1, :]
+                s_t = summaries[:, 0:-1, :]
                 x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
 
                 mean_tp1, log_std_tp1 = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
@@ -446,7 +446,7 @@ class RSACAgent:
                 return jax.lax.cond(update_actor_and_alpha, self._update_actor_and_alpha, no_update_aa, actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
             else: # 标准流程C0A0->C1A1 critic评估的是上一步的(最新的)actor
                 summaries, _ = self.summarizer.apply({'params': summarizer_state_new.params}, market_o)
-                x_t_new = jnp.concat([summaries[:, 1:-1, :], agent_o[:, :-1, :]], axis=-1)
+                x_t_new = jnp.concat([summaries[:, :-1, :], agent_o[:, :-1, :]], axis=-1)
                 return self._update_actor_and_alpha(actor_state, qf1_state_new, qf2_state_new, log_alpha_state, curr_alpha, x_t_new, loss_calc_m, key)
         actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val) = maybe_defer_to_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
         
