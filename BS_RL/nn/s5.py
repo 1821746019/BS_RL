@@ -643,7 +643,7 @@ class S5Summarizer(nn.Module):
             ssm=ssm_init_fn,
             d_model=H,
             n_layers=self.num_layers,
-            activation="full_glu",
+            activation="gelu",
             do_norm=True,
             prenorm=True,
             do_gtrxl_norm=True,
