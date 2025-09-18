@@ -703,3 +703,19 @@ class S5Summarizer(nn.Module):
         y_bTH = jnp.swapaxes(y_tbH, 0, 1)
         outputs = jnp.concatenate([top_init[:, None, :], y_bTH], axis=1)
         return outputs, (final_h_real, jnp.zeros_like(final_h_real))
+
+import warnings, jax.numpy as jnp
+warnings.filterwarnings("ignore", category=jnp.ComplexWarning)
+"""
+/root/project/.venv/lib/python3.11/site-packages/jax/_src/lax/lax.py:5125: ComplexWarning: Casting complex values to real discards the imaginary part
+  x_bar = _convert_element_type(x_bar, x.aval.dtype, x.aval.weak_type)
+不会影响训练的正确性。
+这是 JAX 在反向传播里把复数型共轭梯度投回到实数参数时的提示，不是报错，训练会继续进行。
+原因：S5 内部用复数态计算，但你网络的参数是以“实数对”（real, imag）存储并参与优化，最终输出传给后续网络都是实数。JAX 的梯度在回写到实数参数时会丢弃虚部，因此给出 ComplexWarning，但这在数学上等价于对实部/虚部分别求导，不影响优化正确性。
+关键依据（代码）
+S5 的输出在前向里已显式取实部，确保传给下游网络是实数：
+S5 的隐藏状态用实数组拼成复数（forward）/再拆回实数（state 接口），参数本身是实数张量：
+何时需要担心
+只有当你真的把 Flax 参数直接定义为复数 dtype，并希望其“虚部”也被单独优化时，丢弃虚部才会带来信息损失。现在你的实现用的是实数参数对（最后一维 size=2），不受影响。
+若在 loss 中直接保留了复数（未取 real），那会导致更严重的问题（NaN/报错），但你当前实现已在关键处取实部。
+"""

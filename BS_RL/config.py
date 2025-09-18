@@ -33,7 +33,7 @@ class AlgoConfig:
     """the batch size of sample from the reply memory"""
     learning_starts: int = 20000
     """timestep to start learning"""
-    summarizer_lr: float = 1e-5
+    summarizer_lr: float = 3e-4 #1e-5
     """the learning rate of the summarizer network optimizer"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
