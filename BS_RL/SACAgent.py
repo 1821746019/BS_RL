@@ -1,5 +1,5 @@
-import jax
-import jax.numpy as jnp
+import jax, jax.numpy as jnp
+from jax import Array
 import flax.core
 import flax.linen as nn
 from flax.training.train_state import TrainState
@@ -69,9 +69,9 @@ class RSACAgent:
         if algo_config.autotune:
             log_alpha_params = {'log_alpha': jnp.zeros(())}
             self.log_alpha_state = TrainState.create(apply_fn=None, params=log_alpha_params, tx=self.alpha_optimizer)
-            self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
+            self.curr_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
         else:
-            self.current_alpha = jnp.array(algo_config.alpha)
+            self.curr_alpha = jnp.array(algo_config.alpha)
         
         if self.is_discrete:
             self.target_entropy = -self.algo_config.target_entropy_scale_for_disc * jnp.log(1.0 / self.action_dim)
@@ -83,12 +83,6 @@ class RSACAgent:
         params = variables.get('params', flax.core.FrozenDict()) # RSNorm没有param故用.get
         batch_stats = variables.get('batch_stats')
         return params, batch_stats
-
-    def _apply_model_with_batch_stats(self, model: nn.Module, variables, *args, deterministic=True, mutable=None, **kwargs):
-        if mutable:
-            return model.apply(variables, *args, deterministic=deterministic, mutable=mutable, **kwargs)
-        else:
-            return model.apply(variables, *args, deterministic=deterministic, **kwargs)
 
     def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_summarizer, key_rsnorm):
         # Shared summarizer and target summarizer
@@ -250,45 +244,17 @@ class RSACAgent:
         # 真实数据且不在burn-in阶段时计算损失
         calc_loss = jnp.logical_and(is_real.astype(bool), jnp.logical_not(burn_in_mask))
         return calc_loss.astype(jnp.float32)
-
-    @partial(jax_jit, static_argnums=(0,))
-    def _update(self,
-                actor_state: TrainState,
-                qf1_state: CriticTrainState,
-                qf2_state: CriticTrainState,
-                summarizer_state: SummarizerTrainState,
-                rsnorm_state: TrainStateWithBatchStats,
-                log_alpha_state: Optional[TrainState],
-                batch: dict,
-                key: jax.Array):
-        o = batch['o']
-        a = batch['a']
-        r = batch['r']
-        term = batch['term']
-        trunc = batch['trunc']
-        is_real = batch['m'] # rb的m为1时表示对应索引的数据是真实的，为0时表示是padding的
-        B, T = r.shape[0], r.shape[1]
-        
-        # Apply burn-in mask, m from rb only indicates padding, not burn-in
-        calc_loss = self._create_calc_loss_mask(is_real)
-        
-        _, o_normalized = self._norm_obs(rsnorm_state, o, update_stats=False)
-        market_o, agent_o = self._split_obs(o_normalized)
-
-        # Pre-calculate summaries for the target network, which should be detached from grad calculations
+    def _update_critic(self, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, curr_alpha: Array, market_o: Array, agent_o: Array, a: Array, r: Array, term: Array, loss_calc_m: Array, key: Array):
+        B, T = loss_calc_m.shape[0], loss_calc_m.shape[1]
+         # Pre-calculate summaries for the target network, which should be detached from grad calculations
         s_tp1_targ, _ = self.summarizer.apply({'params': summarizer_state.target_params}, market_o)
         s_tp1 = s_tp1_targ[:, 2:, :]
         x_tp1 = jnp.concatenate([s_tp1, agent_o[:, 1:, :]], axis=-1)
-
-        if self.algo_config.autotune:
-            current_alpha = jnp.exp(log_alpha_state.params['log_alpha'])
-        else:
-            current_alpha = self.current_alpha
-        def maybe_freeze_summarizer(summarizer_params):
+        def maybe_freeze_summarizer(params):
             if self.train_summarizer:
-                return summarizer_params
+                return params
             else:
-                return jax.lax.stop_gradient(summarizer_params)
+                return jax.lax.stop_gradient(params)
         if self.is_discrete:
             def critic_loss_fn(q1_params, q2_params, summarizer_params):
                 summarizer_params = maybe_freeze_summarizer(summarizer_params)
@@ -304,7 +270,7 @@ class RSACAgent:
                 q1_next = self.critic_model.apply({'params': qf1_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True).reshape(B, T, -1)
                 q2_next = self.critic_model.apply({'params': qf2_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True).reshape(B, T, -1)
                 min_q_next = jnp.minimum(q1_next, q2_next)
-                v_next = jnp.sum(next_probs * (min_q_next - current_alpha * next_log_probs), axis=-1)
+                v_next = jnp.sum(next_probs * (min_q_next - curr_alpha * next_log_probs), axis=-1)
                 target = r + (1.0 - term) * self.algo_config.gamma * v_next
 
                 q1_all = self.critic_model.apply({'params': q1_params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=False)
@@ -317,12 +283,12 @@ class RSACAgent:
 
                 mse1 = (q1_taken - target) ** 2
                 mse2 = (q2_taken - target) ** 2
-                mse1 = (mse1 * calc_loss).sum() / (calc_loss.sum() + 1e-8)
-                mse2 = (mse2 * calc_loss).sum() / (calc_loss.sum() + 1e-8)
+                mse1 = (mse1 * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
+                mse2 = (mse2 * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
                 loss = 0.5 * (mse1 + mse2)
-                qf1_value_mean = (q1_taken * calc_loss).sum() / (calc_loss.sum() + 1e-8)
-                qf2_value_mean = (q2_taken * calc_loss).sum() / (calc_loss.sum() + 1e-8)
-                return loss, (qf1_value_mean, qf2_value_mean)
+                qf1_value_mean = (q1_taken * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
+                qf2_value_mean = (q2_taken * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
+                return loss, (qf1_value_mean, qf2_value_mean, x_t)
         else: # continuous
             def critic_loss_fn(q1_params, q2_params, summarizer_params):
                 summarizer_params = maybe_freeze_summarizer(summarizer_params)
@@ -342,7 +308,7 @@ class RSACAgent:
                 q1_next = self.critic_model.apply({'params': qf1_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), action=squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(B, T)
                 q2_next = self.critic_model.apply({'params': qf2_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), action=squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(B, T)
                 min_q_next = jnp.minimum(q1_next, q2_next)
-                target = r + (1.0 - term) * self.algo_config.gamma * (min_q_next - current_alpha * log_prob)
+                target = r + (1.0 - term) * self.algo_config.gamma * (min_q_next - curr_alpha * log_prob)
 
                 q1_cur = self.critic_model.apply({'params': q1_params}, x_t.reshape(-1, x_t.shape[-1]), action=a.reshape(-1, a.shape[-1]), deterministic=False)
                 q2_cur = self.critic_model.apply({'params': q2_params}, x_t.reshape(-1, x_t.shape[-1]), action=a.reshape(-1, a.shape[-1]), deterministic=False)
@@ -351,46 +317,42 @@ class RSACAgent:
 
                 mse1 = (q1_cur - target) ** 2
                 mse2 = (q2_cur - target) ** 2
-                mse1 = (mse1 * calc_loss).sum() / (calc_loss.sum() + 1e-8)
-                mse2 = (mse2 * calc_loss).sum() / (calc_loss.sum() + 1e-8)
+                mse1 = (mse1 * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
+                mse2 = (mse2 * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
                 loss = 0.5 * (mse1 + mse2)
-                qf1_value_mean = (q1_cur * calc_loss).sum() / (calc_loss.sum() + 1e-8)
-                qf2_value_mean = (q2_cur * calc_loss).sum() / (calc_loss.sum() + 1e-8)
-                return loss, (qf1_value_mean, qf2_value_mean)
+                qf1_value_mean = (q1_cur * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
+                qf2_value_mean = (q2_cur * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
+                return loss, (qf1_value_mean, qf2_value_mean, x_t)
 
-        (critic_loss_val, (qf1_value_mean, qf2_value_mean)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1,2))(qf1_state.params, qf2_state.params, summarizer_state.params)
+        (critic_loss_val, (qf1_value_mean, qf2_value_mean, x_t)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1,2))(qf1_state.params, qf2_state.params, summarizer_state.params)
         g_q1_params, g_q2_params, g_sum_params = critic_grads
         qf1_state_new = qf1_state.apply_gradients(grads=g_q1_params)
         qf2_state_new = qf2_state.apply_gradients(grads=g_q2_params)
         summarizer_state_new = summarizer_state.apply_gradients(grads=g_sum_params)
-
-        # Re-compute summaries with the updated summarizer state for the actor loss,
-        # and immediately stop the gradient to prevent the actor loss from training the summarizer.
-        summaries_for_actor, _ = self.summarizer.apply({'params': summarizer_state_new.params}, market_o)
-        s_t_detached = summaries_for_actor[:, 1:-1, :]
-        x_t_detached = jnp.concatenate([s_t_detached, agent_o[:, :-1, :]], axis=-1)
-
+        return qf1_state_new, qf2_state_new, summarizer_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t)
+    def _update_actor_and_alpha(self, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, log_alpha_state: Optional[TrainState], curr_alpha: Array, x_t: Array, loss_calc_m: Array, key: Array):
+        B, T = loss_calc_m.shape
         if self.is_discrete:
             def actor_loss_fn(actor_params):
                 logits = self.actor_model.apply(
                     {'params': actor_params},
-                    x_t_detached.reshape(-1, x_t_detached.shape[-1]),
+                    x_t.reshape(-1, x_t.shape[-1]),
                     deterministic=False,
                 ).reshape(B, T, -1)
                 probs = nn.softmax(logits, axis=-1)
                 log_probs = nn.log_softmax(logits, axis=-1)
-                q1_all = self.critic_model.apply({'params': qf1_state_new.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
-                q2_all = self.critic_model.apply({'params': qf2_state_new.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
+                q1_all = self.critic_model.apply({'params': qf1_state.params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True).reshape(B, T, -1)
+                q2_all = self.critic_model.apply({'params': qf2_state.params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True).reshape(B, T, -1)
                 min_q = jnp.minimum(q1_all, q2_all)
-                actor_loss_t = jnp.sum(probs * (current_alpha * log_probs - min_q), axis=-1)
-                actor_loss = (actor_loss_t * calc_loss).sum() / (calc_loss.sum() + 1e-8)
-                entropy = (-jnp.sum((probs + 1e-8) * log_probs, axis=-1) * calc_loss).sum() / (calc_loss.sum() + 1e-8)
+                actor_loss_t = jnp.sum(probs * (curr_alpha * log_probs - min_q), axis=-1)
+                actor_loss = (actor_loss_t * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
+                entropy = (-jnp.sum((probs + 1e-8) * log_probs, axis=-1) * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
                 return actor_loss, entropy
         else: # continuous
             def actor_loss_fn(actor_params):
                 mean, log_std = self.actor_model.apply(
                     {'params': actor_params},
-                    x_t_detached.reshape(-1, x_t_detached.shape[-1]),
+                    x_t.reshape(-1, x_t.shape[-1]),
                     deterministic=False,
                 )
                 mean = mean.reshape(B, T, -1)
@@ -401,33 +363,33 @@ class RSACAgent:
                 log_prob = dist.log_prob(u)
                 log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(u) ** 2 + 1e-6), axis=-1)
 
-                q1_pi = self.critic_model.apply({'params': qf1_state_new.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), action=squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(B, T)
-                q2_pi = self.critic_model.apply({'params': qf2_state_new.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), action=squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(B, T)
+                q1_pi = self.critic_model.apply({'params': qf1_state.params}, x_t.reshape(-1, x_t.shape[-1]), action=squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(B, T)
+                q2_pi = self.critic_model.apply({'params': qf2_state.params}, x_t.reshape(-1, x_t.shape[-1]), action=squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(B, T)
                 min_q = jnp.minimum(q1_pi, q2_pi)
-                loss_t = (current_alpha * log_prob - min_q)
-                loss = (loss_t * calc_loss).sum() / (calc_loss.sum() + 1e-8)
-                entropy = (-(log_prob) * calc_loss).sum() / (calc_loss.sum() + 1e-8)
+                loss_t = (curr_alpha * log_prob - min_q)
+                loss = (loss_t * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
+                entropy = (-(log_prob) * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
                 return loss, entropy
 
         (actor_loss_val, entropy_val), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
         actor_state_new = actor_state.apply_gradients(grads=actor_grads)
 
         alpha_loss_val = jnp.array(0.0)
-        log_alpha_state_to_return = log_alpha_state
-        current_alpha_to_return = current_alpha
+        log_alpha_state_new = log_alpha_state
+        curr_alpha_new = curr_alpha # 没autotune时alpha值是固定的
         if self.algo_config.autotune:
             if self.is_discrete:
-                logits_det = self.actor_model.apply({'params': actor_state.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True).reshape(B, T, -1)
+                logits_det = self.actor_model.apply({'params': actor_state.params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True).reshape(B, T, -1)
                 log_probs_det = nn.log_softmax(logits_det, axis=-1)
                 probs_det = nn.softmax(logits_det, axis=-1)
                 def alpha_loss_fn(log_alpha_params):
                     lp = log_probs_det
                     pr = probs_det
                     loss_t = pr * (-jnp.exp(log_alpha_params['log_alpha']) * (lp + self.target_entropy))
-                    loss = (jnp.sum(loss_t, axis=-1) * calc_loss).sum() / (calc_loss.sum() + 1e-8)
+                    loss = (jnp.sum(loss_t, axis=-1) * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
                     return loss
             else: # continuous
-                mean_det, log_std_det = self.actor_model.apply({'params': actor_state.params}, x_t_detached.reshape(-1, x_t_detached.shape[-1]), deterministic=True)
+                mean_det, log_std_det = self.actor_model.apply({'params': actor_state.params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True)
                 mean_det = mean_det.reshape(B, T, -1)
                 log_std_det = log_std_det.reshape(B, T, -1)
                 dist_det = tfd.MultivariateNormalDiag(loc=mean_det, scale_diag=jnp.exp(log_std_det))
@@ -435,26 +397,69 @@ class RSACAgent:
                 log_prob_det = dist_det.log_prob(u_det)
                 log_prob_det -= jnp.sum(jnp.log(1 - jnp.tanh(u_det) ** 2 + 1e-6), axis=-1)
                 def alpha_loss_fn(log_alpha_params):
-                    return ((-jnp.exp(log_alpha_params['log_alpha']) * (log_prob_det + self.target_entropy)) * calc_loss).sum() / (calc_loss.sum() + 1e-8)
+                    return ((-jnp.exp(log_alpha_params['log_alpha']) * (log_prob_det + self.target_entropy)) * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
             
             alpha_loss_val, alpha_grads = jax.value_and_grad(alpha_loss_fn)(log_alpha_state.params)
-            log_alpha_state_updated = log_alpha_state.apply_gradients(grads=alpha_grads)
+            log_alpha_state_new = log_alpha_state.apply_gradients(grads=alpha_grads)
             # clamp updated log_alpha and alpha
-            alpha_clamped = jnp.clip(jnp.exp(log_alpha_state_updated.params['log_alpha']), self.algo_config.alpha_min, self.algo_config.alpha_max)
-            log_alpha_state_updated = log_alpha_state_updated.replace(params={'log_alpha': jnp.log(alpha_clamped)})
-            log_alpha_state_to_return = log_alpha_state_updated
-            current_alpha_to_return = alpha_clamped
+            alpha_clamped = jnp.clip(jnp.exp(log_alpha_state_new.params['log_alpha']), self.algo_config.alpha_min, self.algo_config.alpha_max)
+            log_alpha_state_new = log_alpha_state_new.replace(params={'log_alpha': jnp.log(alpha_clamped)})
+            curr_alpha_new = alpha_clamped
+        return actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val)
 
+    @partial(jax_jit, static_argnums=(0,))
+    def _update(self,
+                actor_state: TrainState,
+                qf1_state: CriticTrainState,
+                qf2_state: CriticTrainState,
+                summarizer_state: SummarizerTrainState,
+                rsnorm_state: TrainStateWithBatchStats,
+                log_alpha_state: Optional[TrainState],
+                batch: dict,
+                key: jax.Array):
+        o = batch['o']
+        a = batch['a']
+        r = batch['r']
+        term = batch['term']
+        # trunc = batch['trunc']
+        is_real = batch['m'] # rb的m为1时表示对应索引的数据是真实的，为0时表示是padding的
+        
+        # Apply burn-in mask, m from rb only indicates padding, not burn-in
+        loss_calc_m = self._create_calc_loss_mask(is_real)
+        
+        _, o_normalized = self._norm_obs(rsnorm_state, o, update_stats=False)
+        market_o, agent_o = self._split_obs(o_normalized)
+
+        if self.algo_config.autotune:
+            curr_alpha = jnp.exp(log_alpha_state.params['log_alpha'])
+        else:
+            curr_alpha = self.curr_alpha
+
+        qf1_state_new, qf2_state_new, summarizer_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t) = self._update_critic(actor_state, qf1_state, qf2_state, summarizer_state, curr_alpha, market_o, agent_o, a, r, term, loss_calc_m, key)
+        # 首次update不更新actor和alpha
+        update_actor_and_alpha = qf1_state.step != 0
+        def no_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key):
+            return actor_state, log_alpha_state, curr_alpha, (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0))
+        defer_update = False 
+        def maybe_defer_to_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key):
+            if defer_update: # 流程C0->C1A0->C2A1 critic评估的是上上步的actor。共用x_t减少了一次summarizer的前向传播，能带来10%的SPS提升(500->550)
+                return jax.lax.cond(update_actor_and_alpha, self._update_actor_and_alpha, no_update_aa, actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
+            else: # 标准流程C0A0->C1A1 critic评估的是上一步的(最新的)actor
+                summaries, _ = self.summarizer.apply({'params': summarizer_state_new.params}, market_o)
+                x_t_new = jnp.concat([summaries[:, 1:-1, :], agent_o[:, :-1, :]], axis=-1)
+                return self._update_actor_and_alpha(actor_state, qf1_state_new, qf2_state_new, log_alpha_state, curr_alpha, x_t_new, loss_calc_m, key)
+        actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val) = maybe_defer_to_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
+        
         metrics = {
             'critic_loss': critic_loss_val,
             'actor_loss': actor_loss_val,
             'alpha_loss': alpha_loss_val,
-            'alpha': current_alpha_to_return,
+            'alpha': curr_alpha_new,
             'entropy': entropy_val,
             'qf1_value_mean': qf1_value_mean,
             'qf2_value_mean': qf2_value_mean,
         }
-        return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_to_return, current_alpha_to_return, metrics
+        return actor_state_new, qf1_state_new, qf2_state_new, summarizer_state_new, log_alpha_state_new, curr_alpha_new, metrics
 
     @partial(jax_jit, static_argnums=(0, 5))
     def update_then_select_action(self, obs, hidden_h, hidden_c, batches, do_update, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, summarizer_state: SummarizerTrainState, rsnorm_state: TrainStateWithBatchStats, log_alpha_state: TrainState, key: jax.Array, updates_per_call: int, deterministic: bool = False):
@@ -534,7 +539,7 @@ class RSACAgent:
                         cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha_n)
 
             (updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state,
-             critic_loss_sum, actor_loss_sum, alpha_loss_sum, entropy_sum, qf1_mean_sum, qf2_mean_sum, current_alpha) = \
+             critic_loss_sum, actor_loss_sum, alpha_loss_sum, entropy_sum, qf1_mean_sum, qf2_mean_sum, curr_alpha) = \
                 jax.lax.fori_loop(0, num_updates, body_fun, init_carry)
 
             kf = jnp.maximum(1, num_updates)
@@ -542,14 +547,14 @@ class RSACAgent:
                 'critic_loss': critic_loss_sum / kf,
                 'actor_loss': actor_loss_sum / kf,
                 'alpha_loss': alpha_loss_sum / kf,
-                'alpha': current_alpha,
+                'alpha': curr_alpha,
                 'entropy': entropy_sum / kf,
                 'qf1_value_mean': qf1_mean_sum / kf,
                 'qf2_value_mean': qf2_mean_sum / kf,
             }
         else:
             updated_actor_state, updated_qf1_state, updated_qf2_state, updated_summarizer_state, updated_log_alpha_state = actor_state, qf1_state, qf2_state, summarizer_state, log_alpha_state
-            current_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha)
+            curr_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha)
             metrics = {}
         
         # 2. Then perform action selection using potentially updated states
