@@ -446,7 +446,7 @@ class RSACAgent:
                 return jax.lax.cond(update_actor_and_alpha, self._update_actor_and_alpha, no_update_aa, actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
             else: # 标准流程C0A0->C1A1 critic评估的是上一步的(最新的)actor
                 summaries, _ = self.summarizer.apply({'params': summarizer_state_new.params}, market_o)
-                x_t_new = jnp.concat([summaries, agent_o], axis=-1)
+                x_t_new = jnp.concat([summaries[:, :-1, :], agent_o[:, :-1, :]], axis=-1)
                 return self._update_actor_and_alpha(actor_state, qf1_state_new, qf2_state_new, log_alpha_state, curr_alpha, x_t_new, loss_calc_m, key)
         actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val) = maybe_defer_to_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
         
