@@ -59,6 +59,8 @@ class Evaluator:
                 data_loader_cfg=self.env_config.data_loader_cfg,
                 feat_getter=self.env_config.feat_getter,
                 capture_media=self.eval_config.capture_media,
+                random_choose_tickers=env_num > 1,
+                tickers_per_env=self.env_config.tickers_per_env,
             )
             envs.append(env)
         return eval_vec_env_cls(envs)

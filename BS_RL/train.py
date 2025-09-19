@@ -173,7 +173,8 @@ class Trainer:
                 config=self.args.env.trading_env_config,
                 data_loader_cfg=self.args.env.data_loader_cfg,
                 feat_getter=self.args.env.feat_getter,
-                random_choose_tickers= self.args.env.env_num > 1
+                random_choose_tickers= self.args.env.env_num > 1,
+                tickers_per_env=self.args.env.tickers_per_env
             ) for i in range(self.args.env.env_num)]
         )
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)

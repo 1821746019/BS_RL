@@ -15,6 +15,7 @@ USE_JAX_PROFILER = os.getenv("USE_JAX_PROFILER", "false").lower() == "true"
 class EnvConfig:
     trading_env_config: TradingEnvConfig = field(default_factory=TradingEnvConfig)
     data_loader_cfg: DataLoaderConfig = field(default_factory=DataLoaderConfig)
+    tickers_per_env: int = 1
     feat_getter: Callable = field(default_factory=lambda: norm_OHLCV.features_getter) 
     env_num: int = 1 # sac_atari.py uses 1 env
     """the number of parallel game environments"""

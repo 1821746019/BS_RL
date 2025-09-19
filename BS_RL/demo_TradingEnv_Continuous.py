@@ -9,21 +9,24 @@ from BS_RL.common import gym_train_env_maker, gym_eval_env_maker
 import os
 from TradingEnv import TradingEnvConfig
 
-
+DAY_MINUTES = 1440
 if __name__ == "__main__":
     env_id = "TradingEnv"
     window_size = 1 # 防止过拟合，用1
     use_SGD = False
     total_timesteps = int(10e6) 
     env_num = 32
-    batch_size = 4
-    updates_per_call = 8
-    async_vector_env = True if env_num > 1 else False
+    batch_size = 1
+    updates_per_call = 32
+    async_vector_env = False #True if env_num > 1 else False
     eval_env_num = 48
-    async_vector_env_eval = True if eval_env_num > 1 else False
+    async_vector_env_eval = False #if eval_env_num > 1 else False
     exp_name = f"env_num({env_num})_window({window_size})_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
-    eval_episodes = 1
-    train_unroll_steps = 16
+    eval_episodes = eval_env_num #每个环境评估一次
+    timeframe_m = 5
+    burn_in = DAY_MINUTES // timeframe_m
+    train_unroll_steps = DAY_MINUTES * 3  // timeframe_m 
+    rb_seg_len = DAY_MINUTES * 8 // timeframe_m
     is_test = total_timesteps == int(1e6)
     learning_starts = 1000 if is_test else 30000
     ckpt_save_frequency = 0.1 if is_test else 0.1
@@ -48,7 +51,8 @@ if __name__ == "__main__":
             capture_media=True,
         ),
         env=EnvConfig(
-            trading_env_config=TradingEnvConfig(),
+            data_loader_cfg=DataLoaderConfig(timeframe_minutes=timeframe_m),
+            trading_env_config=TradingEnvConfig(cooldown_days=0, loss_aversion=1),
             env_num=env_num,
         ),
         network=NetworkConfig(
@@ -75,7 +79,9 @@ if __name__ == "__main__":
             adam_eps=1e-4,
             use_SGD=use_SGD,
             updates_per_call=updates_per_call,
-            train_unroll_steps=train_unroll_steps
+            train_unroll_steps=train_unroll_steps,
+            burn_in=burn_in,
+            rb_seg_len=rb_seg_len,
         ),
         wandb=WandbConfig(
             track=True,
