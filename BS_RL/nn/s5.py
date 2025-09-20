@@ -657,7 +657,7 @@ S5模型内部的状态演化由一个复杂的线性系统描述。为了更好
             ssm=ssm_init_fn,
             d_model=H,
             n_layers=self.num_layers,
-            activation="gelu",
+            activation="full_glu",
             do_norm=True,
             prenorm=True,
             do_gtrxl_norm=True,
