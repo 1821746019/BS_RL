@@ -354,7 +354,7 @@ class S5SSM(nn.Module):
         if self.conj_sym:
             # Need to account for case where we actually sample real B and C, and then multiply
             # by the half sized Vinv and possibly V
-            local_P = 2*self.P
+            local_P = 2*self.P 
         else:
             local_P = self.P
 
@@ -368,7 +368,8 @@ class S5SSM(nn.Module):
 
         # Initialize input to state (B) matrix
         B_init = lecun_normal()
-        B_shape = (local_P, self.H)
+        # 【修正】B 的形状应该基于存储的复数维度 P，而不是有效的实数维度 local_P。local_P 仅用于概念上的理解，不应参与 B 的形状定义
+        B_shape = (self.P, self.H)
         self.B = self.param("B",
                             lambda rng, shape: init_VinvB(B_init,
                                                           rng,
@@ -380,10 +381,10 @@ class S5SSM(nn.Module):
         # Initialize state to output (C) matrix
         if self.C_init in ["trunc_standard_normal"]:
             C_init = trunc_standard_normal
-            C_shape = (self.H, local_P, 2)
+            C_shape = (self.H, self.P, 2) # 【修正】C 的形状也应该基于存储的复数维度 P
         elif self.C_init in ["lecun_normal"]:
             C_init = lecun_normal()
-            C_shape = (self.H, local_P, 2)
+            C_shape = (self.H, self.P, 2) # 【修正】C 的形状也应该基于存储的复数维度 P
         elif self.C_init in ["complex_normal"]:
             C_init = normal(stddev=0.5 ** 0.5)
         else:
@@ -634,10 +635,23 @@ class S5Summarizer(nn.Module):
             discretization="zoh",
             dt_min=self.delta_min,
             dt_max=self.delta_max,
-            conj_sym=False, # 为True有bug，应该是官方代码的问题。TypeError: dot_general requires contracting dimensions to have the same shape, got (128,) and (256,).
+            conj_sym=True, 
             clip_eigs=False,
             bidirectional=False,
         )
+        """
+conj_sym是什么？
+S5模型内部的状态演化由一个复杂的线性系统描述。为了更好地分析和计算这个系统，模型会将其分解到“特征模式”（即特征向量和特征值）。对于一个用真实世界数值定义的系统，它的复数特征值必然以共轭对的形式存在 。
+为什么能优化？
+减少存储和计算：既然这些特征值是成对的，我们只需要存储和计算其中一半（例如，虚部为正的那一半） 。
+效率翻倍：通过只处理一半的数据，模型的运行时长和内存占用几乎可以减半 。这是一个巨大的性能提升，尤其是在处理长序列和大型模型时。
+保证实数输出：这个操作的另一个重要作用是，它能确保模型的最终输出是实数，而不是复数，这对于神经网络的后续层是必需的 。   
+总结：conj_sym(共轭对称)是S5模型中的一个关键效率开关。当它开启时：
+利用了“共轭对称”这一数学性质 。
+只存储和计算一半的复数状态 。
+将模型运行速度和内存效率提升近一倍 。
+确保模型输出为实数，保证了计算的正确性 。
+        """
         self.encoder = nn.Dense(H, name="in_proj")
         self.s5_stack = StackedEncoderModel(
             ssm=ssm_init_fn,
