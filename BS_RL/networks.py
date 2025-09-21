@@ -18,7 +18,7 @@ def get_activation(name: str) -> Callable:
 
 class FeatExtractor(nn.Module):
     net_arch: List[int]
-    dropout_rate: float = 0.1
+    dropout_rate: float = 0
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool):
         x = SimbaMLP(net_arch=self.net_arch, dropout_rate=self.dropout_rate)(x, deterministic=deterministic)
