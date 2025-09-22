@@ -83,9 +83,9 @@ if __name__ == "__main__":
     env_id = "popgym-RepeatPreviousHard-v0" 
     # env_id="CartPole-v1") # 完全可观测环境能解决
     total_timesteps = int(1e6)
-    env_num = 16
-    eval_env_num = 16
-    eval_episodes = 16
+    env_num = 32
+    eval_env_num = 32
+    eval_episodes = 32
     rb_seg_len = 155 # 最长回合长度是155步
     batch_size = 8 #round(256 / rb_seg_len) *
     burn_in = 64 # 开始的64步无论做什么动作reward都是0，到第65步，agent必须准确地“说出”它在64步之前看到的那个数字
@@ -94,7 +94,7 @@ if __name__ == "__main__":
     is_test = False
     ckpt_save_frequency = 0
     eval_frequency = 0 if is_test else 0.1
-    updates_per_call = 16
+    updates_per_call = 32
     # 针对POPGym优化的网络配置
     # 观察空间: Box(0, 1, (1,), float32)
     # 动作空间: Discrete(3)

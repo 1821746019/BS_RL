@@ -19,14 +19,15 @@ if __name__ == "__main__":
     batch_size = 1
     updates_per_call = 32
     async_vector_env = False #True if env_num > 1 else False
-    eval_env_num = 48
+    eval_env_num = 32
     async_vector_env_eval = False #if eval_env_num > 1 else False
     exp_name = f"env_num({env_num})_window({window_size})_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
     eval_episodes = eval_env_num #每个环境评估一次
-    timeframe_m = 5
-    burn_in = DAY_MINUTES // timeframe_m
-    train_unroll_steps = DAY_MINUTES * 3  // timeframe_m 
-    rb_seg_len = DAY_MINUTES * 8 // timeframe_m
+    timeframe_m = 1
+    trading_timeframe_m = 60
+    burn_in = DAY_MINUTES // trading_timeframe_m
+    train_unroll_steps = DAY_MINUTES * 3  // trading_timeframe_m 
+    rb_seg_len = DAY_MINUTES * 8 // trading_timeframe_m
     is_test = total_timesteps == int(1e6)
     learning_starts = 1000 if is_test else 30000
     ckpt_save_frequency = 0.1 if is_test else 0.1
@@ -51,8 +52,8 @@ if __name__ == "__main__":
             capture_media=True,
         ),
         env=EnvConfig(
-            data_loader_cfg=DataLoaderConfig(timeframe_minutes=timeframe_m),
-            trading_env_config=TradingEnvConfig(cooldown_days=0, loss_aversion=1),
+            data_loader_cfg=DataLoaderConfig(timeframe_m=timeframe_m),
+            trading_env_config=TradingEnvConfig(cooldown_days=0, loss_aversion=1, test_episode_days=14),
             env_num=env_num,
         ),
         network=NetworkConfig(

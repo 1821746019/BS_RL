@@ -684,7 +684,7 @@ S5模型内部的状态演化由一个复杂的线性系统描述。为了更好
         x: [B, T, D]
         Returns:
           outputs: [B, T, H]
-          final_state: (h, c_dummy) with shapes [L,B,H]
+          final_state: (h) with shapes [L,B,H]
         """
         B, T, _ = x.shape
         H = self.hidden_dim
@@ -698,7 +698,7 @@ S5模型内部的状态演化由一个复杂的线性系统描述。为了更好
         if initial_state is None:
             h0_layers = [jnp.zeros((1, B, max(H // 2, 1)), dtype=jnp.complex64) for _ in range(L)]
         else:
-            h_init, _ = initial_state  # [L, B, H]
+            h_init = initial_state  # [L, B, H]
             h0_layers = [self._pack_hidden_real_to_complex(h_init[i]) for i in range(L)]
 
         # Resets: zeros [T, B]
@@ -712,7 +712,7 @@ S5模型内部的状态演化由一个复杂的线性系统描述。为了更好
         
         y_bTH = jnp.swapaxes(y_tbH, 0, 1)
         outputs = y_bTH
-        return outputs, (final_h_real, jnp.zeros_like(final_h_real))
+        return outputs, final_h_real
 
 import warnings, jax.numpy as jnp
 warnings.filterwarnings("ignore", category=jnp.ComplexWarning)

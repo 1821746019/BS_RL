@@ -65,7 +65,7 @@ class Evaluator:
             envs.append(env)
         return eval_vec_env_cls(envs)
 
-    def evaluate(self, actor_state_eval, summarizer_params_eval, rsnorm_state_eval, current_train_step: int):
+    def evaluate(self, actor_state_eval, encoder_params_eval, rsnorm_state_eval, current_train_step: int):
         num_episodes = self.eval_config.eval_episodes
         print(f"\nStarting evaluation for {num_episodes} episodes at step {current_train_step}...")
 
@@ -76,30 +76,28 @@ class Evaluator:
 
         obs, _ = eval_envs.reset(seed=self.seed + current_train_step)
         # init hidden states
+        N = eval_envs.num_envs
         if self.agent.network_config.use_s5_summarizer:
             L = self.agent.network_config.s5_num_layers
             H = self.agent.network_config.s5_hidden_dim
+            hidden_state = jnp.zeros((L, N, H), dtype=jnp.float32)
         else:
             L = self.agent.network_config.lstm_num_layers
             H = self.agent.network_config.lstm_hidden_dim
-        N = eval_envs.num_envs
-        hidden_h = jnp.zeros((L, N, H), dtype=jnp.float32)
-        hidden_c = jnp.zeros((L, N, H), dtype=jnp.float32)
+            hidden_state = (jnp.zeros((L, N, H), dtype=jnp.float32), jnp.zeros((L, N, H), dtype=jnp.float32))
 
         while len(stats_aggregator.buffer) < num_episodes:
-            actions_jax, new_h, new_c, key_eval_actions = self.agent.select_action_for_eval(
+            actions_jax, new_hidden_state, key_eval_actions = self.agent.select_action_for_eval(
                 actor_state_eval,
-                summarizer_params_eval,
+                encoder_params_eval,
                 rsnorm_state_eval,
                 jnp.asarray(obs),
-                hidden_h,
-                hidden_c,
+                hidden_state,
                 key_eval_actions,
                 deterministic=self.eval_config.greedy_actions,
             )
             actions_numpy = np.array(jax.device_get(actions_jax))
-            hidden_h = new_h
-            hidden_c = new_c
+            hidden_state = new_hidden_state
 
             next_obs, rewards, terminations, truncations, infos = eval_envs.step(actions_numpy)
             obs = next_obs

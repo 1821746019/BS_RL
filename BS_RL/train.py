@@ -24,7 +24,7 @@ import joblib
 from BS_RL.config import Args
 from BS_RL.common import profile, train_env_maker, MetricLogger, StatsAggregator, jax_profiler
 from BS_RL.networks import Actor, Critic
-from BS_RL.SACAgent import RSACAgent, TrainStateWithBatchStats, CriticTrainState, SummarizerTrainState, TrainState
+from BS_RL.SACAgent import RSACAgent, TrainStateWithBatchStats, CriticTrainState, EncoderTrainState, TrainState
 from BS_RL.eval import Evaluator
 from TradingEnv import DataLoader, DataLoaderConfig
 from BS_RL.replay_buffer import RecurrentReplayBuffer
@@ -51,7 +51,7 @@ class Trainer:
         self.actor_state: TrainStateWithBatchStats
         self.qf1_state: CriticTrainState
         self.qf2_state: CriticTrainState
-        self.summarizer_state: SummarizerTrainState
+        self.encoder_state: EncoderTrainState
         self.rsnorm_state: TrainStateWithBatchStats
         self.log_alpha_state: Optional[TrainState]
         self.current_alpha: jnp.ndarray
@@ -59,8 +59,7 @@ class Trainer:
         self.evaluator: Evaluator
         self.logger: MetricLogger
         self.is_discrete: bool
-        self.hidden_h: jnp.ndarray  # [L, N, H]
-        self.hidden_c: jnp.ndarray  # [L, N, H]
+        self.hidden_state: jnp.ndarray
 
     def setup(self):
         self._setup_paths_and_run_name()
@@ -204,35 +203,35 @@ class Trainer:
         self.actor_state = self.agent.actor_state
         self.qf1_state = self.agent.qf1_state
         self.qf2_state = self.agent.qf2_state
-        self.summarizer_state = self.agent.summarizer_state
+        self.encoder_state = self.agent.encoder_state
         self.rsnorm_state = self.agent.rsnorm_state
         self.log_alpha_state = self.agent.log_alpha_state if self.args.algo.autotune else None
         self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha']) if self.args.algo.autotune and self.log_alpha_state else jnp.array(self.args.algo.alpha)
 
         # initialize per-env hidden states
+        N = self.envs.num_envs
         if self.args.network.use_s5_summarizer:
             L = self.args.network.s5_num_layers
             H = self.args.network.s5_hidden_dim
+            self.hidden_state = jnp.zeros((L, N, H))
         else:
             L = self.args.network.lstm_num_layers
             H = self.args.network.lstm_hidden_dim
-        N = self.envs.num_envs
-        self.hidden_h = jnp.zeros((L, N, H))
-        self.hidden_c = jnp.zeros((L, N, H))
+            self.hidden_state = (jnp.zeros((L, N, H)), jnp.zeros((L, N, H)))
 
         # restore if checkpoint exists
         self._initialize_or_restore_agent_states()
 
         actor_p_count = count_params(self.actor_state.params) / 1e6
         critic_p_count = count_params(self.qf1_state.params) / 1e6
-        summarizer_p_count = count_params(self.summarizer_state.params) / 1e6
+        encoder_p_count = count_params(self.encoder_state.params) / 1e6
         print(f"Actor params: {actor_p_count:.2f}M")
         print(f"Critic params: {critic_p_count:.2f}M (x2 networks)")
-        print(f"Summarizer params: {summarizer_p_count:.2f}M")
+        print(f"Shared Encoder params: {encoder_p_count:.2f}M")
         if self.args.wandb.track:
             wandb.summary['actor_params_m'] = actor_p_count
             wandb.summary['critic_params_m'] = critic_p_count
-            wandb.summary['summarizer_params_m'] = summarizer_p_count
+            wandb.summary['encoder_params_m'] = encoder_p_count
 
     def _initialize_or_restore_agent_states(self):
         if self.restored_ckpt_path:
@@ -246,9 +245,9 @@ class Trainer:
                     'qf2_params': self.qf2_state.params,
                     'qf2_opt_state': self.qf2_state.opt_state,
                     'qf2_target_params': self.qf2_state.target_params,
-                    'summarizer_params': self.summarizer_state.params,
-                    'summarizer_opt_state': self.summarizer_state.opt_state,
-                    'summarizer_target_params': self.summarizer_state.target_params,
+                    'encoder_params': self.encoder_state.params,
+                    'encoder_opt_state': self.encoder_state.opt_state,
+                    'encoder_target_params': self.encoder_state.target_params,
                     'rsnorm_batch_stats': self.rsnorm_state.batch_stats,
                 }
                 if self.args.algo.autotune:
@@ -274,10 +273,10 @@ class Trainer:
                     opt_state=loaded_contents['qf2_opt_state'],
                     target_params=loaded_contents['qf2_target_params'],
                 )
-                self.summarizer_state = self.summarizer_state.replace(
-                    params=loaded_contents['summarizer_params'],
-                    opt_state=loaded_contents['summarizer_opt_state'],
-                    target_params=loaded_contents['summarizer_target_params']
+                self.encoder_state = self.encoder_state.replace(
+                    params=loaded_contents['encoder_params'],
+                    opt_state=loaded_contents['encoder_opt_state'],
+                    target_params=loaded_contents['encoder_target_params']
                 )
                 self.rsnorm_state = self.rsnorm_state.replace(batch_stats=loaded_contents['rsnorm_batch_stats'])
                 if self.log_alpha_state and 'log_alpha_params' in loaded_contents:
@@ -353,9 +352,9 @@ class Trainer:
                     updates_per_call = max(1, int(self.args.algo.updates_per_call))
                     batches = self.rb.sample_many(self.args.algo.batch_size, self.args.algo.burn_in + self.args.algo.train_unroll_steps, updates_per_call)
                     # Combined action selection and multi-update in single JIT call
-                    actions, new_h, new_c, new_actor_state, new_qf1_state, new_qf2_state, new_summarizer_state, new_rsnorm_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_then_select_action(
-                        obs, self.hidden_h, self.hidden_c, batches, do_update,
-                        self.actor_state, self.qf1_state, self.qf2_state, self.summarizer_state,
+                    actions, new_hidden_state, new_actor_state, new_qf1_state, new_qf2_state, new_encoder_state, new_rsnorm_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_then_select_action(
+                        obs, self.hidden_state, batches, do_update,
+                        self.actor_state, self.qf1_state, self.qf2_state, self.encoder_state,
                         self.rsnorm_state, self.log_alpha_state, self.jax_key, updates_per_call,
                         deterministic=False
                     )
@@ -363,12 +362,11 @@ class Trainer:
                     self.actor_state = new_actor_state
                     self.qf1_state = new_qf1_state
                     self.qf2_state = new_qf2_state
-                    self.summarizer_state = new_summarizer_state
+                    self.encoder_state = new_encoder_state
                     self.rsnorm_state = new_rsnorm_state
                     if self.args.algo.autotune:
                         self.log_alpha_state = new_log_alpha_state
-                    self.hidden_h = new_h
-                    self.hidden_c = new_c
+                    self.hidden_state = new_hidden_state
                     actions = np.array(jax.device_get(actions))
                 else:
                     # Random actions during warmup
@@ -393,16 +391,18 @@ class Trainer:
                 # Reset hidden states on done envs
                 done_mask = (terminations | truncations).astype(bool)
                 if done_mask.any():
-                    L, N, H = self.hidden_h.shape
-                    hh = np.array(self.hidden_h)
-                    hh[:, done_mask, :] = 0.0
-                    # 从将np.ndarray的数据转为jnp.ndarray涉及拷贝数据到default_backend上，是异步的，这里提前转比起调jit函数时让自动转, 性能更好
-                    self.hidden_h = jnp.asarray(hh)
-                    if self.hidden_c is not None:
-                        hc = np.array(self.hidden_c)
+                    if self.args.network.use_s5_summarizer:
+                        L, N, H = self.hidden_state.shape
+                        hs = np.array(self.hidden_state)
+                        hs[:, done_mask, :] = 0.0
+                        self.hidden_state = jnp.asarray(hs)
+                    else: # LSTM
+                        L, N, H = self.hidden_state[0].shape
+                        hh, hc = np.array(self.hidden_state[0]), np.array(self.hidden_state[1])
+                        hh[:, done_mask, :] = 0.0
                         hc[:, done_mask, :] = 0.0
-                        self.hidden_c = jnp.asarray(hc)
-                
+                        self.hidden_state = (jnp.asarray(hh), jnp.asarray(hc))
+
                 obs = next_obs
                 
                 # Logging
@@ -455,7 +455,7 @@ class Trainer:
         
         eval_metrics = self.evaluator.evaluate(
             actor_state_eval=self.actor_state,
-            summarizer_params_eval=self.summarizer_state.params,
+            encoder_params_eval=self.encoder_state.params,
             rsnorm_state_eval=self.rsnorm_state,
             current_train_step=current_step
         )
@@ -479,9 +479,9 @@ class Trainer:
                 'qf2_params': self.qf2_state.params,
                 'qf2_opt_state': self.qf2_state.opt_state,
                 'qf2_target_params': self.qf2_state.target_params,
-                'summarizer_params': self.summarizer_state.params,
-                'summarizer_opt_state': self.summarizer_state.opt_state,
-                'summarizer_target_params': self.summarizer_state.target_params,
+                'encoder_params': self.encoder_state.params,
+                'encoder_opt_state': self.encoder_state.opt_state,
+                'encoder_target_params': self.encoder_state.target_params,
                 'rsnorm_batch_stats': self.rsnorm_state.batch_stats,
             }
             if self.args.algo.autotune and self.log_alpha_state:

@@ -1,10 +1,68 @@
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-from typing import List, Callable, Sequence, Optional
+from typing import List, Callable, Sequence, Optional, Tuple
 from .config import NetworkConfig
 from .nn.ResNet1DEncoder import ResNet1DEncoder
 from .nn.Simba import SimbaMLPResidualBlock, RSNorm, SimbaMLP
+from .nn.ModernTCN import ModernTCNEncoder
+from .nn.s5 import S5Summarizer
+from .nn.lstm import LSTMSummarizer
+
+LOG_STD_MAX = 2
+LOG_STD_MIN = -20
+    
+class SharedEncoder(nn.Module):
+    """
+    一个统一的编码器模块，可以选择性地组合ModernTCNEncoder和循环摘要器(S5/LSTM)。
+    """
+    network_cfg: NetworkConfig
+
+    @nn.compact
+    def __call__(self, market_features: jnp.ndarray, hidden_state: Optional[Tuple[jnp.ndarray, jnp.ndarray]], training: bool):
+        # market_features shape: (B, L, M) where B=batch, L=seq_len, M=n_vars/market_feature_dim
+        
+        x = market_features
+        # 1. (可选) ModernTCN特征提取
+        # 注意: 需要在NetworkConfig中添加 use_modern_tcn_encoder: bool 和 tcn_* 相关超参数
+        if getattr(self.network_cfg, 'use_modern_tcn_encoder', False):
+            tcn_encoder = ModernTCNEncoder(
+                patch_size=self.network_cfg.tcn_patch_size,
+                patch_stride=self.network_cfg.tcn_patch_stride,
+                dims=self.network_cfg.tcn_dims,
+                num_blocks=self.network_cfg.tcn_num_blocks,
+                large_kernel_sizes=self.network_cfg.tcn_large_kernel_sizes,
+                small_kernel_sizes=self.network_cfg.tcn_small_kernel_sizes,
+                downsample_ratio=self.network_cfg.tcn_downsample_ratio,
+                ffn_ratio=self.network_cfg.tcn_ffn_ratio,
+                dropout_rate=self.network_cfg.tcn_dropout_rate,
+                norm_type=self.network_cfg.tcn_norm_type,
+                post_proc=self.network_cfg.tcn_post_proc,
+                name='tcn_encoder'
+            )
+            features = tcn_encoder(x, training=training)
+            # 将 (B, M, D, N) reshape为 (B, N, M*D) 以适应summarizer
+            B, M, D, N = features.shape
+            x = features.transpose((0, 3, 1, 2)).reshape(B, N, M * D)
+
+        # 2. 序列摘要
+        if self.network_cfg.use_s5_summarizer:
+            summarizer = S5Summarizer(
+                hidden_dim=self.network_cfg.s5_hidden_dim,
+                num_layers=self.network_cfg.s5_num_layers,
+                delta_min=self.network_cfg.s5_delta_min,
+                delta_max=self.network_cfg.s5_delta_max,
+            )
+        else:
+            summarizer = LSTMSummarizer(
+                hidden_dim=self.network_cfg.lstm_hidden_dim,
+                num_layers=self.network_cfg.lstm_num_layers
+            )
+        
+
+        outputs, new_hidden_state = summarizer(x, hidden_state) if hidden_state is not None else summarizer(x)
+            
+        return outputs, new_hidden_state
 
 def get_activation(name: str) -> Callable:
     if name == "relu":
@@ -24,9 +82,6 @@ class FeatExtractor(nn.Module):
         x = SimbaMLP(net_arch=self.net_arch, dropout_rate=self.dropout_rate)(x, deterministic=deterministic)
         return x
 
-LOG_STD_MAX = 2
-LOG_STD_MIN = -20
-    
 class Actor(nn.Module):
     network_config: NetworkConfig
     action_dim: int
