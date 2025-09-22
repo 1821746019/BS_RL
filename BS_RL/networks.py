@@ -17,16 +17,25 @@ class SharedEncoder(nn.Module):
     一个统一的编码器模块，可以选择性地组合ModernTCNEncoder和循环摘要器(S5/LSTM)。
     """
     network_cfg: NetworkConfig
-
-    @nn.compact
-    def __call__(self, market_features: jnp.ndarray, hidden_state: Optional[Tuple[jnp.ndarray, jnp.ndarray]], training: bool):
-        # market_features shape: (B, L, M) where B=batch, L=seq_len, M=n_vars/market_feature_dim
+    
+    def setup(self):
+        """在setup方法中创建子模块"""
+        if self.network_cfg.use_s5_summarizer:
+            self.summarizer = S5Summarizer(
+                hidden_dim=self.network_cfg.s5_hidden_dim,
+                num_layers=self.network_cfg.s5_num_layers,
+                delta_min=self.network_cfg.s5_delta_min,
+                delta_max=self.network_cfg.s5_delta_max,
+            )
+        else:
+            self.summarizer = LSTMSummarizer(
+                hidden_dim=self.network_cfg.lstm_hidden_dim,
+                num_layers=self.network_cfg.lstm_num_layers
+            )
         
-        x = market_features
-        # 1. (可选) ModernTCN特征提取
-        # 注意: 需要在NetworkConfig中添加 use_modern_tcn_encoder: bool 和 tcn_* 相关超参数
+        # 创建ModernTCN编码器（如果需要）
         if getattr(self.network_cfg, 'use_modern_tcn_encoder', False):
-            tcn_encoder = ModernTCNEncoder(
+            self.tcn_encoder = ModernTCNEncoder(
                 patch_size=self.network_cfg.tcn_patch_size,
                 patch_stride=self.network_cfg.tcn_patch_stride,
                 dims=self.network_cfg.tcn_dims,
@@ -40,27 +49,22 @@ class SharedEncoder(nn.Module):
                 post_proc=self.network_cfg.tcn_post_proc,
                 name='tcn_encoder'
             )
-            features = tcn_encoder(x, training=training)
+        else:
+            self.tcn_encoder = None
+
+    def __call__(self, market_features: jnp.ndarray, hidden_state: Optional[Tuple[jnp.ndarray, jnp.ndarray]], training: bool):
+        # market_features shape: (B, L, M) where B=batch, L=seq_len, M=n_vars/market_feature_dim
+        
+        x = market_features
+        # 1. (可选) ModernTCN特征提取
+        if self.tcn_encoder is not None:
+            features = self.tcn_encoder(x, training=training)
             # 将 (B, M, D, N) reshape为 (B, N, M*D) 以适应summarizer
             B, M, D, N = features.shape
             x = features.transpose((0, 3, 1, 2)).reshape(B, N, M * D)
 
         # 2. 序列摘要
-        if self.network_cfg.use_s5_summarizer:
-            summarizer = S5Summarizer(
-                hidden_dim=self.network_cfg.s5_hidden_dim,
-                num_layers=self.network_cfg.s5_num_layers,
-                delta_min=self.network_cfg.s5_delta_min,
-                delta_max=self.network_cfg.s5_delta_max,
-            )
-        else:
-            summarizer = LSTMSummarizer(
-                hidden_dim=self.network_cfg.lstm_hidden_dim,
-                num_layers=self.network_cfg.lstm_num_layers
-            )
-        
-
-        outputs, new_hidden_state = summarizer(x, hidden_state) if hidden_state is not None else summarizer(x)
+        outputs, new_hidden_state = self.summarizer(x, hidden_state)
             
         return outputs, new_hidden_state
 

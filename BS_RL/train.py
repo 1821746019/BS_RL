@@ -209,15 +209,7 @@ class Trainer:
         self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha']) if self.args.algo.autotune and self.log_alpha_state else jnp.array(self.args.algo.alpha)
 
         # initialize per-env hidden states
-        N = self.envs.num_envs
-        if self.args.network.use_s5_summarizer:
-            L = self.args.network.s5_num_layers
-            H = self.args.network.s5_hidden_dim
-            self.hidden_state = jnp.zeros((L, N, H))
-        else:
-            L = self.args.network.lstm_num_layers
-            H = self.args.network.lstm_hidden_dim
-            self.hidden_state = (jnp.zeros((L, N, H)), jnp.zeros((L, N, H)))
+        self.hidden_state = None
 
         # restore if checkpoint exists
         self._initialize_or_restore_agent_states()
@@ -390,18 +382,14 @@ class Trainer:
                 
                 # Reset hidden states on done envs
                 done_mask = (terminations | truncations).astype(bool)
-                if done_mask.any():
+                if self.hidden_state is not None and done_mask.any():
                     if self.args.network.use_s5_summarizer:
-                        L, N, H = self.hidden_state.shape
-                        hs = np.array(self.hidden_state)
-                        hs[:, done_mask, :] = 0.0
-                        self.hidden_state = jnp.asarray(hs)
+                        self.hidden_state = self.hidden_state.at[:, done_mask, :].set(0.0)
                     else: # LSTM
-                        L, N, H = self.hidden_state[0].shape
-                        hh, hc = np.array(self.hidden_state[0]), np.array(self.hidden_state[1])
-                        hh[:, done_mask, :] = 0.0
-                        hc[:, done_mask, :] = 0.0
-                        self.hidden_state = (jnp.asarray(hh), jnp.asarray(hc))
+                        h, c = self.hidden_state
+                        h = h.at[:, done_mask, :].set(0.0)
+                        c = c.at[:, done_mask, :].set(0.0)
+                        self.hidden_state = (h, c)
 
                 obs = next_obs
                 

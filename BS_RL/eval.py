@@ -76,15 +76,7 @@ class Evaluator:
 
         obs, _ = eval_envs.reset(seed=self.seed + current_train_step)
         # init hidden states
-        N = eval_envs.num_envs
-        if self.agent.network_config.use_s5_summarizer:
-            L = self.agent.network_config.s5_num_layers
-            H = self.agent.network_config.s5_hidden_dim
-            hidden_state = jnp.zeros((L, N, H), dtype=jnp.float32)
-        else:
-            L = self.agent.network_config.lstm_num_layers
-            H = self.agent.network_config.lstm_hidden_dim
-            hidden_state = (jnp.zeros((L, N, H), dtype=jnp.float32), jnp.zeros((L, N, H), dtype=jnp.float32))
+        hidden_state = None
 
         while len(stats_aggregator.buffer) < num_episodes:
             actions_jax, new_hidden_state, key_eval_actions = self.agent.select_action_for_eval(

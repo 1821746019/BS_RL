@@ -27,6 +27,12 @@ class LSTMSummarizer(nn.Module):
     hidden_dim: int
     num_layers: int = 1
 
+    def initialize_state(self, batch_size: int):
+        """Initializes the (h, c) carry state."""
+        h0 = jnp.zeros((self.num_layers, batch_size, self.hidden_dim), dtype=jnp.float32)
+        c0 = jnp.zeros((self.num_layers, batch_size, self.hidden_dim), dtype=jnp.float32)
+        return (h0, c0)
+
     @nn.compact
     def __call__(self, x: jnp.ndarray, initial_state: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None):
         """
@@ -40,15 +46,9 @@ class LSTMSummarizer(nn.Module):
         L = self.num_layers
         x_proj = nn.Dense(H, name="in_proj")(x)  # [B,T,H]
 
-        def init_state(bs):
-            h0 = jnp.zeros((L, bs, H))
-            c0 = jnp.zeros((L, bs, H))
-            return (h0, c0)
-
         if initial_state is None:
-            h, c = init_state(B)
-        else:
-            h, c = initial_state
+            initial_state = self.initialize_state(B)
+        h, c = initial_state
 
         # Create a scanned module over time
         Scanned = nn.scan(

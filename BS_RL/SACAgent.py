@@ -94,16 +94,8 @@ class RSACAgent:
             encoder_output_dim = self.network_config.lstm_hidden_dim
         
         dummy_market_seq = jnp.zeros((1, 1, self.market_feature_dim))
-
-        # Hidden state initialization
-        if self.network_config.use_s5_summarizer:
-            L, H = self.network_config.s5_num_layers, self.network_config.s5_hidden_dim
-            dummy_hidden = jnp.zeros((L, 1, H)) # (L, B, H)
-        else: # LSTM
-            L, H = self.network_config.lstm_num_layers, self.network_config.lstm_hidden_dim
-            dummy_hidden = (jnp.zeros((L, 1, H)), jnp.zeros((L, 1, H))) # (h, c) with shape (L, B, H)
-            
-        encoder_params, _ = self._init_model_with_batch_stats(self.shared_encoder, key_encoder, dummy_market_seq, dummy_hidden, training=False)
+        
+        encoder_params, _ = self._init_model_with_batch_stats(self.shared_encoder, key_encoder, dummy_market_seq, hidden_state=None, training=False)
         
         if self.network_config.use_pretrained_summarizer_path:
             try:

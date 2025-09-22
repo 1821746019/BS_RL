@@ -616,6 +616,10 @@ class S5Summarizer(nn.Module):
     delta_min: float = 0.001
     delta_max: float = 0.1
 
+    def initialize_state(self, batch_size: int):
+        """Initializes the real-valued carry state."""
+        return jnp.zeros((self.num_layers, batch_size, self.hidden_dim), dtype=jnp.float32)
+        
     def setup(self):
         H = self.hidden_dim
         if H % 2 != 0:
@@ -679,7 +683,7 @@ S5模型内部的状态演化由一个复杂的线性系统描述。为了更好
         return jnp.concatenate([real, imag], axis=-1)
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, initial_state: Optional[tuple[jnp.ndarray, jnp.ndarray]] = None):
+    def __call__(self, x: jnp.ndarray, initial_state: Optional[jnp.ndarray] = None):
         """
         x: [B, T, D]
         Returns:
@@ -696,10 +700,10 @@ S5模型内部的状态演化由一个复杂的线性系统描述。为了更好
 
         # Prepare initial hidden states per S5 layer as complex [1,B,P]
         if initial_state is None:
-            h0_layers = [jnp.zeros((1, B, max(H // 2, 1)), dtype=jnp.complex64) for _ in range(L)]
-        else:
-            h_init = initial_state  # [L, B, H]
-            h0_layers = [self._pack_hidden_real_to_complex(h_init[i]) for i in range(L)]
+            initial_state = self.initialize_state(B)
+        
+        h_init = initial_state  # [L, B, H]
+        h0_layers = [self._pack_hidden_real_to_complex(h_init[i]) for i in range(L)]
 
         # Resets: zeros [T, B]
         d_tb = jnp.zeros((T, B), dtype=jnp.float32)
