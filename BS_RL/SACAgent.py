@@ -7,8 +7,9 @@ from flax.training import checkpoints
 import optax
 from functools import partial
 from .common import jax_jit
-from typing import Union, Optional, Tuple
+from typing import Union, Optional, Tuple, Callable
 import tensorflow_probability.substrates.jax.distributions as tfd
+import numpy as np
 from .common import profile
 from .config import AlgoConfig, NetworkConfig
 from .networks import Actor, Critic, SharedEncoder
@@ -29,11 +30,12 @@ CarryType = tuple[TrainState, CriticTrainState, CriticTrainState, EncoderTrainSt
 class RSACAgent:
     def __init__(self,
                  action_dim: int,
-                 obs_dim: int,
                  key: jax.Array,
                  network_config: NetworkConfig,
                  algo_config: AlgoConfig,
                  is_discrete: bool,
+                 obs_split_fn: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]],
+                 dummy_obs: np.ndarray,
                  norm_limit: float = MAX_NORM):
         self.actor_model: nn.Module
         self.critic_model: nn.Module
@@ -42,6 +44,7 @@ class RSACAgent:
         self.network_config = network_config
         self.norm_limit = norm_limit
         self.is_discrete = is_discrete
+        self.obs_split_fn = obs_split_fn
         key_actor, key_qf1, key_qf2, key_encoder, key_rsnorm, key_log_alpha = jax.random.split(key, 6)
 
         optimizer = optax.chain(
@@ -56,14 +59,7 @@ class RSACAgent:
             optax.sgd(learning_rate=self.algo_config.summarizer_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.summarizer_lr, eps=self.algo_config.adam_eps),
         )
 
-        self.obs_dim = obs_dim
-        self.market_feature_dim = self.network_config.market_feature_dim if self.network_config.market_feature_dim > 0 else self.obs_dim - self.network_config.agent_feature_dim
-        self.agent_feature_dim = self.network_config.agent_feature_dim
-        if self.market_feature_dim + self.agent_feature_dim != self.obs_dim:
-            self.market_feature_dim = self.obs_dim
-            self.agent_feature_dim = 0
-
-        self._create_models_and_states(key_actor, key_qf1, key_qf2, key_encoder, key_rsnorm)
+        self._create_models_and_states(key_actor, key_qf1, key_qf2, key_encoder, key_rsnorm, dummy_obs)
 
         self.log_alpha_state: TrainState
         if algo_config.autotune:
@@ -84,7 +80,7 @@ class RSACAgent:
         batch_stats = variables.get('batch_stats')
         return params, batch_stats
 
-    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_encoder, key_rsnorm):
+    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_encoder, key_rsnorm, dummy_obs: np.ndarray):
         # Shared encoder and target encoder
         self.shared_encoder = SharedEncoder(network_cfg=self.network_config)
 
@@ -93,9 +89,10 @@ class RSACAgent:
         else:
             encoder_output_dim = self.network_config.lstm_hidden_dim
         
-        dummy_market_seq = jnp.zeros((1, 1, self.market_feature_dim))
+        dummy_obs_batched = jax.tree_map(lambda x: x[None, None, ...], dummy_obs)
+        dummy_cnn, dummy_mem, dummy_instant = self.obs_split_fn(dummy_obs_batched)
         
-        encoder_params, _ = self._init_model_with_batch_stats(self.shared_encoder, key_encoder, dummy_market_seq, hidden_state=None, training=False)
+        encoder_params, _ = self._init_model_with_batch_stats(self.shared_encoder, key_encoder, dummy_mem, dummy_cnn, hidden_state=None, training=False)
         
         if self.network_config.use_pretrained_summarizer_path:
             try:
@@ -114,12 +111,12 @@ class RSACAgent:
 
         # Actor head
         self.actor_model = Actor(network_config=self.network_config, action_dim=self.action_dim, is_discrete=self.is_discrete)
-        actor_params, _ = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, encoder_output_dim + self.agent_feature_dim)), deterministic=True)
+        actor_params, _ = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, encoder_output_dim + dummy_instant.shape[-1])), deterministic=True)
         self.actor_state = TrainState.create(apply_fn=self.actor_model.apply, params=actor_params, tx=self.actor_optimizer)
 
         # Critic heads (two critics)
         self.critic_model = Critic(network_config=self.network_config, action_dim=self.action_dim, is_discrete=self.is_discrete)
-        dummy_critic_input = jnp.zeros((1, encoder_output_dim + self.agent_feature_dim))
+        dummy_critic_input = jnp.zeros((1, encoder_output_dim + dummy_instant.shape[-1]))
         
         if self.is_discrete:
             qf1_params, _ = self._init_model_with_batch_stats(self.critic_model, key_qf1, dummy_critic_input, deterministic=True)
@@ -136,8 +133,7 @@ class RSACAgent:
 
         # RSNorm for observations
         self.rsnorm_model = RSNorm()
-        dummy_obs = jnp.zeros((1, self.obs_dim))
-        rsnorm_params, rsnorm_batch_stats = self._init_model_with_batch_stats(self.rsnorm_model, key_rsnorm, dummy_obs, update_stats=False)
+        rsnorm_params, rsnorm_batch_stats = self._init_model_with_batch_stats(self.rsnorm_model, key_rsnorm, dummy_obs[None,...], update_stats=False)
         self.rsnorm_state = TrainStateWithBatchStats.create(
             apply_fn=self.rsnorm_model.apply,
             params=rsnorm_params,
@@ -176,19 +172,23 @@ class RSACAgent:
     def select_action(self, actor_state: TrainState, encoder_params: flax.core.FrozenDict,
                       obs: jnp.ndarray, hidden_state: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
                       key: jax.Array, deterministic: bool = False):
-        if obs.ndim == 1 and self.obs_dim == 1:
-            obs = obs[:, None] # obs为标量时应视作长度为1的1D数组，Reshape from (N,) to (N, 1) if obs is a squeezed 1D array for envs with obs_dim=1
-        market = obs[..., :self.market_feature_dim]
-        agent_feat = obs[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros((obs.shape[0], 0))
-        seq = market[:, None, :]
+        # 若obs的shape为(B,)，需增加一个轴。也就是把标量视为1d数组
+        if len(obs.shape) == 1: obs = obs[:, None]
+        obs_cnn, obs_mem, obs_instant = self.obs_split_fn(obs)
+
+        # Add sequence dimension for summarizer
+        obs_cnn = obs_cnn[:, None, :] if obs_cnn.shape[-1] > 0 else None
+        obs_mem = obs_mem[:, None, :] if obs_mem.shape[-1] > 0 else None
+        
         outputs, new_hidden_state = self.shared_encoder.apply(
             {'params': encoder_params},
-            seq,
+            obs_mem,
+            obs_cnn,
             hidden_state,
             training=jnp.logical_not(deterministic)
         )
         summary_t = outputs[:, -1, :]
-        x = jnp.concatenate([summary_t, agent_feat], axis=-1)
+        x = jnp.concatenate([summary_t, obs_instant], axis=-1)
         det_flag = jnp.asarray(deterministic)
 
         if self.is_discrete:
@@ -232,11 +232,6 @@ class RSACAgent:
         )
         return actions, new_hidden_state, new_key
 
-    def _split_obs(self, o_seq: jnp.ndarray):
-        market = o_seq[..., :self.market_feature_dim]
-        agent_feat = o_seq[..., self.market_feature_dim: self.market_feature_dim + self.agent_feature_dim] if self.agent_feature_dim > 0 else jnp.zeros(o_seq.shape[:-1] + (0,))
-        return market, agent_feat
-
     def _create_calc_loss_mask(self, is_real: jnp.ndarray):
         B, T = is_real.shape
         burn_in_steps = int(self.algo_config.burn_in)
@@ -248,12 +243,12 @@ class RSACAgent:
         # 真实数据且不在burn-in阶段时计算损失
         calc_loss = jnp.logical_and(is_real.astype(bool), jnp.logical_not(burn_in_mask))
         return calc_loss.astype(jnp.float32)
-    def _update_critic(self, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, encoder_state: EncoderTrainState, curr_alpha: Array, market_o: Array, agent_o: Array, a: Array, r: Array, term: Array, loss_calc_m: Array, key: Array):
+    def _update_critic(self, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, encoder_state: EncoderTrainState, curr_alpha: Array, obs_cnn: Array, obs_mem: Array, obs_instant: Array, a: Array, r: Array, term: Array, loss_calc_m: Array, key: Array):
         B, T = loss_calc_m.shape[0], loss_calc_m.shape[1]
          # Pre-calculate summaries for the target network, which should be detached from grad calculations
-        s_tp1_targ, _ = self.shared_encoder.apply({'params': encoder_state.target_params}, market_o, hidden_state=None, training=False)
+        s_tp1_targ, _ = self.shared_encoder.apply({'params': encoder_state.target_params}, obs_mem, obs_cnn, hidden_state=None, training=False)
         s_tp1 = s_tp1_targ[:, 1:, :]
-        x_tp1 = jnp.concatenate([s_tp1, agent_o[:, 1:, :]], axis=-1)
+        x_tp1 = jnp.concatenate([s_tp1, obs_instant[:, 1:, :]], axis=-1)
         def maybe_freeze_encoder(params):
             if self.train_encoder:
                 return params
@@ -262,9 +257,9 @@ class RSACAgent:
         if self.is_discrete:
             def critic_loss_fn(q1_params, q2_params, encoder_params):
                 encoder_params = maybe_freeze_encoder(encoder_params)
-                summaries, _ = self.shared_encoder.apply({'params': encoder_params}, market_o, hidden_state=None, training=True)
+                summaries, _ = self.shared_encoder.apply({'params': encoder_params}, obs_mem, obs_cnn, hidden_state=None, training=True)
                 s_t = summaries[:, :-1, :]
-                x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
+                x_t = jnp.concatenate([s_t, obs_instant[:, :-1, :]], axis=-1)
                 
                 next_logits = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
                 next_logits = next_logits.reshape(B, T, -1)
@@ -296,9 +291,9 @@ class RSACAgent:
         else: # continuous
             def critic_loss_fn(q1_params, q2_params, encoder_params):
                 encoder_params = maybe_freeze_encoder(encoder_params)
-                summaries, _ = self.shared_encoder.apply({'params': encoder_params}, market_o, hidden_state=None, training=True)
+                summaries, _ = self.shared_encoder.apply({'params': encoder_params}, obs_mem, obs_cnn, hidden_state=None, training=True)
                 s_t = summaries[:, 0:-1, :]
-                x_t = jnp.concatenate([s_t, agent_o[:, :-1, :]], axis=-1)
+                x_t = jnp.concatenate([s_t, obs_instant[:, :-1, :]], axis=-1)
 
                 mean_tp1, log_std_tp1 = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
                 mean_tp1 = mean_tp1.reshape(B, T, -1)
@@ -432,14 +427,14 @@ class RSACAgent:
         loss_calc_m = self._create_calc_loss_mask(is_real)
         
         _, o_normalized = self._norm_obs(rsnorm_state, o, update_stats=False)
-        market_o, agent_o = self._split_obs(o_normalized)
+        obs_cnn, obs_mem, obs_instant = self.obs_split_fn(o_normalized)
 
         if self.algo_config.autotune:
             curr_alpha = jnp.exp(log_alpha_state.params['log_alpha'])
         else:
             curr_alpha = self.curr_alpha
 
-        qf1_state_new, qf2_state_new, encoder_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t) = self._update_critic(actor_state, qf1_state, qf2_state, encoder_state, curr_alpha, market_o, agent_o, a, r, term, loss_calc_m, key)
+        qf1_state_new, qf2_state_new, encoder_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t) = self._update_critic(actor_state, qf1_state, qf2_state, encoder_state, curr_alpha, obs_cnn, obs_mem, obs_instant, a, r, term, loss_calc_m, key)
         # 首次update不更新actor和alpha
         update_actor_and_alpha = qf1_state.step != 0
         def no_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key):
@@ -449,8 +444,8 @@ class RSACAgent:
             if defer_update: # 流程C0->C1A0->C2A1 critic评估的是上上步的actor。共用x_t减少了一次summarizer的前向传播，能带来10%的SPS提升(500->550)
                 return jax.lax.cond(update_actor_and_alpha, self._update_actor_and_alpha, no_update_aa, actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
             else: # 标准流程C0A0->C1A1 critic评估的是上一步的(最新的)actor
-                summaries, _ = self.shared_encoder.apply({'params': encoder_state_new.params}, market_o, hidden_state=None, training=True)
-                x_t_new = jnp.concatenate([summaries[:, :-1, :], agent_o[:, :-1, :]], axis=-1)
+                summaries, _ = self.shared_encoder.apply({'params': encoder_state_new.params}, obs_mem, obs_cnn, hidden_state=None, training=True)
+                x_t_new = jnp.concatenate([summaries[:, :-1, :], obs_instant[:, :-1, :]], axis=-1)
                 return self._update_actor_and_alpha(actor_state, qf1_state_new, qf2_state_new, log_alpha_state, curr_alpha, x_t_new, loss_calc_m, key)
         actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val) = maybe_defer_to_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
         

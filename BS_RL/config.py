@@ -11,12 +11,24 @@ import jax
 ENABLE_PROFILE = __name__.split(".")[0] in os.getenv("PROFILE_PACKAGES", "").split(",") # 如果PROFILE_PACKAGES中包含当前包名，则进行profile
 USE_JAX_PROFILER = os.getenv("USE_JAX_PROFILER", "false").lower() == "true"
 
+def default_obs_split_fn(obs: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """默认的观测值切分函数。
+
+    返回:
+        obs_cnn_mem: (..., 0)
+        obs_mem: obs
+        obs_instant: (..., 0)
+    """
+    empty_shape = obs.shape[:-1] + (0,)
+    return np.zeros(empty_shape, dtype=obs.dtype), obs, np.zeros(empty_shape, dtype=obs.dtype)
+
 @dataclass
 class EnvConfig:
     trading_env_config: TradingEnvConfig = field(default_factory=TradingEnvConfig)
     data_loader_cfg: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     tickers_per_env: int = 1
     feat_getter: Callable = field(default_factory=lambda: norm_OHLCV.features_getter) 
+    obs_split_fn: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]] = field(default_factory=lambda: default_obs_split_fn)
     env_num: int = 1 # sac_atari.py uses 1 env
     """the number of parallel game environments"""
 
@@ -142,10 +154,6 @@ class NetworkConfig:
     activation:str = "gelu"
 
     # RSAC-share specific
-    market_feature_dim: int = 0
-    """Dimension of market features fed into the LSTM summarizer (set 0 to use all)."""
-    agent_feature_dim: int = 0
-    """Dimension of agent-specific features concatenated after summarizer (remaining dims if market_feature_dim>0)."""
     use_pretrained_summarizer_path: Optional[str] = None
     """Path to a pretrained summarizer params (Flax serialization). If None, train from scratch."""
     train_summarizer: bool = False

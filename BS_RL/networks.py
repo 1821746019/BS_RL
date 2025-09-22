@@ -52,16 +52,28 @@ class SharedEncoder(nn.Module):
         else:
             self.tcn_encoder = None
 
-    def __call__(self, market_features: jnp.ndarray, hidden_state: Optional[Tuple[jnp.ndarray, jnp.ndarray]], training: bool):
-        # market_features shape: (B, L, M) where B=batch, L=seq_len, M=n_vars/market_feature_dim
+    def __call__(self, obs_mem: Optional[jnp.ndarray], obs_cnn_mem: Optional[jnp.ndarray], hidden_state: Optional[Tuple[jnp.ndarray, jnp.ndarray]], training: bool):
+        # obs_mem shape: (B, L, M_mem)
+        # obs_cnn_mem shape: (B, L, M_cnn)
         
-        x = market_features
+        cnn_features = None
         # 1. (可选) ModernTCN特征提取
         if self.tcn_encoder is not None:
-            features = self.tcn_encoder(x, training=training)
+            if obs_cnn_mem is None:
+                raise ValueError("obs_cnn_mem must be provided when using tcn_encoder")
+            features = self.tcn_encoder(obs_cnn_mem, training=training)
             # 将 (B, M, D, N) reshape为 (B, N, M*D) 以适应summarizer
             B, M, D, N = features.shape
-            x = features.transpose((0, 3, 1, 2)).reshape(B, N, M * D)
+            cnn_features = features.transpose((0, 3, 1, 2)).reshape(B, N, M * D)
+
+        if obs_mem is not None and cnn_features is not None:
+            x = jnp.concatenate([obs_mem, cnn_features], axis=-1)
+        elif obs_mem is not None:
+            x = obs_mem
+        elif cnn_features is not None:
+            x = cnn_features
+        else:
+            raise ValueError("At least one of obs_mem or obs_cnn_mem (with tcn_encoder) must be provided.")
 
         # 2. 序列摘要
         outputs, new_hidden_state = self.summarizer(x, hidden_state)

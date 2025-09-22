@@ -32,8 +32,10 @@ class GymTrainer(Trainer):
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
         action_type = "离散" if self.is_discrete else "连续"
         print(f"检测到{action_type}动作空间")
-        obs_shape = self.envs.single_observation_space.shape
-        self.obs_dim = 1 if len(obs_shape) == 0 else obs_shape[-1]
+        self.obs_shape = self.envs.single_observation_space.shape
+        if self.obs_shape == ():
+            self.obs_shape = (1,) # 标量视为1d数组
+        
     
     def _setup_evaluator(self):
         if self.args.eval.eval_episodes <= 0:
@@ -128,8 +130,6 @@ if __name__ == "__main__":
             actor_dropout_rate=0.0,
             critic_dropout_rate=0.0,
             # RSAC-share
-            market_feature_dim=1,  # POPGym obs dim
-            agent_feature_dim=0,
             use_pretrained_summarizer_path=None,
             use_s5_summarizer=True,
             train_summarizer=True,

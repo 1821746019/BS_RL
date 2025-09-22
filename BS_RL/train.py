@@ -34,7 +34,6 @@ from typing import Optional
 
 def count_params(params):
     return sum(x.size for x in jax.tree_util.tree_leaves(params))
-
 class Trainer:
     def __init__(self, args: Args):
         self.args = args
@@ -179,11 +178,11 @@ class Trainer:
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
         if not self.is_discrete:
             print("Continuous action space detected.")
-        obs_shape = self.envs.single_observation_space.shape
-        # 有些环境的观测可能是多维的。比如，一个自定义环境的观测可能是 (10, 2)，代表 10 个时间步，每个时间步有 2 个特征。在这种情况下，如果智能体的循环网络（RNN/LSTM）一次只处理一个时间步的数据，那么它关心的特征维度就是 2。shape[-1] 恰好能取出这个最后的维度 2
-        # 约定:观测数据是向量形式的，并且最后一个维度代表了特征数。
-        self.obs_dim = 1 if len(obs_shape) == 0 else obs_shape[-1]
-
+        self.obs_shape = self.envs.single_observation_space.shape
+        print(f"原始观察空间形状: {self.envs.single_observation_space.shape}")
+        if self.obs_shape == ():
+            self.obs_shape = (1,) # 标量视为1d数组
+    
     def _setup_agent(self):
         if self.is_discrete:
             action_dim = self.envs.single_action_space.n # type: ignore
@@ -191,14 +190,16 @@ class Trainer:
         else:
             action_dim = self.envs.single_action_space.shape[0] # type: ignore
 
+        dummy_obs = np.zeros(self.obs_shape, dtype=self.envs.single_observation_space.dtype)
         key_agent, self.jax_key = jax.random.split(self.jax_key)
         self.agent = RSACAgent(
             action_dim=action_dim,
-            obs_dim=self.obs_dim,
             key=key_agent,
             network_config=self.args.network,
             algo_config=self.args.algo,
-            is_discrete=self.is_discrete
+            is_discrete=self.is_discrete,
+            obs_split_fn=self.args.env.obs_split_fn,
+            dummy_obs=dummy_obs
         )
         self.actor_state = self.agent.actor_state
         self.qf1_state = self.agent.qf1_state
@@ -291,7 +292,7 @@ class Trainer:
         # Assuming average episode length, convert buffer_size (in steps) to segments
         capacity_segments = max(self.args.algo.buffer_size // self.args.algo.rb_seg_len, 1)
         self.rb = RecurrentReplayBuffer(
-            obs_dim=self.obs_dim,
+            obs_shape=self.obs_shape,
             action_shape=action_shape,
             is_discrete_action=self.is_discrete,
             capacity_segments=capacity_segments,
@@ -337,7 +338,6 @@ class Trainer:
                 # Determine if we should update and use actor
                 do_update = (current_step > self.args.algo.learning_starts and 
                            self.rb.can_sample_many(self.args.algo.batch_size, self.args.algo.burn_in + self.args.algo.train_unroll_steps, self.args.algo.updates_per_call) and current_step % self.args.algo.update_frequency == 0)
-                
                 if do_update:
                     update_cnt += 1
                     # Prepare multiple batches for multiple updates per JIT call
@@ -367,7 +367,6 @@ class Trainer:
                 
                 # Environment step
                 next_obs, rewards, terminations, truncations, infos = self.envs.step(actions)
-                
                 # Handle final observations
                 real_next_obs = next_obs.copy()
                 for idx, trunc in enumerate(truncations):

@@ -3,14 +3,14 @@ from typing import Optional, Dict, Any
 
 class RecurrentReplayBuffer:
     def __init__(self,
-                 obs_dim: int,
+                 obs_shape: tuple,
                  action_shape: tuple,
                  is_discrete_action: bool,
                  capacity_segments: int,
                  num_envs: int,
                  seg_len: int,
                  min_gap: int = 60):
-        self.obs_dim = obs_dim
+        self.obs_shape = obs_shape
         self.action_shape = action_shape
         self.is_discrete_action = is_discrete_action
         self.capacity_segments = capacity_segments
@@ -19,7 +19,7 @@ class RecurrentReplayBuffer:
         self.min_gap = min_gap
         # Storage for segments as multi-dimensional arrays for vectorized operations
         T = self.seg_len
-        self.segments_o = np.zeros((capacity_segments, T + 1, obs_dim), dtype=np.float32)
+        self.segments_o = np.zeros((capacity_segments, T + 1) + self.obs_shape, dtype=np.float32)
         self.segments_a = np.zeros((capacity_segments, T) + action_shape, dtype=np.int32 if is_discrete_action else np.float32)
         self.segments_r = np.zeros((capacity_segments, T), dtype=np.float32)
         self.segments_term = np.zeros((capacity_segments, T), dtype=np.float32)
@@ -35,7 +35,7 @@ class RecurrentReplayBuffer:
     def _reset_working_buffers(self):
         # Working buffers for accumulating num_bptt steps before storing as segment
         T = self.seg_len
-        self.work_o = [np.zeros((T + 1, self.obs_dim), dtype=np.float32) for _ in range(self.num_envs)]
+        self.work_o = [np.zeros((T + 1,) + self.obs_shape, dtype=np.float32) for _ in range(self.num_envs)]
         self.work_a = [np.zeros((T,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32) for _ in range(self.num_envs)]
         self.work_r = [np.zeros((T,), dtype=np.float32) for _ in range(self.num_envs)]
         self.work_term = [np.zeros((T,), dtype=np.float32) for _ in range(self.num_envs)]
@@ -94,7 +94,7 @@ class RecurrentReplayBuffer:
         # Create segment with proper padding/masking
         length = t
         T = self.seg_len
-        o = np.zeros((T + 1, self.obs_dim), dtype=np.float32)
+        o = np.zeros((T + 1,) + self.obs_shape, dtype=np.float32)
         a = np.zeros((T,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32)
         r = np.zeros((T,), dtype=np.float32)
         term = np.zeros((T,), dtype=np.float32)
@@ -207,5 +207,5 @@ class RecurrentReplayBuffer:
         for i in range(self.num_envs):
             if self.work_started[i]:
                 # Force finalize with dummy next obs and episode_ended=True
-                dummy_next_obs = np.zeros(self.obs_dim, dtype=np.float32)
+                dummy_next_obs = np.zeros(self.obs_shape, dtype=np.float32)
                 self._finalize_env_segment(i, dummy_next_obs, episode_ended=True) 
