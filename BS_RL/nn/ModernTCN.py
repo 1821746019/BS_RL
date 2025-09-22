@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from jax import lax
 from flax import linen as nn
 from typing import Sequence, Optional, Literal
 
@@ -248,7 +249,6 @@ class ModernTCNEncoder(nn.Module):
     ModernTCN 编码器，用于从时间序列中提取丰富的特征表示。
     输出形状为 (B, M, D, N)。
     """
-    n_vars: int
     patch_size: int
     patch_stride: int
     dims: Sequence[int]
@@ -256,12 +256,13 @@ class ModernTCNEncoder(nn.Module):
     large_kernel_sizes: Sequence[int]
     small_kernel_sizes: Sequence[int]
     downsample_ratio: int
+    n_vars: int = -1 # 在flax，shape能自动推断而无需该字段
     ffn_ratio: int = 2
     dropout_rate: float = 0.1
     revin: bool = False
     norm_type: Literal['batch', 'layer'] = 'layer'
     dtype: Dtype = jnp.float32
-
+    post_proc: Literal['none', 'max_pool', 'avg_pool', 'global_max_pool', 'global_avg_pool'] = 'global_avg_pool'
     @nn.compact
     def __call__(self, x: Array, training: bool = True) -> Array:
         """
@@ -317,7 +318,7 @@ class ModernTCNEncoder(nn.Module):
                 N, _ = x_emb.shape[1], x_emb.shape[2]
                 if N % self.downsample_ratio != 0:
                     pad_len = self.downsample_ratio - (N % self.downsample_ratio)
-                    # 对齐官方实现：在时间维末尾用边界复制进行补齐（而非常数0填充）
+                    # 若要对齐官方实现，需constant->edge：在时间维末尾用边界复制进行补齐（而非常数0填充）
                     x_emb = jnp.pad(x_emb, ((0, 0), (0, pad_len), (0, 0)), mode='edge')
 
                 x_emb = nn.LayerNorm(
@@ -351,6 +352,54 @@ class ModernTCNEncoder(nn.Module):
             # For next iteration, reshape and transpose back
             # (B, M, D_i, N_i) -> (B, M, N_i, D_i) -> (B*M, N_i, D_i)
             x_emb = z.transpose((0, 1, 3, 2)).reshape(B*M, N_i, D_i)
+        # z: (B, M, D_final, N_final)
+        _, _, D_final, N_final = z.shape
+        
+        # Post-processing: 对时间维度进行后处理以减少特征图的时间复杂度
+        if self.post_proc == 'max_pool':
+            # 在时间维度上进行最大池化 (窗口大小为2)
+            # 使用 reduce_window 进行更精确的控制
+            z = lax.reduce_window(
+                z, 
+                -jnp.inf, 
+                lax.max,
+                window_dimensions=(1, 1, 1, 2),
+                window_strides=(1, 1, 1, 2),
+                padding='VALID'
+            )
+        elif self.post_proc == 'avg_pool':
+            # 在时间维度上进行平均池化 (窗口大小为2)
+            pool_sum = lax.reduce_window(
+                z,
+                0.,
+                lax.add,
+                window_dimensions=(1, 1, 1, 2),
+                window_strides=(1, 1, 1, 2),
+                padding='VALID'
+            )
+            z = pool_sum / 2.0  # 除以窗口大小得到平均值
+        elif self.post_proc == 'global_max_pool':
+            # 全局最大池化：将时间维度完全压缩为1
+            z = lax.reduce_window(
+                z,
+                -jnp.inf,
+                lax.max,
+                window_dimensions=(1, 1, 1, N_final),
+                window_strides=(1, 1, 1, 1),
+                padding='VALID'
+            )
+        elif self.post_proc == 'global_avg_pool':
+            # 全局平均池化：将时间维度完全压缩为1
+            pool_sum = lax.reduce_window(
+                z,
+                0.,
+                lax.add,
+                window_dimensions=(1, 1, 1, N_final),
+                window_strides=(1, 1, 1, 1),
+                padding='VALID'
+            )
+            z = pool_sum / N_final  # 除以窗口大小得到平均值
+        # elif self.post_proc == 'none': 不做任何处理
         
         return z # Return the final feature map
 
@@ -372,6 +421,7 @@ class ModernTCN(nn.Module):
     dropout_rate: float = 0.1
     revin: bool = False
     norm_type: Literal['batch', 'layer'] = 'layer'
+    post_proc: Literal['none', 'max_pool', 'avg_pool', 'global_max_pool', 'global_avg_pool'] = 'none'
     
     # Head Hyperparameters
     target_window: int = 96
@@ -396,6 +446,7 @@ class ModernTCN(nn.Module):
             dropout_rate=self.dropout_rate,
             revin=self.revin,
             norm_type=self.norm_type,
+            post_proc=self.post_proc,
             dtype=self.dtype,
             name='encoder'
         )
@@ -416,77 +467,3 @@ class ModernTCN(nn.Module):
         )
         
         return head(features, training=training)
-
-# --- 使用示例 ---
-if __name__ == '__main__':
-    key = jax.random.PRNGKey(0)
-    
-    # 模拟 K 线数据 (Batch, SeqLen, Vars)
-    batch_size = 16
-    seq_len = 512
-    n_vars = 7
-    
-    mock_kline_data = jnp.ones((batch_size, seq_len, n_vars))
-    
-    # --- 1. 使用 Encoder 提取特征 ---
-    print("--- Testing ModernTCNEncoder ---")
-    encoder_params = {
-        'n_vars': n_vars,
-        'patch_size': 16,
-        'patch_stride': 8,
-        'dims': [64, 128, 256],
-        'num_blocks': [3, 3, 3],
-        'large_kernel_sizes': [31, 31, 31],
-        'small_kernel_sizes': [5, 5, 5],
-        'downsample_ratio': 2,
-        'ffn_ratio': 2,
-        'dropout_rate': 0.1,
-        'norm_type': 'layer',
-    }
-    encoder = ModernTCNEncoder(**encoder_params)
-    encoder_vars = encoder.init({'params': key, 'dropout': key}, mock_kline_data, training=False)
-    features = encoder.apply(encoder_vars, mock_kline_data, training=False)
-    
-    print("输入 K-Line 数据形状:", mock_kline_data.shape)
-    print("编码后特征形状 (B, M, D, N):", features.shape)
-    # Expected N = (512 / 8) / 2 / 2 = 16
-    # Expected D = 256 (last dim in `dims`)
-    expected_feature_shape = (batch_size, n_vars, encoder_params['dims'][-1], 16)
-    assert features.shape == expected_feature_shape
-    print("Encoder 输出形状符合预期!\n")
-
-    # --- 2. 使用 Forecaster (完整的 ModernTCN) 进行预测 ---
-    print("--- Testing ModernTCN (Forecaster) ---")
-    forecaster_params = {
-        'n_vars': n_vars,
-        'patch_size': 16,
-        'patch_stride': 8,
-        'dims': [64, 128, 256],
-        'num_blocks': [3, 3, 3],
-        'large_kernel_sizes': [31, 31, 31],
-        'small_kernel_sizes': [5, 5, 5],
-        'downsample_ratio': 2,
-        'ffn_ratio': 2,
-        'target_window': 96,
-        'individual': False,
-        'head_dropout': 0.1,
-        'dropout_rate': 0.1,
-        'norm_type': 'layer',
-    }
-    forecaster = ModernTCN(**forecaster_params)
-    forecaster_vars = forecaster.init({'params': key, 'dropout': key}, mock_kline_data, training=False)
-    
-    # 推理模式
-    predictions = forecaster.apply(
-        forecaster_vars,
-        mock_kline_data,
-        training=False
-    )
-
-    print("输入 K-Line 数据形状:", mock_kline_data.shape)
-    print("输出预测形状 (B, target_window, M):", predictions.shape)
-
-    # 验证输出形状是否符合预期
-    expected_prediction_shape = (batch_size, forecaster_params['target_window'], n_vars)
-    assert predictions.shape == expected_prediction_shape
-    print("Forecaster 输出形状符合预期!")
