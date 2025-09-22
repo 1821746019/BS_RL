@@ -9,7 +9,8 @@ class RecurrentReplayBuffer:
                  capacity_segments: int,
                  num_envs: int,
                  seg_len: int,
-                 min_gap: int = 60):
+                 min_gap: int = 60,
+                 min_valid_step_ratio: float = 0.8):
         self.obs_shape = obs_shape
         self.action_shape = action_shape
         self.is_discrete_action = is_discrete_action
@@ -17,6 +18,7 @@ class RecurrentReplayBuffer:
         self.num_envs = num_envs
         self.seg_len = seg_len
         self.min_gap = min_gap
+        self.min_valid_step_ratio = min_valid_step_ratio
         # Storage for segments as multi-dimensional arrays for vectorized operations
         T = self.seg_len
         self.segments_o = np.zeros((capacity_segments, T + 1) + self.obs_shape, dtype=np.float32)
@@ -91,40 +93,42 @@ class RecurrentReplayBuffer:
             # nothing collected
             return
         
-        # Create segment with proper padding/masking
         length = t
         T = self.seg_len
-        o = np.zeros((T + 1,) + self.obs_shape, dtype=np.float32)
-        a = np.zeros((T,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32)
-        r = np.zeros((T,), dtype=np.float32)
-        term = np.zeros((T,), dtype=np.float32)
-        trunc = np.zeros((T,), dtype=np.float32)
-        m = np.zeros((T,), dtype=np.float32)  # mask for valid steps
-        
-        # Copy actual data
-        o[:length + 1] = self.work_o[env_idx][:length + 1]
-        a[:length] = self.work_a[env_idx][:length]
-        r[:length] = self.work_r[env_idx][:length]
-        term[:length] = self.work_term[env_idx][:length]
-        trunc[:length] = self.work_trunc[env_idx][:length]
-        # mark valid training steps: exclude burn-in prefix
-        m[:length] = 1.0
-        
-        # For padded steps, mark as terminal to prevent bootstrap
-        if length < self.seg_len:
-            term[length:] = 1.0
 
-        # Store segment in circular buffer using vectorized operations
-        self.segments_o[self.seg_ptr] = o
-        self.segments_a[self.seg_ptr] = a
-        self.segments_r[self.seg_ptr] = r
-        self.segments_term[self.seg_ptr] = term
-        self.segments_trunc[self.seg_ptr] = trunc
-        self.segments_m[self.seg_ptr] = m
-        
-        # Update pointers
-        self.seg_ptr = (self.seg_ptr + 1) % self.capacity_segments
-        self.num_stored_segments = min(self.num_stored_segments + 1, self.capacity_segments)
+        if length / T >= self.min_valid_step_ratio:
+            # Create segment with proper padding/masking
+            o = np.zeros((T + 1,) + self.obs_shape, dtype=np.float32)
+            a = np.zeros((T,) + self.action_shape, dtype=np.int32 if self.is_discrete_action else np.float32)
+            r = np.zeros((T,), dtype=np.float32)
+            term = np.zeros((T,), dtype=np.float32)
+            trunc = np.zeros((T,), dtype=np.float32)
+            m = np.zeros((T,), dtype=np.float32)  # mask for valid steps
+            
+            # Copy actual data
+            o[:length + 1] = self.work_o[env_idx][:length + 1]
+            a[:length] = self.work_a[env_idx][:length]
+            r[:length] = self.work_r[env_idx][:length]
+            term[:length] = self.work_term[env_idx][:length]
+            trunc[:length] = self.work_trunc[env_idx][:length]
+            # mark valid training steps: exclude burn-in prefix
+            m[:length] = 1.0
+            
+            # For padded steps, mark as terminal to prevent bootstrap
+            if length < self.seg_len:
+                term[length:] = 1.0
+
+            # Store segment in circular buffer using vectorized operations
+            self.segments_o[self.seg_ptr] = o
+            self.segments_a[self.seg_ptr] = a
+            self.segments_r[self.seg_ptr] = r
+            self.segments_term[self.seg_ptr] = term
+            self.segments_trunc[self.seg_ptr] = trunc
+            self.segments_m[self.seg_ptr] = m
+            
+            # Update pointers
+            self.seg_ptr = (self.seg_ptr + 1) % self.capacity_segments
+            self.num_stored_segments = min(self.num_stored_segments + 1, self.capacity_segments)
 
         # Reset working buffer for this env
         self.work_o[env_idx][:] = 0
