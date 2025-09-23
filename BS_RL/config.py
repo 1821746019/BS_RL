@@ -152,7 +152,14 @@ class NetworkConfig:
     critic_dropout_rate: float = 0
     encoder_type: str = "none"  # "none"
     activation:str = "gelu"
-
+    use_modern_tcn_encoder: bool = False
+    tcn_patch_size: int = 4
+    tcn_patch_stride: int = 2 
+    tcn_dims: List[int] = field(default_factory=lambda: [64, 128]) 
+    tcn_num_blocks: List[int] = field(default_factory=lambda: [2, 2])
+    tcn_large_kernel_sizes: List[int] = field(default_factory=lambda: [7, 9])
+    tcn_small_kernel_sizes: List[int] = field(default_factory=lambda: [3, 3])
+    tcn_downsample_ratio: int = 2
     # RSAC-share specific
     use_pretrained_summarizer_path: Optional[str] = None
     """Path to a pretrained summarizer params (Flax serialization). If None, train from scratch."""

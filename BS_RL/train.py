@@ -22,7 +22,7 @@ from flax.training import checkpoints
 from tqdm.auto import tqdm
 import joblib
 from BS_RL.config import Args
-from BS_RL.common import profile, train_env_maker, MetricLogger, StatsAggregator, jax_profiler
+from BS_RL.common import profile, env_maker, MetricLogger, StatsAggregator, jax_profiler
 from BS_RL.networks import Actor, Critic
 from BS_RL.SACAgent import RSACAgent, TrainStateWithBatchStats, CriticTrainState, EncoderTrainState, TrainState
 from BS_RL.eval import Evaluator
@@ -64,8 +64,8 @@ class Trainer:
         self._setup_paths_and_run_name()
         self._setup_jax_devices()
         self._handle_resume_and_directory_setup()
-        self._setup_wandb()
         self._setup_seeds_and_keys()
+        self._setup_wandb()
         self._setup_environments()
         self._setup_agent()
         self._setup_replay_buffer()
@@ -167,7 +167,7 @@ class Trainer:
         print("Creating training environments...")
         vec_env_cls = AsyncVectorEnv if self.args.train.async_vector_env else SyncVectorEnv
         self.envs = vec_env_cls(
-            [train_env_maker(
+            [env_maker(
                 config=self.args.env.trading_env_config,
                 data_loader_cfg=self.args.env.data_loader_cfg,
                 feat_getter=self.args.env.feat_getter,
@@ -180,9 +180,9 @@ class Trainer:
             print("Continuous action space detected.")
         self.obs_shape = self.envs.single_observation_space.shape
         print(f"原始观察空间形状: {self.envs.single_observation_space.shape}")
-        if self.obs_shape == ():
-            self.obs_shape = (1,) # 标量视为1d数组
-    
+        # 修改obs_split_fn
+        self.args.env.obs_split_fn = self.envs.envs[0].obs_split_fn
+            
     def _setup_agent(self):
         if self.is_discrete:
             action_dim = self.envs.single_action_space.n # type: ignore

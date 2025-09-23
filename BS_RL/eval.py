@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from .SACAgent import RSACAgent
-from .common import eval_env_maker, MetricLogger, StatsAggregator
+from .common import env_maker, MetricLogger, StatsAggregator
 from .config import EnvConfig, EvalConfig
 from TradingEnv import DataLoaderConfig, TradingEnvConfig
 from datetime import datetime, timedelta
@@ -54,7 +54,7 @@ class Evaluator:
             if start_i >= end_i:
                 break
             trading_env_cfg.test_timerange = (start_i.strftime("%Y-%m-%d"), end_i.strftime("%Y-%m-%d"))
-            env = eval_env_maker(
+            env = env_maker(
                 config=trading_env_cfg,
                 data_loader_cfg=self.env_config.data_loader_cfg,
                 feat_getter=self.env_config.feat_getter,

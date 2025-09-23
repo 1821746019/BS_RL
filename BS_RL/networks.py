@@ -34,7 +34,7 @@ class SharedEncoder(nn.Module):
             )
         
         # 创建ModernTCN编码器（如果需要）
-        if getattr(self.network_cfg, 'use_modern_tcn_encoder', False):
+        if self.network_cfg.use_modern_tcn_encoder:
             self.tcn_encoder = ModernTCNEncoder(
                 patch_size=self.network_cfg.tcn_patch_size,
                 patch_stride=self.network_cfg.tcn_patch_stride,
@@ -43,10 +43,7 @@ class SharedEncoder(nn.Module):
                 large_kernel_sizes=self.network_cfg.tcn_large_kernel_sizes,
                 small_kernel_sizes=self.network_cfg.tcn_small_kernel_sizes,
                 downsample_ratio=self.network_cfg.tcn_downsample_ratio,
-                ffn_ratio=self.network_cfg.tcn_ffn_ratio,
-                dropout_rate=self.network_cfg.tcn_dropout_rate,
-                norm_type=self.network_cfg.tcn_norm_type,
-                post_proc=self.network_cfg.tcn_post_proc,
+                post_proc="global_max_pool",
                 name='tcn_encoder'
             )
         else:
@@ -61,10 +58,12 @@ class SharedEncoder(nn.Module):
         if self.tcn_encoder is not None:
             if obs_cnn_mem is None:
                 raise ValueError("obs_cnn_mem must be provided when using tcn_encoder")
+            B, L, M_cnn = obs_cnn_mem.shape
+            obs_cnn_mem = obs_cnn_mem.reshape(B*L, *M_cnn)
             features = self.tcn_encoder(obs_cnn_mem, training=training)
-            # 将 (B, M, D, N) reshape为 (B, N, M*D) 以适应summarizer
-            B, M, D, N = features.shape
-            cnn_features = features.transpose((0, 3, 1, 2)).reshape(B, N, M * D)
+            # 用全局最大池化，输出shape为(B_L, M, D)
+            B_L, M, D = features.shape
+            cnn_features = features.reshape(B, L, M * D)
 
         if obs_mem is not None and cnn_features is not None:
             x = jnp.concatenate([obs_mem, cnn_features], axis=-1)

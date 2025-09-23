@@ -1,76 +1,97 @@
-from BS_RL.common import valid_step_to_gamma
+from TradingEnv.Config import DataLoaderConfig
 import numpy as np
 import tyro
+import gymnasium as gym
 from BS_RL.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
+from BS_RL.nn.ResMLP import ResMLPConfig, ResidualStrategy
 from BS_RL.train import train
+from BS_RL.common import gym_train_env_maker, gym_eval_env_maker
 import os
-from TradingEnv import TradingEnvConfig as TradingEnvConfig, RewardSchema
+from TradingEnv import TradingEnvConfig
+
+DAY_MINUTES = 1440
 if __name__ == "__main__":
-    trading_timeframe = "5m"
-    valid_step = 100 #2*60/int(trading_timeframe[:-1]) #让agent只关注未来2h的reward
-    reward_schema = RewardSchema.exp_baseline
-    encoder="none"
-    total_timesteps = int(200e6)
-    resume = True
-    batch_size = 256
-    env_id = f"TradingEnv{trading_timeframe}"
-    env_num = 96
-    eval_env_num = 12 # 从48改为12减少评估耗时，若能实现异步评估就更好了
-    eval_episodes = eval_env_num
-    trading_env_config = TradingEnvConfig(
-        data_path="/root/project/processed_data/",
-        timeframe_minutes=trading_timeframe,
-        reward_schema=reward_schema
-    )
-    is_test = total_timesteps!=int(200e6)
-    learning_starts = int(batch_size) if is_test else int(2e4)
-    ckpt_save_frequency = None if is_test else 0.01
-    eval_frequency = None if is_test else 0.01
-    async_vector_env = True # 开启以利用CPU多核。v3-8的CPU主频似乎v4-8低很多，实测SPS会低近1半(900-->500)
+    env_id = "TradingEnv"
+    use_SGD = False
+    total_timesteps = int(10e6) 
+    env_num = 32
+    batch_size = 1
+    updates_per_call = 32
+    async_vector_env = False #True if env_num > 1 else False
+    eval_env_num = 32
+    async_vector_env_eval = False #if eval_env_num > 1 else False
+    exp_name = f"env_num({env_num})_{env_id}_SAC_{'SGD' if use_SGD else 'AdamW'}"
+    eval_episodes = eval_env_num #每个环境评估一次
+    timeframe_m = 1
+    trading_timeframe_m = 60
+    burn_in = DAY_MINUTES // trading_timeframe_m
+    train_unroll_steps = DAY_MINUTES * 7  // trading_timeframe_m 
+    rb_seg_len = DAY_MINUTES * 15 // trading_timeframe_m
+    is_test = total_timesteps == int(1e6)
+    learning_starts = 1000 if is_test else 30000
+    ckpt_save_frequency = 0.1 if is_test else 0.1
+    eval_frequency = 0.1 if is_test else 0.1
+    
+    # 针对TradingEnv优化的网络配置
+    
     args = Args(
         train=TrainConfig(
-            exp_name=env_id,
-            save_model=True,
+            exp_name=exp_name,
             ckpt_save_frequency=ckpt_save_frequency,
-            resume=resume,
-            save_dir=f"runs/{env_id}_{encoder}",
+            resume=False,  # 首次运行设为False
+            save_dir=f"runs/SAC_{env_id}",
             async_vector_env=async_vector_env,
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,
             eval_episodes=eval_episodes,
-            greedy_actions=True,
+            greedy_actions=True,  # 评估时使用确定性动作
             env_num=eval_env_num,
-            async_vector_env=async_vector_env,
+            async_vector_env=async_vector_env_eval,
+            capture_media=True,
         ),
         env=EnvConfig(
-            trading_env_config=trading_env_config,
-            env_num=env_num, # SAC typically uses 1 env for off-policy learning
+            data_loader_cfg=DataLoaderConfig(timeframe_m=timeframe_m),
+            trading_env_config=TradingEnvConfig(cooldown_days=0, loss_aversion=1, test_episode_days=14),
+            env_num=env_num,
         ),
         network=NetworkConfig(
-            encoder_type=encoder,
-            shape_tickers_positions=(trading_env_config.window_size, trading_env_config.kline_dim_5m),
-            # encoder_type 默认为 "convnext". 若要使用 transformer, 设置: encoder_type="transformer"
+            actor_net_arch=[128, 128, 128],
+            critic_net_arch=[128, 128, 128],
+            s5_hidden_dim=256,
+            s5_num_layers=3,
+            # 不需要时间序列编码器，直接用MLP
+            shape_tickers_positions=(0, 0),  # 不使用
+            encoder_type="none",  # 标记为不使用编码器
         ),
         algo=AlgoConfig(
             total_timesteps=total_timesteps,
-            buffer_size=int(1e5),
-            learning_starts=learning_starts, 
+            buffer_size=int(10e6),  # 大缓冲区有助于稳定训练
+            learning_starts=learning_starts,
             batch_size=batch_size,
-            update_frequency=4, # Update more frequently for simpler envs
-            target_network_frequency=int(8e3),
-            gamma=valid_step_to_gamma(valid_step), 
-            tau=1, # Softer updates can be better for MLP envs, but 1.0 is also fine
-            policy_lr=3e-4*np.log1p(batch_size/64), 
-            q_lr=3e-4*np.log1p(batch_size/64),
-            autotune=True,
-            target_entropy_scale_for_disc=0.89*(6/11), # 无操作(1)、多空减减仓(4)、其它的权重视为(1)
-            adam_eps=1e-4
+            update_frequency=1,  # 每步都更新
+            target_network_frequency=1,  # 软更新，每步更新
+            gamma=0.99,
+            tau=0.005,  # 连续动作通常用软更新
+            policy_lr=3e-4,
+            q_lr=3e-4,
+            autotune=True,  # 自动调节熵系数
+            adam_eps=1e-4,
+            use_SGD=use_SGD,
+            updates_per_call=updates_per_call,
+            train_unroll_steps=train_unroll_steps,
+            burn_in=burn_in,
+            rb_seg_len=rb_seg_len,
         ),
         wandb=WandbConfig(
-            project_name="SAC_TradingEnv",
-            entity=None # Your WandB entity
+            track=True,
+            project_name=f"{env_id}",
+            entity=None
         )
     )
     
+    print(f"总步数: {total_timesteps:,}")
+    print(f"批次大小: {batch_size}")
+    print(f"学习开始步数: {learning_starts:,}")
+    print(f"使用SGD: {args.algo.use_SGD}")
     train(args)

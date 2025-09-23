@@ -128,7 +128,8 @@ class MetricLogger:
             log_dict = {f"{prefix}/{k}_env0": v for k, v in remapped.items()}
             wandb.log(log_dict, step=step)
 
-def train_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, feat_getter: Callable, random_choose_tickers: bool=False, tickers_per_env: int=1):
+
+def env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, feat_getter: Callable, capture_media: bool=False, random_choose_tickers: bool=False, tickers_per_env: int=1):
     # 将env的tickers限制在tickers_per_env
     data_loader_cfg = dataclasses.replace(data_loader_cfg, tickers=data_loader_cfg.tickers[:tickers_per_env])
     # 若随机选tickers，则从Ticker枚举列表中选
@@ -142,29 +143,10 @@ def train_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig,
         env = wrappers.LossLimit(env)
         env = wrappers.EpisodeWrapper(env)
         env = wrappers.RandomWrapper(env)
-        env = wrappers.ObsWrapper(env)
-        # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
-        # env = FiniteCheck(env)
-        return env
-
-    return thunk
-
-def eval_env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, feat_getter: Callable, capture_media: bool=True, random_choose_tickers: bool=False, tickers_per_env: int=1):
-    # 将env的tickers限制在tickers_per_env
-    data_loader_cfg = dataclasses.replace(data_loader_cfg, tickers=data_loader_cfg.tickers[:tickers_per_env])
-    if random_choose_tickers:
-        tickers_new = tuple(np.random.choice(list(Ticker), tickers_per_env, replace=False))
-        data_loader_cfg = dataclasses.replace(data_loader_cfg, tickers=tickers_new)
-    def thunk():
-        data_loader = DataLoaderWithCache(data_loader_cfg, feat_getter)
-        account = Account(config, tickers=data_loader_cfg.tickers)
-        env = TradingEnv(config, data_loader, account)
-        env = wrappers.LossLimit(env)
-        env = wrappers.EpisodeWrapper(env)
-        env = wrappers.RandomWrapper(env)
         if capture_media:
             env = wrappers.EpisodeRender(env)
         env = wrappers.ObsWrapper(env)
+        env = wrappers.DiscreteAction(env)
         # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
         # env = FiniteCheck(env)
         return env
