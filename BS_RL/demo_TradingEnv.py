@@ -56,6 +56,7 @@ if __name__ == "__main__":
             env_num=env_num,
         ),
         network=NetworkConfig(
+            use_modern_tcn_encoder=True,
             actor_net_arch=[128, 128, 128],
             critic_net_arch=[128, 128, 128],
             s5_hidden_dim=256,

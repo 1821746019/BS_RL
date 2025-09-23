@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import dataclasses
 from typing import Callable, Deque, List, Dict, Any, Optional, Iterable
@@ -128,6 +129,42 @@ class MetricLogger:
             log_dict = {f"{prefix}/{k}_env0": v for k, v in remapped.items()}
             wandb.log(log_dict, step=step)
 
+class BS_SyncVectorEnv(gymnasium.vector.SyncVectorEnv):
+    def __init__(
+        self,
+        env_fns: Iterable[Callable[[], gymnasium.Env]],
+        observation_space: gymnasium.Space = None,
+        action_space: gymnasium.Space = None,
+        copy: bool = True,
+    ):
+        self.env_fns = env_fns
+        with ThreadPoolExecutor() as executor:
+            self.envs = list(executor.map(lambda fn: fn(), env_fns))
+        self.copy = copy
+        self.metadata = self.envs[0].metadata
+
+        if (observation_space is None) or (action_space is None):
+            observation_space = observation_space or self.envs[0].observation_space
+            action_space = action_space or self.envs[0].action_space
+        
+        # gymnasium.vector.SyncVectorEnv.__init__ calls gymnasium.vector.VectorEnv.__init__
+        # We are re-implementing SyncVectorEnv.__init__ to parallelize env creation.
+        # So we need to call VectorEnv.__init__ directly.
+        gymnasium.vector.VectorEnv.__init__(
+            self,
+            num_envs=len(self.envs),
+            observation_space=observation_space,
+            action_space=action_space,
+        )
+
+        self._check_spaces()
+        self.observations = gymnasium.vector.utils.create_empty_array(
+            self.single_observation_space, n=self.num_envs, fn=np.zeros
+        )
+        self._rewards = np.zeros((self.num_envs,), dtype=np.float64)
+        self._terminateds = np.zeros((self.num_envs,), dtype=np.bool_)
+        self._truncateds = np.zeros((self.num_envs,), dtype=np.bool_)
+        self._actions = None
 
 def env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, feat_getter: Callable, capture_media: bool=False, random_choose_tickers: bool=False, tickers_per_env: int=1):
     # 将env的tickers限制在tickers_per_env

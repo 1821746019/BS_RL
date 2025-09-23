@@ -13,7 +13,7 @@ import shutil
 import pickle
 import collections
 import gymnasium as gym
-from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
+from gymnasium.vector import AsyncVectorEnv
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,7 +22,7 @@ from flax.training import checkpoints
 from tqdm.auto import tqdm
 import joblib
 from BS_RL.config import Args
-from BS_RL.common import profile, env_maker, MetricLogger, StatsAggregator, jax_profiler
+from BS_RL.common import profile, env_maker, MetricLogger, StatsAggregator, jax_profiler, BS_SyncVectorEnv as SyncVectorEnv
 from BS_RL.networks import Actor, Critic
 from BS_RL.SACAgent import RSACAgent, TrainStateWithBatchStats, CriticTrainState, EncoderTrainState, TrainState
 from BS_RL.eval import Evaluator
