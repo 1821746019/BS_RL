@@ -25,7 +25,7 @@ class CriticTrainState(TrainState):
 
 class EncoderTrainState(TrainState):
     target_params: flax.core.FrozenDict
-CarryType = tuple[TrainState, CriticTrainState, CriticTrainState, EncoderTrainState, TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
+CarryType = tuple[TrainState, CriticTrainState, CriticTrainState, EncoderTrainState, TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
 
 class RSACAgent:
     def __init__(self,
@@ -89,7 +89,7 @@ class RSACAgent:
         else:
             encoder_output_dim = self.network_config.lstm_hidden_dim
         
-        dummy_obs_batched = jax.tree_map(lambda x: x[None, None, ...], dummy_obs)
+        dummy_obs_batched = jax.tree_util.tree_map(lambda x: x[None, None, ...], dummy_obs)
         dummy_cnn, dummy_mem, dummy_instant = self.obs_split_fn(dummy_obs_batched)
         
         encoder_params, _ = self._init_model_with_batch_stats(self.shared_encoder, key_encoder, dummy_mem, dummy_cnn, hidden_state=None, training=False)
@@ -168,10 +168,9 @@ class RSACAgent:
             obs
         )
 
-    @partial(jax_jit, static_argnums=(0,))
-    def select_action(self, actor_state: TrainState, encoder_params: flax.core.FrozenDict,
-                      obs: jnp.ndarray, hidden_state: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]],
-                      key: jax.Array, deterministic: bool = False):
+    @partial(jax_jit, static_argnames=('self', 'deterministic'))
+    def select_action(self, actor_state: TrainState, encoder_params: flax.core.FrozenDict, obs: jnp.ndarray, hidden_state: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]], key: jax.Array, deterministic: bool = False):
+        key, dropout_key = jax.random.split(key)
         # 若obs的shape为(B,)，需增加一个轴。也就是把标量视为1d数组
         if len(obs.shape) == 1: obs = obs[:, None]
         obs_cnn, obs_mem, obs_instant = self.obs_split_fn(obs)
@@ -185,7 +184,8 @@ class RSACAgent:
             obs_mem,
             obs_cnn,
             hidden_state,
-            training=jnp.logical_not(deterministic)
+            training=not deterministic,
+            rngs={'dropout': dropout_key}
         )
         summary_t = outputs[:, -1, :]
         x = jnp.concatenate([summary_t, obs_instant], axis=-1)
@@ -210,7 +210,7 @@ class RSACAgent:
             squashed = jnp.tanh(actions)
             return squashed, new_hidden_state
 
-    @partial(jax_jit, static_argnums=(0, 7))
+    @partial(jax_jit, static_argnames=('self', 'deterministic'))
     def select_action_for_eval(self,
                                actor_state: TrainState,
                                encoder_params: flax.core.FrozenDict,
@@ -245,6 +245,7 @@ class RSACAgent:
         return calc_loss.astype(jnp.float32)
     def _update_critic(self, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, encoder_state: EncoderTrainState, curr_alpha: Array, obs_cnn: Array, obs_mem: Array, obs_instant: Array, a: Array, r: Array, term: Array, loss_calc_m: Array, key: Array):
         B, T = loss_calc_m.shape[0], loss_calc_m.shape[1]
+        key, dropout_key = jax.random.split(key)
          # Pre-calculate summaries for the target network, which should be detached from grad calculations
         s_tp1_targ, _ = self.shared_encoder.apply({'params': encoder_state.target_params}, obs_mem, obs_cnn, hidden_state=None, training=False)
         s_tp1 = s_tp1_targ[:, 1:, :]
@@ -257,7 +258,7 @@ class RSACAgent:
         if self.is_discrete:
             def critic_loss_fn(q1_params, q2_params, encoder_params):
                 encoder_params = maybe_freeze_encoder(encoder_params)
-                summaries, _ = self.shared_encoder.apply({'params': encoder_params}, obs_mem, obs_cnn, hidden_state=None, training=True)
+                summaries, _ = self.shared_encoder.apply({'params': encoder_params}, obs_mem, obs_cnn, hidden_state=None, training=True, rngs={'dropout': dropout_key})
                 s_t = summaries[:, :-1, :]
                 x_t = jnp.concatenate([s_t, obs_instant[:, :-1, :]], axis=-1)
                 
@@ -291,7 +292,7 @@ class RSACAgent:
         else: # continuous
             def critic_loss_fn(q1_params, q2_params, encoder_params):
                 encoder_params = maybe_freeze_encoder(encoder_params)
-                summaries, _ = self.shared_encoder.apply({'params': encoder_params}, obs_mem, obs_cnn, hidden_state=None, training=True)
+                summaries, _ = self.shared_encoder.apply({'params': encoder_params}, obs_mem, obs_cnn, hidden_state=None, training=True, rngs={'dropout': dropout_key})
                 s_t = summaries[:, 0:-1, :]
                 x_t = jnp.concatenate([s_t, obs_instant[:, :-1, :]], axis=-1)
 
@@ -406,7 +407,7 @@ class RSACAgent:
             curr_alpha_new = alpha_clamped
         return actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val)
 
-    @partial(jax_jit, static_argnums=(0,))
+    @partial(jax_jit, static_argnames=('self',))
     def _update(self,
                 actor_state: TrainState,
                 qf1_state: CriticTrainState,
@@ -416,6 +417,7 @@ class RSACAgent:
                 log_alpha_state: Optional[TrainState],
                 batch: dict,
                 key: jax.Array):
+        key, dropout_key = jax.random.split(key)
         o = batch['o']
         a = batch['a']
         r = batch['r']
@@ -444,7 +446,7 @@ class RSACAgent:
             if defer_update: # 流程C0->C1A0->C2A1 critic评估的是上上步的actor。共用x_t减少了一次summarizer的前向传播，能带来10%的SPS提升(500->550)
                 return jax.lax.cond(update_actor_and_alpha, self._update_actor_and_alpha, no_update_aa, actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
             else: # 标准流程C0A0->C1A1 critic评估的是上一步的(最新的)actor
-                summaries, _ = self.shared_encoder.apply({'params': encoder_state_new.params}, obs_mem, obs_cnn, hidden_state=None, training=True)
+                summaries, _ = self.shared_encoder.apply({'params': encoder_state_new.params}, obs_mem, obs_cnn, hidden_state=None, training=True, rngs={'dropout': dropout_key})
                 x_t_new = jnp.concatenate([summaries[:, :-1, :], obs_instant[:, :-1, :]], axis=-1)
                 return self._update_actor_and_alpha(actor_state, qf1_state_new, qf2_state_new, log_alpha_state, curr_alpha, x_t_new, loss_calc_m, key)
         actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val) = maybe_defer_to_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
@@ -460,7 +462,7 @@ class RSACAgent:
         }
         return actor_state_new, qf1_state_new, qf2_state_new, encoder_state_new, log_alpha_state_new, curr_alpha_new, metrics
 
-    @partial(jax_jit, static_argnums=(0, 4))
+    @partial(jax_jit, static_argnames=('self', 'do_update', 'deterministic'))
     def update_then_select_action(self, obs, hidden_state, batches, do_update, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, encoder_state: EncoderTrainState, rsnorm_state: TrainStateWithBatchStats, log_alpha_state: TrainState, key: jax.Array, updates_per_call: int, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
 
@@ -490,11 +492,14 @@ class RSACAgent:
                 jnp.array(0.0),  # qf1_mean_sum
                 jnp.array(0.0),  # qf2_mean_sum
                 jnp.array(0.0),  # current_alpha placeholder
+                key_update,
             )
 
             def body_fun(i, carry: CarryType):
+                # 每次更新应使用不同的key
                 (a_state, q1_state, q2_state, s_state, la_state,
-                 cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha) = carry
+                 cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha, key_update_in) = carry
+                key_update_i, key_update_out = jax.random.split(key_update_in)
                 b = {
                     'o': batches['o'][i],
                     'a': batches['a'][i],
@@ -504,7 +509,7 @@ class RSACAgent:
                     'm': batches['m'][i],
                 }
                 a_state_n, q1_state_n, q2_state_n, s_state_n, la_state_n, cur_alpha_n, metric_i = self._update(
-                    a_state, q1_state, q2_state, s_state, updated_rsnorm_state, la_state, b, key_update
+                    a_state, q1_state, q2_state, s_state, updated_rsnorm_state, la_state, b, key_update_i
                 )
                 
                 # Target network update logic inside the loop
@@ -535,10 +540,10 @@ class RSACAgent:
                 qf1m_sum = qf1m_sum + metric_i['qf1_value_mean']
                 qf2m_sum = qf2m_sum + metric_i['qf2_value_mean']
                 return (a_state_n, q1_state_n, q2_state_n, s_state_n, la_state_n,
-                        cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha_n)
+                        cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha_n, key_update_out)
 
             (updated_actor_state, updated_qf1_state, updated_qf2_state, updated_encoder_state, updated_log_alpha_state,
-             critic_loss_sum, actor_loss_sum, alpha_loss_sum, entropy_sum, qf1_mean_sum, qf2_mean_sum, curr_alpha) = \
+             critic_loss_sum, actor_loss_sum, alpha_loss_sum, entropy_sum, qf1_mean_sum, qf2_mean_sum, curr_alpha, _) = \
                 jax.lax.fori_loop(0, num_updates, body_fun, init_carry)
 
             kf = jnp.maximum(1, num_updates)

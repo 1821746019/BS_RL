@@ -58,11 +58,11 @@ class SharedEncoder(nn.Module):
         if self.tcn_encoder is not None:
             if obs_cnn_mem is None:
                 raise ValueError("obs_cnn_mem must be provided when using tcn_encoder")
-            B, L, M_cnn = obs_cnn_mem.shape
+            B, L, *M_cnn = obs_cnn_mem.shape
             obs_cnn_mem = obs_cnn_mem.reshape(B*L, *M_cnn)
             features = self.tcn_encoder(obs_cnn_mem, training=training)
-            # 用全局最大池化，输出shape为(B_L, M, D)
-            B_L, M, D = features.shape
+            # 用全局最大池化，输出shape为(B_L, M, D, 1)
+            B_L, M, D, _ = features.shape
             cnn_features = features.reshape(B, L, M * D)
 
         if obs_mem is not None and cnn_features is not None:
