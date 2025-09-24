@@ -1,3 +1,4 @@
+from functools import partial
 import os
 os.environ['MUJOCO_GL'] = 'egl'
 
@@ -11,7 +12,7 @@ from BS_RL.common import gym_env_maker
 from TradingEnv import TradingEnvConfig
 import popgym
 from BS_RL.common import MetricLogger
-
+BS_AsyncVectorEnv = partial(gym.vector.AsyncVectorEnv, context="spawn", daemon=False, copy=False) # 解决memory_maze和AsyncVectorEnv一块用，子进程创建环境会卡死的问题
 class GymTrainer(Trainer):
     """适配标准gym环境的训练器"""
     
@@ -25,7 +26,7 @@ class GymTrainer(Trainer):
     
     def _setup_environments(self):
         print(f"创建{self.env_id}训练环境...")
-        vec_env_cls = gym.vector.AsyncVectorEnv if self.args.train.async_vector_env else gym.vector.SyncVectorEnv
+        vec_env_cls = BS_AsyncVectorEnv if self.args.train.async_vector_env else gym.vector.SyncVectorEnv
         self.envs = vec_env_cls([
             gym_env_maker(
                 env_id=self.env_id,
@@ -62,7 +63,7 @@ class GymTrainer(Trainer):
             
             def _make_envs(self):
                 print("创建评估环境...")
-                eval_vec_env_cls = gym.vector.AsyncVectorEnv if self.eval_config.async_vector_env else gym.vector.SyncVectorEnv
+                eval_vec_env_cls = BS_AsyncVectorEnv if self.eval_config.async_vector_env else gym.vector.SyncVectorEnv
                 
                 return eval_vec_env_cls([
                     gym_env_maker(
@@ -111,14 +112,14 @@ def args_RepeatPreviousHard():
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,
             save_dir=f"runs/RSAC_{env_id}",
-            async_vector_env=False,
+            async_vector_env=True,
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,
             eval_episodes=eval_episodes,
             greedy_actions=True,  # 评估时使用确定性动作
             env_num=eval_env_num,
-            async_vector_env=False,
+            async_vector_env=True,
             capture_media=False,  # POPGym环境通常非可视化
         ),
         env=EnvConfig(
@@ -168,9 +169,9 @@ def args_RepeatPreviousHard():
 def args_MemoryMaze():
     env_id = "memory_maze:MemoryMaze-9x9-v0" 
     total_timesteps = int(5e6)
-    env_num = 1
-    eval_env_num = 1
-    eval_episodes = 1
+    env_num = 96
+    eval_env_num = 32
+    eval_episodes = 32
     rb_seg_len = 1000
     batch_size = 1 
     burn_in = 0
@@ -179,7 +180,7 @@ def args_MemoryMaze():
     is_test = False
     ckpt_save_frequency = 0
     eval_frequency = 0 if is_test else 0.1
-    updates_per_call = 8    
+    updates_per_call = 32    
     args = Args(
         train=TrainConfig(
             jax_platform_name="",
@@ -187,14 +188,14 @@ def args_MemoryMaze():
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,
             save_dir=f"runs/RSAC_{env_id}",
-            async_vector_env=False,
+            async_vector_env=True,
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,
             eval_episodes=eval_episodes,
             greedy_actions=True,  # 评估时使用确定性动作
             env_num=eval_env_num,
-            async_vector_env=False,
+            async_vector_env=True,
             capture_media=False,  # POPGym环境通常非可视化
         ),
         env=EnvConfig(
