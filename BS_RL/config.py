@@ -5,7 +5,6 @@ from typing import Optional, Union, Tuple, List, Callable
 from TradingEnv import TradingEnvConfig as TradingEnvConfig, DataLoaderConfig
 from TradingEnv.feature import norm_OHLCV
 from .nn.ResMLP import ResMLPConfig, ResidualStrategy, ActivationPosition, ResMLPPresets
-from .nn.ResNet1DEncoder import ResNet1DConfig, ResidualBlock1D
 import numpy as np
 import jax
 ENABLE_PROFILE = __name__.split(".")[0] in os.getenv("PROFILE_PACKAGES", "").split(",") # 如果PROFILE_PACKAGES中包含当前包名，则进行profile

@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 from typing import List, Callable, Sequence, Optional, Tuple
 from .config import NetworkConfig
-from .nn.ResNet1DEncoder import ResNet1DEncoder
+from .nn.ResNetNDEncoder import ResNet8, ResNetConfig, ResNetNDEncoder
 from .nn.Simba import SimbaMLPResidualBlock, RSNorm, SimbaMLP
 from .nn.ModernTCN import ModernTCNEncoder
 from .nn.s5 import S5Summarizer
