@@ -10,7 +10,7 @@ import numpy as np
 import wandb
 import gymnasium
 from BS_RL.config import ENABLE_PROFILE, USE_JAX_PROFILER
-from TradingEnv.feature import norm_OHLCV
+
 jax_jit: Any = jax.jit # 为了让调用jitWrapped函数时IDE能提供正常的IntelliSense
 
 try:
@@ -189,18 +189,8 @@ def env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, feat_
         return env
 
     return thunk
-
-def gym_train_env_maker(env_id: str, seed: int, capture_video: bool = False, run_name: str|None = None):
-    """创建标准gym环境的训练环境制造函数"""
-    def thunk():
-        env = gymnasium.make(env_id)
-        env = gymnasium.wrappers.RecordEpisodeStatistics(env) # type: ignore
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
-        return env
-    return thunk
-
-def gym_eval_env_maker(env_id: str, seed: int, capture_video: bool = False, run_name: str|None = None):
+    
+def gym_env_maker(env_id: str, seed: int, capture_video: bool = False, run_name: str|None = None):
     """创建标准gym环境的评估环境制造函数"""
     def thunk():
         # 如果需要录制视频，指定render_mode

@@ -4,7 +4,7 @@ import gymnasium as gym
 from BS_RL.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
 from BS_RL.nn.ResMLP import ResMLPConfig, ResidualStrategy
 from BS_RL.train import Trainer
-from BS_RL.common import gym_train_env_maker, gym_eval_env_maker
+from BS_RL.common import gym_env_maker
 import os
 from TradingEnv import TradingEnvConfig
 
@@ -23,7 +23,7 @@ class GymTrainer(Trainer):
         print(f"创建{self.env_id}训练环境...")
         vec_env_cls = gym.vector.AsyncVectorEnv if self.args.train.async_vector_env else gym.vector.SyncVectorEnv
         self.envs = vec_env_cls([
-            gym_train_env_maker(
+            gym_env_maker(
                 env_id=self.env_id,
                 seed=self.args.train.seed + i
             ) for i in range(self.args.env.env_num)
@@ -58,7 +58,7 @@ class GymTrainer(Trainer):
                 eval_vec_env_cls = gym.vector.AsyncVectorEnv if self.eval_config.async_vector_env else gym.vector.SyncVectorEnv
                 
                 return eval_vec_env_cls([
-                    gym_eval_env_maker(
+                    gym_env_maker(
                         env_id=self.env_id,
                         seed=self.seed + i,
                         capture_video=self.eval_config.capture_media and i == 0,
