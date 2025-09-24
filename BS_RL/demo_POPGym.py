@@ -1,13 +1,16 @@
+import os
+os.environ['MUJOCO_GL'] = 'egl'
+
 import numpy as np
 import tyro
 import gymnasium as gym
 from BS_RL.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
 from BS_RL.nn.ResMLP import ResMLPConfig, ResidualStrategy
 from BS_RL.train import Trainer
-from BS_RL.common import gym_train_env_maker, gym_eval_env_maker
-import os
+from BS_RL.common import gym_env_maker
 from TradingEnv import TradingEnvConfig
 import popgym
+from BS_RL.common import MetricLogger
 
 class GymTrainer(Trainer):
     """适配标准gym环境的训练器"""
@@ -24,7 +27,7 @@ class GymTrainer(Trainer):
         print(f"创建{self.env_id}训练环境...")
         vec_env_cls = gym.vector.AsyncVectorEnv if self.args.train.async_vector_env else gym.vector.SyncVectorEnv
         self.envs = vec_env_cls([
-            gym_train_env_maker(
+            gym_env_maker(
                 env_id=self.env_id,
                 seed=self.args.train.seed + i
             ) for i in range(self.args.env.env_num)
@@ -45,7 +48,7 @@ class GymTrainer(Trainer):
         from BS_RL.eval import Evaluator
         
         class GymEvaluator(Evaluator):
-            def __init__(self, agent, env_config, eval_config, run_name_suffix, logger, env_id, seed):
+            def __init__(self, agent, env_config: EnvConfig, eval_config: EvalConfig, run_name_suffix: str, logger: MetricLogger, env_id: str, seed: int):
                 self.agent = agent
                 self.env_config = env_config
                 self.eval_config = eval_config
@@ -62,7 +65,7 @@ class GymTrainer(Trainer):
                 eval_vec_env_cls = gym.vector.AsyncVectorEnv if self.eval_config.async_vector_env else gym.vector.SyncVectorEnv
                 
                 return eval_vec_env_cls([
-                    gym_eval_env_maker(
+                    gym_env_maker(
                         env_id=self.env_id,
                         seed=self.seed + i,
                         capture_video=self.eval_config.capture_media and i == 0,
@@ -80,7 +83,7 @@ class GymTrainer(Trainer):
             seed=self.args.train.seed + 1
         )
 
-if __name__ == "__main__":
+def args_RepeatPreviousHard():
     # POPGym RepeatPreviousHard-v0 参数配置
     env_id = "popgym-RepeatPreviousHard-v0" 
     # env_id="CartPole-v1") # 完全可观测环境能解决
@@ -160,14 +163,94 @@ if __name__ == "__main__":
             entity=None
         )
     )
-    
-    print(f"开始训练RSAC-share在{env_id}环境...")
-    print(f"总步数: {total_timesteps:,}")
-    print(f"批次大小: {batch_size}")
-    print(f"学习开始步数: {learning_starts:,}")
-    print(f"预期成功率: > 0.8")
-    
+    return args, env_id    
+
+def args_MemoryMaze():
+    env_id = "memory_maze:MemoryMaze-9x9-v0" 
+    total_timesteps = int(5e6)
+    env_num = 1
+    eval_env_num = 1
+    eval_episodes = 1
+    rb_seg_len = 1000
+    batch_size = 1 
+    burn_in = 0
+    train_unroll_steps = rb_seg_len - burn_in #
+    learning_starts = 10000
+    is_test = False
+    ckpt_save_frequency = 0
+    eval_frequency = 0 if is_test else 0.1
+    updates_per_call = 8    
+    args = Args(
+        train=TrainConfig(
+            jax_platform_name="",
+            exp_name=f"RSAC_{env_id}",
+            ckpt_save_frequency=ckpt_save_frequency,
+            resume=False,
+            save_dir=f"runs/RSAC_{env_id}",
+            async_vector_env=False,
+        ),
+        eval=EvalConfig(
+            eval_frequency=eval_frequency,
+            eval_episodes=eval_episodes,
+            greedy_actions=True,  # 评估时使用确定性动作
+            env_num=eval_env_num,
+            async_vector_env=False,
+            capture_media=False,  # POPGym环境通常非可视化
+        ),
+        env=EnvConfig(
+            trading_env_config=TradingEnvConfig(),  # 提供默认配置，但不会使用
+            env_num=env_num,
+        ),
+        network=NetworkConfig(
+            # summarizer输入就是原观察（本demo使用向量），不使用额外编码器
+            encoder_type="resnet",
+            actor_net_arch=[128, 128],
+            critic_net_arch=[128, 128],
+            actor_dropout_rate=0.0,
+            critic_dropout_rate=0.0,
+            # RSAC-share
+            use_pretrained_summarizer_path=None,
+            use_s5_summarizer=True,
+            train_summarizer=True,
+            s5_num_layers=1,
+            s5_hidden_dim=512,
+        ),
+        algo=AlgoConfig(
+            total_timesteps=total_timesteps,
+            buffer_size=int(1e6),
+            learning_starts=learning_starts,
+            batch_size=batch_size,
+            update_frequency=1,  # 每步都更新
+            target_network_frequency=1000,  # 硬更新频率
+            gamma=0.99,
+            tau=1.0,  # 离散动作用硬更新
+            summarizer_lr=3e-4,
+            policy_lr=3e-4,
+            q_lr=3e-4,
+            autotune=True,  # 自动调节熵系数
+            adam_eps=1e-4,
+            rb_seg_len=rb_seg_len,
+            train_unroll_steps=train_unroll_steps,
+            burn_in=burn_in,
+            rb_min_gap=1,
+            updates_per_call=updates_per_call,
+        ),
+        wandb=WandbConfig(
+            track=os.getenv("USE_WANDB", "true").lower() == "true",
+            project_name=f"RSAC_{env_id.split(':')[-1]}",
+            entity=None
+        )
+    )
+    return args, env_id   
+
+if __name__ == "__main__":
+    # args, env_id = args_RepeatPreviousHard()
+    args, env_id = args_MemoryMaze()
     # 使用专门的gym训练器
     trainer = GymTrainer(args, env_id=env_id) 
     trainer.setup()
     trainer.train() 
+    print(f"开始训练RSAC-share在{env_id}环境...")
+    print(f"总步数: {args.algo.total_timesteps:,}")
+    print(f"批次大小: {args.algo.batch_size}")
+    print(f"学习开始步数: {args.algo.learning_starts:,}")

@@ -1,7 +1,7 @@
 import os
 os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache" # 设置缓存目录才会启用编译缓存，需在导入jax前设置
 from dataclasses import dataclass, field
-from typing import Optional, Union, Tuple, List, Callable
+from typing import Optional, Union, Tuple, List, Callable, Literal
 from TradingEnv import TradingEnvConfig as TradingEnvConfig, DataLoaderConfig
 from TradingEnv.feature import norm_OHLCV
 from .nn.ResMLP import ResMLPConfig, ResidualStrategy, ActivationPosition, ResMLPPresets
@@ -10,16 +10,27 @@ import jax
 ENABLE_PROFILE = __name__.split(".")[0] in os.getenv("PROFILE_PACKAGES", "").split(",") # 如果PROFILE_PACKAGES中包含当前包名，则进行profile
 USE_JAX_PROFILER = os.getenv("USE_JAX_PROFILER", "false").lower() == "true"
 
-def default_obs_split_fn(obs: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """默认的观测值切分函数。
-
+def obs_as(obs: np.ndarray, obs_as_type: Literal['auto', "obs_cnn_mem", "obs_mem", "obs_instant"] = "auto") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """默
+    obs: (batch_size, ...)
     返回:
-        obs_cnn_mem: (..., 0)
-        obs_mem: obs
-        obs_instant: (..., 0)
+        obs_cnn_mem: (batch_size, ..., 0)
+        obs_mem: (batch_size, ..., ...)
+        obs_instant: (batch_size, ..., 0)
     """
-    empty_shape = obs.shape[:-1] + (0,)
-    return np.zeros(empty_shape, dtype=obs.dtype), obs, np.zeros(empty_shape, dtype=obs.dtype)
+    # empty_shape = obs.shape[:-1] + (0,)
+    empty_obs = None #np.zeros(empty_shape, dtype=obs.dtype)
+    as_obs_cnn_mem = lambda: (obs, empty_obs, empty_obs)
+    as_obs_mem = lambda: (empty_obs, obs, empty_obs)
+    as_obs_instant = lambda: (empty_obs, empty_obs, obs)
+    auto_as = lambda : as_obs_cnn_mem() if obs.ndim >= 3 else as_obs_mem()
+
+    return {
+        "obs_cnn_mem": as_obs_cnn_mem,
+        "obs_mem": as_obs_mem,
+        "obs_instant": as_obs_instant,
+        "auto": auto_as,
+    }[obs_as_type]()
 
 @dataclass
 class EnvConfig:
@@ -27,7 +38,7 @@ class EnvConfig:
     data_loader_cfg: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     tickers_per_env: int = 1
     feat_getter: Callable = field(default_factory=lambda: norm_OHLCV.features_getter) 
-    obs_split_fn: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]] = field(default_factory=lambda: default_obs_split_fn)
+    obs_split_fn: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]] = field(default_factory=lambda: obs_as)
     env_num: int = 1 # sac_atari.py uses 1 env
     """the number of parallel game environments"""
 
@@ -149,9 +160,8 @@ class NetworkConfig:
     critic_net_arch: List[int] = field(default_factory=lambda: [512, 512, 512])
     actor_dropout_rate: float = 0
     critic_dropout_rate: float = 0
-    encoder_type: str = "none"  # "none"
+    encoder_type: Literal["none", "tcn", "resnet"] = "none"  # "none"
     activation:str = "gelu"
-    use_modern_tcn_encoder: bool = False
     tcn_patch_size: int = 4
     tcn_patch_stride: int = 2 
     tcn_dims: List[int] = field(default_factory=lambda: [64, 128]) 

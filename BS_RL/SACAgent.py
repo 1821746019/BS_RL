@@ -111,12 +111,12 @@ class RSACAgent:
 
         # Actor head
         self.actor_model = Actor(network_config=self.network_config, action_dim=self.action_dim, is_discrete=self.is_discrete)
-        actor_params, _ = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, encoder_output_dim + dummy_instant.shape[-1])), deterministic=True)
+        actor_params, _ = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, encoder_output_dim + 0 if dummy_instant is None else dummy_instant.shape[-1] )), deterministic=True)
         self.actor_state = TrainState.create(apply_fn=self.actor_model.apply, params=actor_params, tx=self.actor_optimizer)
 
         # Critic heads (two critics)
         self.critic_model = Critic(network_config=self.network_config, action_dim=self.action_dim, is_discrete=self.is_discrete)
-        dummy_critic_input = jnp.zeros((1, encoder_output_dim + dummy_instant.shape[-1]))
+        dummy_critic_input = jnp.zeros((1, encoder_output_dim + 0 if dummy_instant is None else dummy_instant.shape[-1] ))
         
         if self.is_discrete:
             qf1_params, _ = self._init_model_with_batch_stats(self.critic_model, key_qf1, dummy_critic_input, deterministic=True)

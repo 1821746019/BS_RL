@@ -34,8 +34,8 @@ class SharedEncoder(nn.Module):
             )
         
         # 创建ModernTCN编码器（如果需要）
-        if self.network_cfg.use_modern_tcn_encoder:
-            self.tcn_encoder = ModernTCNEncoder(
+        if self.network_cfg.encoder_type == "tcn":
+            self.pre_encoder = ModernTCNEncoder(
                 patch_size=self.network_cfg.tcn_patch_size,
                 patch_stride=self.network_cfg.tcn_patch_stride,
                 dims=self.network_cfg.tcn_dims,
@@ -46,24 +46,30 @@ class SharedEncoder(nn.Module):
                 post_proc="global_max_pool",
                 name='tcn_encoder'
             )
+        elif self.network_cfg.encoder_type == "resnet":
+            self.pre_encoder = ResNet8(dropout_rate=0.1)
         else:
-            self.tcn_encoder = None
+            self.pre_encoder = None
 
     def __call__(self, obs_mem: Optional[jnp.ndarray], obs_cnn_mem: Optional[jnp.ndarray], hidden_state: Optional[Tuple[jnp.ndarray, jnp.ndarray]], training: bool):
         # obs_mem shape: (B, L, M_mem)
         # obs_cnn_mem shape: (B, L, M_cnn)
         
         cnn_features = None
-        # 1. (可选) ModernTCN特征提取
-        if self.tcn_encoder is not None:
+        # 1. (可选) 特征提取
+        if self.pre_encoder is not None:
             if obs_cnn_mem is None:
-                raise ValueError("obs_cnn_mem must be provided when using tcn_encoder")
+                raise ValueError("obs_cnn_mem must be provided when using pre_encoder")
             B, L, *M_cnn = obs_cnn_mem.shape
             obs_cnn_mem = obs_cnn_mem.reshape(B*L, *M_cnn)
-            features = self.tcn_encoder(obs_cnn_mem, training=training)
+            # try:
+                # 有些编码器需要training参数，有些不需要
+            features = self.pre_encoder(obs_cnn_mem, training=training)
+            # except TypeError as e:
+            #     features = self.pre_encoder(obs_cnn_mem)
             # 用全局最大池化，输出shape为(B_L, M, D, 1)
-            B_L, M, D, _ = features.shape
-            cnn_features = features.reshape(B, L, M * D)
+            # B_L, M, D, _ = features.shape
+            cnn_features = features.reshape(B, L, -1)
 
         if obs_mem is not None and cnn_features is not None:
             x = jnp.concatenate([obs_mem, cnn_features], axis=-1)
@@ -72,7 +78,7 @@ class SharedEncoder(nn.Module):
         elif cnn_features is not None:
             x = cnn_features
         else:
-            raise ValueError("At least one of obs_mem or obs_cnn_mem (with tcn_encoder) must be provided.")
+            raise ValueError("At least one of obs_mem or obs_cnn_mem (with pre_encoder) must be provided.")
 
         # 2. 序列摘要
         outputs, new_hidden_state = self.summarizer(x, hidden_state)

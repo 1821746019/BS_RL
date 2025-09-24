@@ -33,7 +33,10 @@ dependencies = [
     "pyinstrument",
     "xprof",
     "tensorflow_probability<=0.25",
-    "POPGym"
+    "POPGym",
+    "memory_maze",
+    "shimmy[dm-control]",
+    # "gym==0.26.*"
     # "tf-keras",
     # "tensorflow==2.18",
     # "tensorboard==2.18",
