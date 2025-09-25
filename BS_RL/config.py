@@ -11,18 +11,9 @@ ENABLE_PROFILE = __name__.split(".")[0] in os.getenv("PROFILE_PACKAGES", "").spl
 USE_JAX_PROFILER = os.getenv("USE_JAX_PROFILER", "false").lower() == "true"
 
 def obs_as(obs: np.ndarray, obs_as_type: Literal['auto', "obs_cnn_mem", "obs_mem", "obs_instant"] = "auto") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """默
-    obs: (batch_size, ...)
-    返回:
-        obs_cnn_mem: (batch_size, ..., 0)
-        obs_mem: (batch_size, ..., ...)
-        obs_instant: (batch_size, ..., 0)
-    """
-    # empty_shape = obs.shape[:-1] + (0,)
-    empty_obs = None #np.zeros(empty_shape, dtype=obs.dtype)
-    as_obs_cnn_mem = lambda: (obs, empty_obs, empty_obs)
-    as_obs_mem = lambda: (empty_obs, obs, empty_obs)
-    as_obs_instant = lambda: (empty_obs, empty_obs, obs)
+    as_obs_cnn_mem = lambda: (obs, None, None)
+    as_obs_mem = lambda: (None, obs, None)
+    as_obs_instant = lambda: (None, None, obs)
     auto_as = lambda : as_obs_cnn_mem() if obs.ndim >= 3 else as_obs_mem()
 
     return {
@@ -38,7 +29,7 @@ class EnvConfig:
     data_loader_cfg: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     tickers_per_env: int = 1
     feat_getter: Callable = field(default_factory=lambda: norm_OHLCV.features_getter) 
-    obs_split_fn: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]] = field(default_factory=lambda: obs_as)
+    obs_split_fn: Callable[[np.ndarray], Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]] = field(default_factory=lambda: obs_as)
     env_num: int = 1 # sac_atari.py uses 1 env
     """the number of parallel game environments"""
 

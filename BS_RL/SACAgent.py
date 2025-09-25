@@ -111,12 +111,13 @@ class RSACAgent:
 
         # Actor head
         self.actor_model = Actor(network_config=self.network_config, action_dim=self.action_dim, is_discrete=self.is_discrete)
-        actor_params, _ = self._init_model_with_batch_stats(self.actor_model, key_actor, jnp.zeros((1, encoder_output_dim + 0 if dummy_instant is None else dummy_instant.shape[-1] )), deterministic=True)
+        actor_input_dim = int(encoder_output_dim + (0 if dummy_instant is None else dummy_instant.shape[-1]))
+        actor_params, _ = self._init_model_with_batch_stats(self.actor_model,key_actor,jnp.zeros((1, actor_input_dim)),deterministic=True,)
         self.actor_state = TrainState.create(apply_fn=self.actor_model.apply, params=actor_params, tx=self.actor_optimizer)
 
         # Critic heads (two critics)
         self.critic_model = Critic(network_config=self.network_config, action_dim=self.action_dim, is_discrete=self.is_discrete)
-        dummy_critic_input = jnp.zeros((1, encoder_output_dim + 0 if dummy_instant is None else dummy_instant.shape[-1] ))
+        dummy_critic_input = jnp.zeros((1, actor_input_dim))
         
         if self.is_discrete:
             qf1_params, _ = self._init_model_with_batch_stats(self.critic_model, key_qf1, dummy_critic_input, deterministic=True)
@@ -176,8 +177,8 @@ class RSACAgent:
         obs_cnn, obs_mem, obs_instant = self.obs_split_fn(obs)
 
         # Add sequence dimension for summarizer
-        obs_cnn = obs_cnn[:, None, :] if obs_cnn.shape[-1] > 0 else None
-        obs_mem = obs_mem[:, None, :] if obs_mem.shape[-1] > 0 else None
+        obs_cnn = obs_cnn[:, None, :] if obs_cnn is not None else None
+        obs_mem = obs_mem[:, None, :] if obs_mem is not None else None
         
         outputs, new_hidden_state = self.shared_encoder.apply(
             {'params': encoder_params},
@@ -188,7 +189,7 @@ class RSACAgent:
             rngs={'dropout': dropout_key}
         )
         summary_t = outputs[:, -1, :]
-        x = jnp.concatenate([summary_t, obs_instant], axis=-1)
+        x = jnp.concatenate([summary_t, obs_instant], axis=-1) if obs_instant is not None else summary_t
         det_flag = jnp.asarray(deterministic)
 
         if self.is_discrete:
@@ -249,7 +250,7 @@ class RSACAgent:
          # Pre-calculate summaries for the target network, which should be detached from grad calculations
         s_tp1_targ, _ = self.shared_encoder.apply({'params': encoder_state.target_params}, obs_mem, obs_cnn, hidden_state=None, training=False)
         s_tp1 = s_tp1_targ[:, 1:, :]
-        x_tp1 = jnp.concatenate([s_tp1, obs_instant[:, 1:, :]], axis=-1)
+        x_tp1 = jnp.concatenate([s_tp1, obs_instant[:, 1:, :]], axis=-1) if obs_instant is not None else s_tp1
         def maybe_freeze_encoder(params):
             if self.train_encoder:
                 return params
@@ -260,7 +261,7 @@ class RSACAgent:
                 encoder_params = maybe_freeze_encoder(encoder_params)
                 summaries, _ = self.shared_encoder.apply({'params': encoder_params}, obs_mem, obs_cnn, hidden_state=None, training=True, rngs={'dropout': dropout_key})
                 s_t = summaries[:, :-1, :]
-                x_t = jnp.concatenate([s_t, obs_instant[:, :-1, :]], axis=-1)
+                x_t = jnp.concatenate([s_t, obs_instant[:, :-1, :]], axis=-1) if obs_instant is not None else s_t
                 
                 next_logits = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
                 next_logits = next_logits.reshape(B, T, -1)
@@ -294,7 +295,7 @@ class RSACAgent:
                 encoder_params = maybe_freeze_encoder(encoder_params)
                 summaries, _ = self.shared_encoder.apply({'params': encoder_params}, obs_mem, obs_cnn, hidden_state=None, training=True, rngs={'dropout': dropout_key})
                 s_t = summaries[:, 0:-1, :]
-                x_t = jnp.concatenate([s_t, obs_instant[:, :-1, :]], axis=-1)
+                x_t = jnp.concatenate([s_t, obs_instant[:, :-1, :]], axis=-1) if obs_instant is not None else s_t
 
                 mean_tp1, log_std_tp1 = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
                 mean_tp1 = mean_tp1.reshape(B, T, -1)
@@ -447,7 +448,7 @@ class RSACAgent:
                 return jax.lax.cond(update_actor_and_alpha, self._update_actor_and_alpha, no_update_aa, actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
             else: # 标准流程C0A0->C1A1 critic评估的是上一步的(最新的)actor
                 summaries, _ = self.shared_encoder.apply({'params': encoder_state_new.params}, obs_mem, obs_cnn, hidden_state=None, training=True, rngs={'dropout': dropout_key})
-                x_t_new = jnp.concatenate([summaries[:, :-1, :], obs_instant[:, :-1, :]], axis=-1)
+                x_t_new = jnp.concatenate([summaries[:, :-1, :], obs_instant[:, :-1, :]], axis=-1) if obs_instant is not None else summaries[:, :-1, :]
                 return self._update_actor_and_alpha(actor_state, qf1_state_new, qf2_state_new, log_alpha_state, curr_alpha, x_t_new, loss_calc_m, key)
         actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val) = maybe_defer_to_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
         

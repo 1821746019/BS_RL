@@ -12,7 +12,7 @@ from BS_RL.common import gym_env_maker
 from TradingEnv import TradingEnvConfig
 import popgym
 from BS_RL.common import MetricLogger
-BS_AsyncVectorEnv = partial(gym.vector.AsyncVectorEnv, context="spawn", daemon=False, copy=False) # 解决memory_maze和AsyncVectorEnv一块用，子进程创建环境会卡死的问题
+BS_AsyncVectorEnv = partial(gym.vector.AsyncVectorEnv, context="spawn", daemon=False, copy=False) # context默认的行为是fork，对于memory_maze有重线程初始化问题。令daemon=False允许子进程创建进程。解决memory_maze和AsyncVectorEnv一块用，子进程创建环境会卡死的问题
 class GymTrainer(Trainer):
     """适配标准gym环境的训练器"""
     
@@ -168,16 +168,16 @@ def args_RepeatPreviousHard():
 
 def args_MemoryMaze():
     env_id = "memory_maze:MemoryMaze-9x9-v0" 
-    total_timesteps = int(5e6)
-    env_num = 96
-    eval_env_num = 32
-    eval_episodes = 32
+    total_timesteps = int(10e6)
+    is_test = True if total_timesteps != int(10e6) else False
+    env_num = 1 if is_test else 96
+    eval_env_num = 1 if is_test else 32
+    eval_episodes = eval_env_num
     rb_seg_len = 1000
     batch_size = 1 
     burn_in = 0
     train_unroll_steps = rb_seg_len - burn_in #
-    learning_starts = 10000
-    is_test = False
+    learning_starts = 1000
     ckpt_save_frequency = 0
     eval_frequency = 0 if is_test else 0.1
     updates_per_call = 32    
@@ -188,14 +188,14 @@ def args_MemoryMaze():
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,
             save_dir=f"runs/RSAC_{env_id}",
-            async_vector_env=True,
+            async_vector_env=True if env_num>1 else False,
         ),
         eval=EvalConfig(
             eval_frequency=eval_frequency,
             eval_episodes=eval_episodes,
             greedy_actions=True,  # 评估时使用确定性动作
             env_num=eval_env_num,
-            async_vector_env=True,
+            async_vector_env=True if eval_env_num>1 else False,
             capture_media=False,  # POPGym环境通常非可视化
         ),
         env=EnvConfig(

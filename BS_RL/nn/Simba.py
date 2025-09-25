@@ -64,7 +64,7 @@ class RSNorm(nn.Module):
     epsilon: float = 1e-8
     
     @nn.compact
-    def __call__(self, obs, update_stats: bool = False):
+    def __call__(self, obs: jnp.ndarray, update_stats: bool = False):
         """
         Args:
             obs: The input observation batch.
@@ -77,16 +77,19 @@ class RSNorm(nn.Module):
 
         # Update statistics in training mode
         if update_stats:
-            # The shape of `obs` can be 2D or 3D.
-            # - 2D: [num_envs, obs_dim] during live agent-environment interaction. Used to update the statistics.
-            # - 3D: [batch_size, seq_len, obs_dim] from the replay buffer during training updates.
-            # We must handle the 3D case here because of JAX's tracing mechanism for jax.lax.cond,
-            # even though stats are not updated with 3D data in practice.
-            # The goal is to calculate statistics per feature, so we reduce over batch and time axes.
-            axis = (0, 1) if obs.ndim > 2 else 0
-            batch_mean = jnp.mean(obs, axis=axis, dtype=jnp.float32)
-            batch_var = jnp.var(obs, axis=axis)
-            batch_count = obs.shape[0] * obs.shape[1] if obs.ndim > 2 else obs.shape[0]
+            # 统一处理任意维度输入：按最后一维为特征/通道维，
+            # 对除最后一维以外的所有维度求均值与方差（即跨 batch/时间/空间 维度）。
+            #
+            # 例如：
+            # - 2D: [N, D] -> 轴 (0,) 归约，得到 [D]
+            # - 3D: [B, T, D] -> 轴 (0,1) 归约，得到 [D]
+            # - 4D: [B, H, W, C] -> 轴 (0,1,2) 归约，得到 [C]
+            reduce_axes = tuple(range(obs.ndim - 1))
+            batch_mean = jnp.mean(obs, axis=reduce_axes, dtype=jnp.float32)
+            batch_var = jnp.var(obs, axis=reduce_axes, dtype=jnp.float32)
+            # 统计样本数：为被归约轴尺寸之乘积
+            reduce_sizes = [obs.shape[i] for i in reduce_axes]
+            batch_count = jnp.array(jnp.prod(jnp.array(reduce_sizes)), dtype=jnp.float32)
             
             delta = batch_mean - running_mean.value
             tot_count = count.value + batch_count
