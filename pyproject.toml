@@ -34,7 +34,7 @@ dependencies = [
     "xprof",
     "tensorflow_probability<=0.25",
     "POPGym",
-    "memory_maze",
+    "memory_maze @git+https://github.com/1821746019/memory-maze",
     "shimmy[dm-control]",
     # "gym==0.26.*"
     # "tf-keras",
