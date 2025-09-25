@@ -90,6 +90,13 @@ class StatsAggregator:
                 if isinstance(value, (list, dict, tuple, set)):
                     continue
                 try:
+                    # For single-element numpy arrays, extract the scalar value to avoid DeprecationWarning.
+                    if isinstance(value, np.ndarray):
+                        if value.size == 1:
+                            value = value.item()
+                        else:
+                            # Skip arrays with more than one element as we can't aggregate them as a single scalar.
+                            continue
                     # 尝试转换为float，如果失败则跳过该值
                     aggregated[key].append(float(value))
                 except (ValueError, TypeError):
