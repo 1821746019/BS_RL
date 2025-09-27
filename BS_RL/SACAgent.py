@@ -16,6 +16,7 @@ from .networks import Actor, Critic, SharedEncoder
 from .nn.s5 import init_S5SSM, make_DPLR_HiPPO, StackedEncoderModel, S5Summarizer
 from .nn.lstm import LSTMSummarizer
 from .nn.Simba import RSNorm
+from .jax_utils import concat_valid
 MAX_NORM = 0.4
 class TrainStateWithBatchStats(TrainState):
     batch_stats: Optional[flax.core.FrozenDict] = None
@@ -26,7 +27,6 @@ class CriticTrainState(TrainState):
 class EncoderTrainState(TrainState):
     target_params: flax.core.FrozenDict
 CarryType = tuple[TrainState, CriticTrainState, CriticTrainState, EncoderTrainState, TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
-
 class RSACAgent:
     def __init__(self,
                  action_dim: int,
@@ -84,15 +84,14 @@ class RSACAgent:
         # Shared encoder and target encoder
         self.shared_encoder = SharedEncoder(network_cfg=self.network_config)
 
-        if self.network_config.use_s5_summarizer:
-            encoder_output_dim = self.network_config.s5_hidden_dim
-        else:
-            encoder_output_dim = self.network_config.lstm_hidden_dim
-        
         dummy_obs_batched = jax.tree_util.tree_map(lambda x: x[None, None, ...], dummy_obs)
         dummy_cnn, dummy_mem, dummy_instant = self.obs_split_fn(dummy_obs_batched)
         
         encoder_params, _ = self._init_model_with_batch_stats(self.shared_encoder, key_encoder, dummy_mem, dummy_cnn, hidden_state=None, training=False)
+        
+        # 动态推断 summarizer 的输出维度
+        dummy_encoder_outputs, _ = self.shared_encoder.apply({'params': encoder_params}, dummy_mem, dummy_cnn, hidden_state=None, training=False)
+        encoder_output_dim = dummy_encoder_outputs.shape[-1]  if dummy_encoder_outputs is not None else 0
         
         if self.network_config.use_pretrained_summarizer_path:
             try:
@@ -174,22 +173,22 @@ class RSACAgent:
         key, dropout_key = jax.random.split(key)
         # 若obs的shape为(B,)，需增加一个轴。也就是把标量视为1d数组
         if len(obs.shape) == 1: obs = obs[:, None]
-        obs_cnn, obs_mem, obs_instant = self.obs_split_fn(obs)
+        obs_cnn_mem, obs_mem, obs_instant = self.obs_split_fn(obs)
 
         # Add sequence dimension for summarizer
-        obs_cnn = obs_cnn[:, None, :] if obs_cnn is not None else None
+        obs_cnn_mem = obs_cnn_mem[:, None, :] if obs_cnn_mem is not None else None
         obs_mem = obs_mem[:, None, :] if obs_mem is not None else None
         
         outputs, new_hidden_state = self.shared_encoder.apply(
             {'params': encoder_params},
             obs_mem,
-            obs_cnn,
+            obs_cnn_mem,
             hidden_state,
             training=not deterministic,
             rngs={'dropout': dropout_key}
         )
-        summary_t = outputs[:, -1, :]
-        x = jnp.concatenate([summary_t, obs_instant], axis=-1) if obs_instant is not None else summary_t
+        summary_t = outputs[:, -1, :] if outputs is not None else None
+        x = concat_valid([summary_t, obs_instant], axis=-1)
         det_flag = jnp.asarray(deterministic)
 
         if self.is_discrete:
@@ -249,8 +248,10 @@ class RSACAgent:
         key, dropout_key = jax.random.split(key)
          # Pre-calculate summaries for the target network, which should be detached from grad calculations
         s_tp1_targ, _ = self.shared_encoder.apply({'params': encoder_state.target_params}, obs_mem, obs_cnn, hidden_state=None, training=False)
-        s_tp1 = s_tp1_targ[:, 1:, :]
-        x_tp1 = jnp.concatenate([s_tp1, obs_instant[:, 1:, :]], axis=-1) if obs_instant is not None else s_tp1
+        s_tp1 = s_tp1_targ[:, 1:, :] if s_tp1_targ is not None else None
+        obs_instant_tp1 = obs_instant[:, 1:, :] if obs_instant is not None else None
+        x_tp1 = concat_valid([s_tp1, obs_instant_tp1], axis=-1)
+
         def maybe_freeze_encoder(params):
             if self.train_encoder:
                 return params
@@ -260,8 +261,9 @@ class RSACAgent:
             def critic_loss_fn(q1_params, q2_params, encoder_params):
                 encoder_params = maybe_freeze_encoder(encoder_params)
                 summaries, _ = self.shared_encoder.apply({'params': encoder_params}, obs_mem, obs_cnn, hidden_state=None, training=True, rngs={'dropout': dropout_key})
-                s_t = summaries[:, :-1, :]
-                x_t = jnp.concatenate([s_t, obs_instant[:, :-1, :]], axis=-1) if obs_instant is not None else s_t
+                s_t = summaries[:, :-1, :] if summaries is not None else None
+                obs_instant_t = obs_instant[:, :-1, :] if obs_instant is not None else None
+                x_t = concat_valid([s_t, obs_instant_t], axis=-1)
                 
                 next_logits = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
                 next_logits = next_logits.reshape(B, T, -1)
@@ -294,8 +296,9 @@ class RSACAgent:
             def critic_loss_fn(q1_params, q2_params, encoder_params):
                 encoder_params = maybe_freeze_encoder(encoder_params)
                 summaries, _ = self.shared_encoder.apply({'params': encoder_params}, obs_mem, obs_cnn, hidden_state=None, training=True, rngs={'dropout': dropout_key})
-                s_t = summaries[:, 0:-1, :]
-                x_t = jnp.concatenate([s_t, obs_instant[:, :-1, :]], axis=-1) if obs_instant is not None else s_t
+                s_t = summaries[:, 0:-1, :] if summaries is not None else None
+                obs_instant_t = obs_instant[:, :-1, :] if obs_instant is not None else None
+                x_t = concat_valid([s_t, obs_instant_t], axis=-1)
 
                 mean_tp1, log_std_tp1 = self.actor_model.apply({'params': actor_state.params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True)
                 mean_tp1 = mean_tp1.reshape(B, T, -1)
@@ -448,7 +451,9 @@ class RSACAgent:
                 return jax.lax.cond(update_actor_and_alpha, self._update_actor_and_alpha, no_update_aa, actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
             else: # 标准流程C0A0->C1A1 critic评估的是上一步的(最新的)actor
                 summaries, _ = self.shared_encoder.apply({'params': encoder_state_new.params}, obs_mem, obs_cnn, hidden_state=None, training=True, rngs={'dropout': dropout_key})
-                x_t_new = jnp.concatenate([summaries[:, :-1, :], obs_instant[:, :-1, :]], axis=-1) if obs_instant is not None else summaries[:, :-1, :]
+                s_t_new = summaries[:, :-1, :] if summaries is not None else None
+                obs_instant_t = obs_instant[:, :-1, :] if obs_instant is not None else None
+                x_t_new = concat_valid([s_t_new, obs_instant_t], axis=-1)
                 return self._update_actor_and_alpha(actor_state, qf1_state_new, qf2_state_new, log_alpha_state, curr_alpha, x_t_new, loss_calc_m, key)
         actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val) = maybe_defer_to_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
         

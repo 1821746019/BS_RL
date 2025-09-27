@@ -26,7 +26,7 @@ from BS_RL.common import profile, env_maker, MetricLogger, StatsAggregator, jax_
 from BS_RL.networks import Actor, Critic
 from BS_RL.SACAgent import RSACAgent, TrainStateWithBatchStats, CriticTrainState, EncoderTrainState, TrainState
 from BS_RL.eval import Evaluator
-from TradingEnv import DataLoader, DataLoaderConfig
+from TradingEnv import DataLoader, DataLoaderConfig, wrappers
 from BS_RL.replay_buffer import RecurrentReplayBuffer
 import wandb
 import optax
@@ -181,7 +181,8 @@ class Trainer:
         self.obs_shape = self.envs.single_observation_space.shape
         print(f"原始观察空间形状: {self.envs.single_observation_space.shape}")
         # 修改obs_split_fn
-        self.args.env.obs_split_fn = self.envs.envs[0].obs_split_fn
+        env: wrappers.ObsWrapper = self.envs.envs[0]
+        self.args.env.obs_split_fn = env.obs_split_fn
             
     def _setup_agent(self):
         if self.is_discrete:

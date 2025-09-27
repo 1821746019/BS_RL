@@ -8,7 +8,7 @@ from .nn.Simba import SimbaMLPResidualBlock, RSNorm, SimbaMLP
 from .nn.ModernTCN import ModernTCNEncoder
 from .nn.s5 import S5Summarizer
 from .nn.lstm import LSTMSummarizer
-
+from .jax_utils import concat_valid
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
     
@@ -55,6 +55,10 @@ class SharedEncoder(nn.Module):
         # obs_mem shape: (B, L, M_mem)
         # obs_cnn_mem shape: (B, L, M_cnn)
         
+        # 当没有任何记忆输入时，直接返回
+        if obs_mem is None and obs_cnn_mem is None:
+            return None, hidden_state
+
         cnn_features = None
         # 1. (可选) 特征提取
         if self.pre_encoder is not None:
@@ -62,23 +66,10 @@ class SharedEncoder(nn.Module):
                 raise ValueError("obs_cnn_mem must be provided when using pre_encoder")
             B, L, *M_cnn = obs_cnn_mem.shape
             obs_cnn_mem = obs_cnn_mem.reshape(B*L, *M_cnn)
-            # try:
-                # 有些编码器需要training参数，有些不需要
             features = self.pre_encoder(obs_cnn_mem, training=training)
-            # except TypeError as e:
-            #     features = self.pre_encoder(obs_cnn_mem)
-            # 用全局最大池化，输出shape为(B_L, M, D, 1)
-            # B_L, M, D, _ = features.shape
             cnn_features = features.reshape(B, L, -1)
 
-        if obs_mem is not None and cnn_features is not None:
-            x = jnp.concatenate([obs_mem, cnn_features], axis=-1)
-        elif obs_mem is not None:
-            x = obs_mem
-        elif cnn_features is not None:
-            x = cnn_features
-        else:
-            raise ValueError("At least one of obs_mem or obs_cnn_mem (with pre_encoder) must be provided.")
+        x = concat_valid([obs_mem, cnn_features], axis=-1)
 
         # 2. 序列摘要
         outputs, new_hidden_state = self.summarizer(x, hidden_state)

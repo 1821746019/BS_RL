@@ -7,7 +7,7 @@ from BS_RL.train import Trainer
 from BS_RL.common import gym_env_maker
 import os
 from TradingEnv import TradingEnvConfig
-
+from BS_RL.config import obs_as
 class GymTrainer(Trainer):
     """适配标准gym环境的训练器"""
     
@@ -79,13 +79,13 @@ class GymTrainer(Trainer):
 if __name__ == "__main__":
     # LunarLanderContinuous参数配置
     total_timesteps = int(1e6)  # 100万步，足够测试收敛性
-    batch_size = int(32)
+    batch_size = 64
     env_num = 1  # SAC通常使用单环境
     eval_env_num = 10
     eval_episodes = 10
-    train_unroll_steps = 8
+    train_unroll_steps = 1
     is_test = total_timesteps != int(1e6)
-    learning_starts = 28400 if is_test else 10000 # 28400用于测试rb性能是否会随segment_len的增大而下降
+    learning_starts = 1000 if is_test else 1000 # 28400用于测试rb性能是否会随segment_len的增大而下降
     ckpt_save_frequency = 0
     eval_frequency = 0 if is_test else 0.1
     
@@ -113,6 +113,7 @@ if __name__ == "__main__":
         env=EnvConfig(
             trading_env_config=TradingEnvConfig(),  # 提供默认配置，但不会使用
             env_num=env_num,
+            obs_split_fn=lambda obs: obs_as(obs, "obs_instant")
         ),
         network=NetworkConfig(
             # summarizer输入就是原观察（本demo使用向量），不使用额外编码器

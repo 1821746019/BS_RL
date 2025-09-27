@@ -1,6 +1,6 @@
 from functools import partial
 import os
-os.environ['MUJOCO_GL'] = 'egl'
+os.environ['MUJOCO_GL'] = 'osmesa' # egl在无GPU时会退化为软件渲染，性能不如osmesa(env96下的SPS：1000 vs 1200)
 
 import numpy as np
 import tyro
