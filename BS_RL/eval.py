@@ -102,9 +102,9 @@ class Evaluator:
                         
                         stats_aggregator.add(info["episode"])
                         r = info["episode"]["r"]
-                        r = r[0] if r.ndim == 1 else r
+                        r = r[0] if isinstance(r, np.ndarray) and r.ndim == 1 else r
                         l = info["episode"]["l"]
-                        l = l[0] if l.ndim == 1 else l
+                        l = l[0] if isinstance(l, np.ndarray) and l.ndim == 1 else l
                         print(f"Eval Episode {len(stats_aggregator.buffer)}/{num_episodes}: Return={r:.2f}, Length={l}")
                         if len(stats_aggregator.buffer) >= num_episodes:
                             break
