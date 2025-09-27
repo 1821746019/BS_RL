@@ -102,11 +102,11 @@ def args_1m():
     timeframe_m = 1
     trading_timeframe_m = 1
     burn_in = 0
-    train_unroll_steps = 64
-    rb_seg_len = DAY_MINUTES*3//trading_timeframe_m
-    train_episode_days = 3
-    test_episode_days = 3
-    batch_size = 1
+    train_unroll_steps = 1
+    rb_seg_len = 32
+    train_episode_days = 1
+    test_episode_days = 1
+    batch_size = 256
     is_test = total_timesteps == int(1e6)
     learning_starts = 1000 if is_test else 5000
     ckpt_save_frequency = 0.1 if is_test else 0.1

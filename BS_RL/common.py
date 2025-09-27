@@ -190,7 +190,7 @@ def env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, feat_
         if capture_media:
             env = wrappers.EpisodeRender(env)
         env = wrappers.ObsWrapper(env)
-        env = wrappers.DiscreteAction(env)
+        env = wrappers.DiscreteAction(env, [-1,1,0])
         # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
         # env = FiniteCheck(env)
         return env
