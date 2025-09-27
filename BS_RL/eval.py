@@ -101,9 +101,11 @@ class Evaluator:
                             self.logger.log_env0_episode(info["episode"], current_train_step, prefix="eval")
                         
                         stats_aggregator.add(info["episode"])
-                        episode_return = float(info["episode"]["r"])
-                        episode_length = int(info["episode"]["l"])
-                        print(f"Eval Episode {len(stats_aggregator.buffer)}/{num_episodes}: Return={episode_return:.2f}, Length={episode_length}")
+                        r = info["episode"]["r"]
+                        r = r[0] if r.ndim == 1 else r
+                        l = info["episode"]["l"]
+                        l = l[0] if l.ndim == 1 else l
+                        print(f"Eval Episode {len(stats_aggregator.buffer)}/{num_episodes}: Return={r:.2f}, Length={l}")
                         if len(stats_aggregator.buffer) >= num_episodes:
                             break
         

@@ -31,7 +31,8 @@ class GymTrainer(Trainer):
         self.is_discrete = isinstance(self.envs.single_action_space, gym.spaces.Discrete)
         action_type = "离散" if self.is_discrete else "连续"
         print(f"检测到{action_type}动作空间")
-        self.obs_dim = self.envs.single_observation_space.shape[-1]
+        self.obs_shape = self.envs.single_observation_space.shape
+
         
     def _setup_evaluator(self):
         if self.args.eval.eval_episodes <= 0:
@@ -79,11 +80,11 @@ class GymTrainer(Trainer):
 if __name__ == "__main__":
     # LunarLanderContinuous参数配置
     total_timesteps = int(1e6)  # 100万步，足够测试收敛性
-    batch_size = 64
-    env_num = 1  # SAC通常使用单环境
+    batch_size = 16
+    env_num = 16  # SAC通常使用单环境
     eval_env_num = 10
     eval_episodes = 10
-    train_unroll_steps = 1
+    train_unroll_steps = 16
     is_test = total_timesteps != int(1e6)
     learning_starts = 1000 if is_test else 1000 # 28400用于测试rb性能是否会随segment_len的增大而下降
     ckpt_save_frequency = 0
@@ -124,8 +125,6 @@ if __name__ == "__main__":
             actor_dropout_rate=0.0,
             critic_dropout_rate=0.0,
             # RSAC-share
-            market_feature_dim=8,  # LunarLander obs dim
-            agent_feature_dim=0,
             lstm_hidden_dim=128,
             lstm_num_layers=1,
             use_pretrained_summarizer_path=None,
