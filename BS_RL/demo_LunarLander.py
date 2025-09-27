@@ -78,13 +78,14 @@ class GymTrainer(Trainer):
         )
 
 if __name__ == "__main__":
-    # LunarLanderContinuous参数配置
+    env_id = "LunarLander-v2"
+    # env_id = "LunarLanderContinuous-v2"
     total_timesteps = int(1e6)  # 100万步，足够测试收敛性
-    batch_size = 16
+    batch_size = 256
     env_num = 16  # SAC通常使用单环境
     eval_env_num = 10
     eval_episodes = 10
-    train_unroll_steps = 16
+    train_unroll_steps = 1
     is_test = total_timesteps != int(1e6)
     learning_starts = 1000 if is_test else 1000 # 28400用于测试rb性能是否会随segment_len的增大而下降
     ckpt_save_frequency = 0
@@ -97,10 +98,10 @@ if __name__ == "__main__":
     args = Args(
         train=TrainConfig(
             jax_platform_name="",
-            exp_name="LunarLanderContinuous-RSAC",
+            exp_name=f"{env_id}-RSAC",
             ckpt_save_frequency=ckpt_save_frequency,
             resume=False,
-            save_dir=f"runs/LunarLanderContinuous_RSAC",
+            save_dir=f"runs/{env_id}_RSAC",
             async_vector_env=False,
         ),
         eval=EvalConfig(
@@ -151,18 +152,18 @@ if __name__ == "__main__":
         ),
         wandb=WandbConfig(
             track=os.getenv("USE_WANDB", "true").lower() == "true",
-            project_name="RSAC-Continuous_LunarLander",
+            project_name=f"RSAC-{env_id}",
             entity=None
         )
     )
     
-    print("开始训练RSAC-share在LunarLanderContinuous环境...")
+    print(f"开始训练RSAC-share在{env_id}环境...")
     print(f"总步数: {total_timesteps:,}")
     print(f"批次大小: {batch_size}")
     print(f"学习开始步数: {learning_starts:,}")
     print(f"预期奖励: > 200 (成功着陆)")
     
     # 使用专门的gym训练器
-    trainer = GymTrainer(args, env_id="LunarLanderContinuous-v2")
+    trainer = GymTrainer(args, env_id=env_id)
     trainer.setup()
     trainer.train() 
