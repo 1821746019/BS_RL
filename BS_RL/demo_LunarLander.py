@@ -88,8 +88,8 @@ if __name__ == "__main__":
     train_unroll_steps = 1
     is_test = total_timesteps != int(1e6)
     learning_starts = 1000 if is_test else 1000 # 28400用于测试rb性能是否会随segment_len的增大而下降
-    ckpt_save_frequency = 0
     eval_frequency = 0 if is_test else 0.1
+    ckpt_save_frequency = eval_frequency
     
     # 针对LunarLanderContinuous优化的网络配置
     # 观察空间: 8维向量 (位置、速度、角度、角速度、腿接触等)

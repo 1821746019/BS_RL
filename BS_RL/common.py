@@ -184,13 +184,14 @@ def env_maker(config: TradingEnvConfig, data_loader_cfg: DataLoaderConfig, feat_
         data_loader = DataLoaderWithCache(data_loader_cfg, feat_getter)
         account = Account(config, tickers=data_loader_cfg.tickers)
         env = TradingEnv(config, data_loader, account)
+        # env = wrappers.PosLimit(env)
         env = wrappers.LossLimit(env)
         env = wrappers.EpisodeWrapper(env)
         env = wrappers.RandomWrapper(env)
         if capture_media:
             env = wrappers.EpisodeRender(env)
         env = wrappers.ObsWrapper(env)
-        env = wrappers.DiscreteAction(env, [-1,1,0])
+        env = wrappers.DiscreteAction(env)
         # 值爆炸时并没有触发断言，说明不是obs含inf导致的，可以注释掉了
         # env = FiniteCheck(env)
         return env

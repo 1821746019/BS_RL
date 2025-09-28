@@ -24,7 +24,7 @@ import joblib
 from BS_RL.config import Args
 from BS_RL.common import profile, env_maker, MetricLogger, StatsAggregator, jax_profiler, BS_SyncVectorEnv as SyncVectorEnv
 from BS_RL.networks import Actor, Critic
-from BS_RL.SACAgent import RSACAgent, TrainStateWithBatchStats, CriticTrainState, EncoderTrainState, TrainState
+from BS_RL.SACAgent import RSACAgent, AgentState
 from BS_RL.eval import Evaluator
 from TradingEnv import DataLoader, DataLoaderConfig, wrappers
 from BS_RL.replay_buffer import RecurrentReplayBuffer
@@ -47,12 +47,7 @@ class Trainer:
         self.envs: AsyncVectorEnv| SyncVectorEnv
         self.agent : RSACAgent
         self.rb: RecurrentReplayBuffer
-        self.actor_state: TrainStateWithBatchStats
-        self.qf1_state: CriticTrainState
-        self.qf2_state: CriticTrainState
-        self.encoder_state: EncoderTrainState
-        self.rsnorm_state: TrainStateWithBatchStats
-        self.log_alpha_state: Optional[TrainState]
+        self.agent_state: AgentState
         self.current_alpha: jnp.ndarray
         self.data_loader: DataLoader
         self.evaluator: Evaluator
@@ -202,13 +197,8 @@ class Trainer:
             obs_split_fn=self.args.env.obs_split_fn,
             dummy_obs=dummy_obs
         )
-        self.actor_state = self.agent.actor_state
-        self.qf1_state = self.agent.qf1_state
-        self.qf2_state = self.agent.qf2_state
-        self.encoder_state = self.agent.encoder_state
-        self.rsnorm_state = self.agent.rsnorm_state
-        self.log_alpha_state = self.agent.log_alpha_state if self.args.algo.autotune else None
-        self.current_alpha = jnp.exp(self.log_alpha_state.params['log_alpha']) if self.args.algo.autotune and self.log_alpha_state else jnp.array(self.args.algo.alpha)
+        self.agent_state = self.agent.agent_state
+        self.current_alpha = self.agent.curr_alpha
 
         # initialize per-env hidden states
         self.hidden_state = None
@@ -216,9 +206,9 @@ class Trainer:
         # restore if checkpoint exists
         self._initialize_or_restore_agent_states()
 
-        actor_p_count = count_params(self.actor_state.params) / 1e6
-        critic_p_count = count_params(self.qf1_state.params) / 1e6
-        encoder_p_count = count_params(self.encoder_state.params) / 1e6
+        actor_p_count = count_params(self.agent_state.actor_state.params) / 1e6
+        critic_p_count = count_params(self.agent_state.qf1_state.params) / 1e6
+        encoder_p_count = count_params(self.agent_state.encoder_state.params) / 1e6
         print(f"Actor params: {actor_p_count:.2f}M")
         print(f"Critic params: {critic_p_count:.2f}M (x2 networks)")
         print(f"Shared Encoder params: {encoder_p_count:.2f}M")
@@ -230,54 +220,12 @@ class Trainer:
     def _initialize_or_restore_agent_states(self):
         if self.restored_ckpt_path:
             try:
-                restore_target = {
-                    'actor_params': self.actor_state.params,
-                    'actor_opt_state': self.actor_state.opt_state,
-                    'qf1_params': self.qf1_state.params,
-                    'qf1_opt_state': self.qf1_state.opt_state,
-                    'qf1_target_params': self.qf1_state.target_params,
-                    'qf2_params': self.qf2_state.params,
-                    'qf2_opt_state': self.qf2_state.opt_state,
-                    'qf2_target_params': self.qf2_state.target_params,
-                    'encoder_params': self.encoder_state.params,
-                    'encoder_opt_state': self.encoder_state.opt_state,
-                    'encoder_target_params': self.encoder_state.target_params,
-                    'rsnorm_batch_stats': self.rsnorm_state.batch_stats,
-                }
-                if self.args.algo.autotune:
-                    restore_target['log_alpha_params'] = self.log_alpha_state.params
-                    restore_target['log_alpha_opt_state'] = self.log_alpha_state.opt_state
-
+                restore_target = {'agent_state': self.agent_state}
                 loaded_contents = checkpoints.restore_checkpoint(
                     ckpt_dir=self.restored_ckpt_path,
                     target=restore_target
                 )
-
-                self.actor_state = self.actor_state.replace(
-                    params=loaded_contents['actor_params'],
-                    opt_state=loaded_contents['actor_opt_state'],
-                )
-                self.qf1_state = self.qf1_state.replace(
-                    params=loaded_contents['qf1_params'],
-                    opt_state=loaded_contents['qf1_opt_state'],
-                    target_params=loaded_contents['qf1_target_params'],
-                )
-                self.qf2_state = self.qf2_state.replace(
-                    params=loaded_contents['qf2_params'],
-                    opt_state=loaded_contents['qf2_opt_state'],
-                    target_params=loaded_contents['qf2_target_params'],
-                )
-                self.encoder_state = self.encoder_state.replace(
-                    params=loaded_contents['encoder_params'],
-                    opt_state=loaded_contents['encoder_opt_state'],
-                    target_params=loaded_contents['encoder_target_params']
-                )
-                self.rsnorm_state = self.rsnorm_state.replace(batch_stats=loaded_contents['rsnorm_batch_stats'])
-                if self.log_alpha_state and 'log_alpha_params' in loaded_contents:
-                    self.log_alpha_state = self.log_alpha_state.replace( 
-                        params=loaded_contents['log_alpha_params'],
-                        opt_state=loaded_contents['log_alpha_opt_state']
-                    )
+                self.agent_state = loaded_contents['agent_state']
                 print(f"Agent states restored from step {self.initial_global_step}.")
             except Exception as e:
                 print(f"Error restoring agent states: {e}. Starting with fresh states.")
@@ -345,20 +293,13 @@ class Trainer:
                     updates_per_call = max(1, int(self.args.algo.updates_per_call))
                     batches = self.rb.sample_many(self.args.algo.batch_size, self.args.algo.burn_in + self.args.algo.train_unroll_steps, updates_per_call)
                     # Combined action selection and multi-update in single JIT call
-                    actions, new_hidden_state, new_actor_state, new_qf1_state, new_qf2_state, new_encoder_state, new_rsnorm_state, new_log_alpha_state, metrics, self.jax_key = self.agent.update_then_select_action(
+                    actions, new_hidden_state, new_agent_state, metrics, self.jax_key = self.agent.update_then_select_action(
                         obs, self.hidden_state, batches, do_update,
-                        self.actor_state, self.qf1_state, self.qf2_state, self.encoder_state,
-                        self.rsnorm_state, self.log_alpha_state, self.jax_key, updates_per_call,
+                        self.agent_state, self.jax_key, updates_per_call,
                         deterministic=False
                     )
                     # Update states
-                    self.actor_state = new_actor_state
-                    self.qf1_state = new_qf1_state
-                    self.qf2_state = new_qf2_state
-                    self.encoder_state = new_encoder_state
-                    self.rsnorm_state = new_rsnorm_state
-                    if self.args.algo.autotune:
-                        self.log_alpha_state = new_log_alpha_state
+                    self.agent_state = new_agent_state
                     self.hidden_state = new_hidden_state
                     actions = np.array(jax.device_get(actions))
                 else:
@@ -442,9 +383,9 @@ class Trainer:
         tqdm.write(f"--- Evaluation Triggered at step {current_step} (effective eval step: {eval_trigger_step}) ---")
         
         eval_metrics = self.evaluator.evaluate(
-            actor_state_eval=self.actor_state,
-            encoder_params_eval=self.encoder_state.params,
-            rsnorm_state_eval=self.rsnorm_state,
+            actor_state_eval=self.agent_state.actor_state,
+            encoder_params_eval=self.agent_state.encoder_state.params,
+            rsnorm_state_eval=self.agent_state.rsnorm_state,
             current_train_step=current_step
         )
         
@@ -458,23 +399,7 @@ class Trainer:
         print(f"--- Saving checkpoint at step {step_for_ckpt} ---")
 
         try:
-            save_target = {
-                'actor_params': self.actor_state.params,
-                'actor_opt_state': self.actor_state.opt_state,
-                'qf1_params': self.qf1_state.params,
-                'qf1_opt_state': self.qf1_state.opt_state,
-                'qf1_target_params': self.qf1_state.target_params,
-                'qf2_params': self.qf2_state.params,
-                'qf2_opt_state': self.qf2_state.opt_state,
-                'qf2_target_params': self.qf2_state.target_params,
-                'encoder_params': self.encoder_state.params,
-                'encoder_opt_state': self.encoder_state.opt_state,
-                'encoder_target_params': self.encoder_state.target_params,
-                'rsnorm_batch_stats': self.rsnorm_state.batch_stats,
-            }
-            if self.args.algo.autotune and self.log_alpha_state:
-                save_target['log_alpha_params'] = self.log_alpha_state.params
-                save_target['log_alpha_opt_state'] = self.log_alpha_state.opt_state
+            save_target = {'agent_state': self.agent_state}
 
             checkpoints.save_checkpoint(
                 ckpt_dir=os.path.abspath(self.ckpt_dir), target=save_target, step=step_for_ckpt,

@@ -17,6 +17,7 @@ from .nn.s5 import init_S5SSM, make_DPLR_HiPPO, StackedEncoderModel, S5Summarize
 from .nn.lstm import LSTMSummarizer
 from .nn.Simba import RSNorm
 from .jax_utils import concat_valid
+import chex
 MAX_NORM = 0.4
 class TrainStateWithBatchStats(TrainState):
     batch_stats: Optional[flax.core.FrozenDict] = None
@@ -26,7 +27,18 @@ class CriticTrainState(TrainState):
 
 class EncoderTrainState(TrainState):
     target_params: flax.core.FrozenDict
-CarryType = tuple[TrainState, CriticTrainState, CriticTrainState, EncoderTrainState, TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
+
+@chex.dataclass
+class AgentState:
+    actor_state: TrainState
+    qf1_state: CriticTrainState
+    qf2_state: CriticTrainState
+    encoder_state: EncoderTrainState
+    rsnorm_state: TrainStateWithBatchStats
+    log_alpha_state: Optional[TrainState]
+    def replace(self, **kwargs) -> 'AgentState':...
+
+CarryType = tuple[AgentState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
 class RSACAgent:
     def __init__(self,
                  action_dim: int,
@@ -59,13 +71,13 @@ class RSACAgent:
             optax.sgd(learning_rate=self.algo_config.summarizer_lr, momentum=0.9) if self.algo_config.use_SGD else optax.adamw(learning_rate=self.algo_config.summarizer_lr, eps=self.algo_config.adam_eps),
         )
 
-        self._create_models_and_states(key_actor, key_qf1, key_qf2, key_encoder, key_rsnorm, dummy_obs)
+        self.agent_state = self._create_models_and_states(key_actor, key_qf1, key_qf2, key_encoder, key_rsnorm, dummy_obs)
 
-        self.log_alpha_state: TrainState
         if algo_config.autotune:
-            log_alpha_params = {'log_alpha': jnp.zeros(())}
-            self.log_alpha_state = TrainState.create(apply_fn=None, params=log_alpha_params, tx=self.alpha_optimizer)
-            self.curr_alpha = jnp.exp(self.log_alpha_state.params['log_alpha'])
+            log_alpha_params = {'log_alpha': jnp.log(algo_config.alpha)}
+            log_alpha_state = TrainState.create(apply_fn=None, params=log_alpha_params, tx=self.alpha_optimizer)
+            self.agent_state = self.agent_state.replace(log_alpha_state=log_alpha_state)
+            self.curr_alpha = jnp.exp(self.agent_state.log_alpha_state.params['log_alpha'])
         else:
             self.curr_alpha = jnp.array(algo_config.alpha)
         
@@ -80,7 +92,7 @@ class RSACAgent:
         batch_stats = variables.get('batch_stats')
         return params, batch_stats
 
-    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_encoder, key_rsnorm, dummy_obs: np.ndarray):
+    def _create_models_and_states(self, key_actor, key_qf1, key_qf2, key_encoder, key_rsnorm, dummy_obs: np.ndarray) -> AgentState:
         # Shared encoder and target encoder
         self.shared_encoder = SharedEncoder(network_cfg=self.network_config)
 
@@ -101,7 +113,7 @@ class RSACAgent:
             except Exception as e:
                 print(f"Warning: failed to load pretrained encoder: {e}")
         
-        self.encoder_state = EncoderTrainState.create(
+        encoder_state = EncoderTrainState.create(
             apply_fn=self.shared_encoder.apply, 
             params=encoder_params, 
             target_params=encoder_params, 
@@ -112,7 +124,7 @@ class RSACAgent:
         self.actor_model = Actor(network_config=self.network_config, action_dim=self.action_dim, is_discrete=self.is_discrete)
         actor_input_dim = int(encoder_output_dim + (0 if dummy_instant is None else dummy_instant.shape[-1]))
         actor_params, _ = self._init_model_with_batch_stats(self.actor_model,key_actor,jnp.zeros((1, actor_input_dim)),deterministic=True,)
-        self.actor_state = TrainState.create(apply_fn=self.actor_model.apply, params=actor_params, tx=self.actor_optimizer)
+        actor_state = TrainState.create(apply_fn=self.actor_model.apply, params=actor_params, tx=self.actor_optimizer)
 
         # Critic heads (two critics)
         self.critic_model = Critic(network_config=self.network_config, action_dim=self.action_dim, is_discrete=self.is_discrete)
@@ -126,47 +138,49 @@ class RSACAgent:
             qf1_params, _ = self._init_model_with_batch_stats(self.critic_model, key_qf1, dummy_critic_input, action=dummy_action, deterministic=True)
             qf2_params, _ = self._init_model_with_batch_stats(self.critic_model, key_qf2, dummy_critic_input, action=dummy_action, deterministic=True)
 
-        self.qf1_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf1_params, target_params=qf1_params, tx=self.critic_optimizer)
-        self.qf2_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf2_params, target_params=qf2_params, tx=self.critic_optimizer)
+        qf1_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf1_params, target_params=qf1_params, tx=self.critic_optimizer)
+        qf2_state = CriticTrainState.create(apply_fn=self.critic_model.apply, params=qf2_params, target_params=qf2_params, tx=self.critic_optimizer)
 
         self.train_encoder = bool(self.network_config.train_summarizer)
 
         # RSNorm for observations
         self.rsnorm_model = RSNorm()
         rsnorm_params, rsnorm_batch_stats = self._init_model_with_batch_stats(self.rsnorm_model, key_rsnorm, dummy_obs[None,...], update_stats=False)
-        self.rsnorm_state = TrainStateWithBatchStats.create(
+        rsnorm_state = TrainStateWithBatchStats.create(
             apply_fn=self.rsnorm_model.apply,
             params=rsnorm_params,
             batch_stats=rsnorm_batch_stats,
             tx=optax.sgd(1e-4)  # Dummy optimizer, not used
         )
+        return AgentState(
+            actor_state=actor_state,
+            qf1_state=qf1_state,
+            qf2_state=qf2_state,
+            encoder_state=encoder_state,
+            rsnorm_state=rsnorm_state,
+            log_alpha_state=None,
+        )
 
     def _norm_obs(self, rsnorm_state: TrainStateWithBatchStats, obs: jnp.ndarray, update_stats: bool):
-        def _update(state, observation):
+        def _update():
             norm_obs, new_vars = self.rsnorm_model.apply(
-                {'params': state.params, 'batch_stats': state.batch_stats},
-                observation,
+                {'params': rsnorm_state.params, 'batch_stats': rsnorm_state.batch_stats},
+                obs,
                 update_stats=True,
                 mutable=['batch_stats']
             )
-            new_state = state.replace(batch_stats=new_vars['batch_stats'])
+            new_state = rsnorm_state.replace(batch_stats=new_vars['batch_stats'])
             return new_state, norm_obs
 
-        def _no_update(state, observation):
+        def _no_update():
             norm_obs = self.rsnorm_model.apply(
-                {'params': state.params, 'batch_stats': state.batch_stats},
-                observation,
+                {'params': rsnorm_state.params, 'batch_stats': rsnorm_state.batch_stats},
+                obs,
                 update_stats=False
             )
-            return state, norm_obs
+            return rsnorm_state, norm_obs
 
-        return jax.lax.cond(
-            update_stats,
-            _update,
-            _no_update,
-            rsnorm_state,
-            obs
-        )
+        return _update() if update_stats else _no_update()
 
     @partial(jax_jit, static_argnames=('self', 'deterministic'))
     def select_action(self, actor_state: TrainState, encoder_params: flax.core.FrozenDict, obs: jnp.ndarray, hidden_state: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]], key: jax.Array, deterministic: bool = False):
@@ -412,15 +426,7 @@ class RSACAgent:
         return actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val)
 
     @partial(jax_jit, static_argnames=('self',))
-    def _update(self,
-                actor_state: TrainState,
-                qf1_state: CriticTrainState,
-                qf2_state: CriticTrainState,
-                encoder_state: EncoderTrainState,
-                rsnorm_state: TrainStateWithBatchStats,
-                log_alpha_state: Optional[TrainState],
-                batch: dict,
-                key: jax.Array):
+    def _update(self, agent_state: AgentState, batch: dict, key: jax.Array) -> Tuple[AgentState, jnp.ndarray, dict]:
         key, dropout_key = jax.random.split(key)
         o = batch['o']
         a = batch['a']
@@ -432,17 +438,17 @@ class RSACAgent:
         # Apply burn-in mask, m from rb only indicates padding, not burn-in
         loss_calc_m = self._create_calc_loss_mask(is_real)
         
-        _, o_normalized = self._norm_obs(rsnorm_state, o, update_stats=False)
+        _, o_normalized = self._norm_obs(agent_state.rsnorm_state, o, update_stats=False)
         obs_cnn, obs_mem, obs_instant = self.obs_split_fn(o_normalized)
 
         if self.algo_config.autotune:
-            curr_alpha = jnp.exp(log_alpha_state.params['log_alpha'])
+            curr_alpha = jnp.exp(agent_state.log_alpha_state.params['log_alpha'])
         else:
             curr_alpha = self.curr_alpha
 
-        qf1_state_new, qf2_state_new, encoder_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t) = self._update_critic(actor_state, qf1_state, qf2_state, encoder_state, curr_alpha, obs_cnn, obs_mem, obs_instant, a, r, term, loss_calc_m, key)
+        qf1_state_new, qf2_state_new, encoder_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t) = self._update_critic(agent_state.actor_state, agent_state.qf1_state, agent_state.qf2_state, agent_state.encoder_state, curr_alpha, obs_cnn, obs_mem, obs_instant, a, r, term, loss_calc_m, key)
         # 首次update不更新actor和alpha
-        update_actor_and_alpha = qf1_state.step != 0
+        update_actor_and_alpha = agent_state.qf1_state.step != 0
         def no_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key):
             return actor_state, log_alpha_state, curr_alpha, (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0))
         defer_update = False 
@@ -455,8 +461,15 @@ class RSACAgent:
                 obs_instant_t = obs_instant[:, :-1, :] if obs_instant is not None else None
                 x_t_new = concat_valid([s_t_new, obs_instant_t], axis=-1)
                 return self._update_actor_and_alpha(actor_state, qf1_state_new, qf2_state_new, log_alpha_state, curr_alpha, x_t_new, loss_calc_m, key)
-        actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val) = maybe_defer_to_update_aa(actor_state, qf1_state, qf2_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
+        actor_state_new, log_alpha_state_new, curr_alpha_new, (actor_loss_val, entropy_val, alpha_loss_val) = maybe_defer_to_update_aa(agent_state.actor_state, agent_state.qf1_state, agent_state.qf2_state, agent_state.log_alpha_state, curr_alpha, x_t, loss_calc_m, key)
         
+        agent_state_new = agent_state.replace(
+            actor_state=actor_state_new,
+            qf1_state=qf1_state_new,
+            qf2_state=qf2_state_new,
+            encoder_state=encoder_state_new,
+            log_alpha_state=log_alpha_state_new,
+        )
         metrics = {
             'critic_loss': critic_loss_val,
             'actor_loss': actor_loss_val,
@@ -466,10 +479,10 @@ class RSACAgent:
             'qf1_value_mean': qf1_value_mean,
             'qf2_value_mean': qf2_value_mean,
         }
-        return actor_state_new, qf1_state_new, qf2_state_new, encoder_state_new, log_alpha_state_new, curr_alpha_new, metrics
+        return agent_state_new, curr_alpha_new, metrics
 
     @partial(jax_jit, static_argnames=('self', 'do_update', 'deterministic'))
-    def update_then_select_action(self, obs, hidden_state, batches, do_update, actor_state: TrainState, qf1_state: CriticTrainState, qf2_state: CriticTrainState, encoder_state: EncoderTrainState, rsnorm_state: TrainStateWithBatchStats, log_alpha_state: TrainState, key: jax.Array, updates_per_call: int, deterministic: bool = False):
+    def update_then_select_action(self, obs, hidden_state, batches, do_update, agent_state: AgentState, key: jax.Array, updates_per_call: int, deterministic: bool = False):
         """Combined action selection and agent update to reduce CPU-TPU communication with multiple updates per call.
 
         batches: if do_update, a dict with leading dim K=updates_per_call; otherwise can be None or a single batch.
@@ -479,18 +492,14 @@ class RSACAgent:
         
         # If put _norm_obs in select_action, the first update will use raw obs to calc loss, which cause instability. So put _norm_obs here to make update func(loss calc) use the newest rsnorm_state
         updated_rsnorm_state, norm_obs_for_action = self._norm_obs(
-            rsnorm_state, obs, update_stats=jnp.logical_not(deterministic)
+            agent_state.rsnorm_state, obs, update_stats=deterministic
         )
 
         # 1. First perform agent update(s) if requested
         if do_update:
             num_updates = jnp.asarray(updates_per_call, dtype=jnp.int32)
             init_carry: CarryType = (
-                actor_state,
-                qf1_state,
-                qf2_state,
-                encoder_state,
-                log_alpha_state,
+                agent_state.replace(rsnorm_state=updated_rsnorm_state),
                 jnp.array(0.0),  # critic_loss_sum
                 jnp.array(0.0),  # actor_loss_sum
                 jnp.array(0.0),  # alpha_loss_sum
@@ -503,7 +512,7 @@ class RSACAgent:
 
             def body_fun(i, carry: CarryType):
                 # 每次更新应使用不同的key
-                (a_state, q1_state, q2_state, s_state, la_state,
+                (ag_state,
                  cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha, key_update_in) = carry
                 key_update_i, key_update_out = jax.random.split(key_update_in)
                 b = {
@@ -514,10 +523,10 @@ class RSACAgent:
                     'trunc': batches['trunc'][i],
                     'm': batches['m'][i],
                 }
-                a_state_n, q1_state_n, q2_state_n, s_state_n, la_state_n, cur_alpha_n, metric_i = self._update(
-                    a_state, q1_state, q2_state, s_state, updated_rsnorm_state, la_state, b, key_update_i
-                )
-                
+                ag_state_n, cur_alpha_n, metric_i = self._update(ag_state, b, key_update_i)
+                ag_state_n: AgentState 
+                cur_alpha_n: jnp.ndarray 
+                metric_i: dict
                 # Target network update logic inside the loop
                 target_update_freq = self.algo_config.target_network_frequency // max(1, self.algo_config.update_frequency)
                 
@@ -533,11 +542,12 @@ class RSACAgent:
                     return states
 
                 q1_state_n, q2_state_n, s_state_n = jax.lax.cond(
-                    (a_state_n.step % target_update_freq == 0),
+                    (ag_state_n.actor_state.step % target_update_freq == 0),
                     _update_targets,
                     _no_update_targets,
-                    (q1_state_n, q2_state_n, s_state_n)
+                    (ag_state_n.qf1_state, ag_state_n.qf2_state, ag_state_n.encoder_state)
                 )
+                ag_state_n = ag_state_n.replace(qf1_state=q1_state_n, qf2_state=q2_state_n, encoder_state=s_state_n)
                 
                 cl_sum = cl_sum + metric_i['critic_loss']
                 al_sum = al_sum + metric_i['actor_loss']
@@ -545,10 +555,10 @@ class RSACAgent:
                 ent_sum = ent_sum + metric_i['entropy']
                 qf1m_sum = qf1m_sum + metric_i['qf1_value_mean']
                 qf2m_sum = qf2m_sum + metric_i['qf2_value_mean']
-                return (a_state_n, q1_state_n, q2_state_n, s_state_n, la_state_n,
+                return (ag_state_n,
                         cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha_n, key_update_out)
 
-            (updated_actor_state, updated_qf1_state, updated_qf2_state, updated_encoder_state, updated_log_alpha_state,
+            (updated_agent_state,
              critic_loss_sum, actor_loss_sum, alpha_loss_sum, entropy_sum, qf1_mean_sum, qf2_mean_sum, curr_alpha, _) = \
                 jax.lax.fori_loop(0, num_updates, body_fun, init_carry)
 
@@ -563,11 +573,11 @@ class RSACAgent:
                 'qf2_value_mean': qf2_mean_sum / kf,
             }
         else:
-            updated_actor_state, updated_qf1_state, updated_qf2_state, updated_encoder_state, updated_log_alpha_state = actor_state, qf1_state, qf2_state, encoder_state, log_alpha_state
-            curr_alpha = jnp.exp(log_alpha_state.params['log_alpha']) if self.algo_config.autotune and log_alpha_state else jnp.array(self.algo_config.alpha)
+            updated_agent_state = agent_state.replace(rsnorm_state=updated_rsnorm_state)
+            curr_alpha = jnp.exp(agent_state.log_alpha_state.params['log_alpha']) if self.algo_config.autotune and agent_state.log_alpha_state else jnp.array(self.algo_config.alpha)
             metrics = {}
         
         # 2. Then perform action selection using potentially updated states
-        actions, new_hidden_state = self.select_action(updated_actor_state, updated_encoder_state.params, norm_obs_for_action, hidden_state, key_action, deterministic=deterministic)
+        actions, new_hidden_state = self.select_action(updated_agent_state.actor_state, updated_agent_state.encoder_state.params, norm_obs_for_action, hidden_state, key_action, deterministic=deterministic)
         
-        return actions, new_hidden_state, updated_actor_state, updated_qf1_state, updated_qf2_state, updated_encoder_state, updated_rsnorm_state, updated_log_alpha_state, metrics, new_key
+        return actions, new_hidden_state, updated_agent_state, metrics, new_key
