@@ -141,3 +141,27 @@ class Critic(nn.Module):
             x = activation_fn(x)
             q_value = nn.Dense(1)(x).squeeze(-1)
             return q_value
+
+class VectorCritic(nn.Module):
+    network_config: NetworkConfig
+    action_dim: int
+    is_discrete: bool
+    n_critics: int = 2
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, deterministic: bool, action: Optional[jnp.ndarray] = None):
+        vmap_critic = nn.vmap(
+            Critic,
+            variable_axes={"params": 0},
+            split_rngs={"params": True, "dropout": True},
+            in_axes=None,
+            out_axes=0,
+            axis_size=self.n_critics,
+        )
+        q_values = vmap_critic(
+            network_config=self.network_config,
+            action_dim=self.action_dim,
+            is_discrete=self.is_discrete,
+            name="SingleCritic"
+        )(x, deterministic, action)
+        return q_values

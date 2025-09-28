@@ -75,6 +75,8 @@ class AlgoConfig:
     adam_eps: float = 1e-4 # CleanRL used 1e-4 for PyTorch Adam, default optax Adam is 1e-8.
     use_SGD: bool = False
     """whether to use SGD instead of AdamW"""
+    n_critics: int = 2
+    """number of critics"""
     # RSAC-share specific
     rb_seg_len: int = int(1440*7)
     """Segment length for replay buffer."""
