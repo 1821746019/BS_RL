@@ -555,12 +555,12 @@ class RSACAgent:
         updated_rsnorm_state, norm_obs_for_action = self._norm_obs(
             agent_state.rsnorm_state, obs, update_stats=deterministic
         )
-
+        agent_state_new = agent_state.replace(rsnorm_state=updated_rsnorm_state)
         # 1. First perform agent update(s) if requested
         if do_update:
             num_updates = jnp.asarray(updates_per_call, dtype=jnp.int32)
             init_carry: CarryType = (
-                agent_state.replace(rsnorm_state=updated_rsnorm_state),
+                agent_state_new,
                 jnp.array(0.0),  # critic_loss_sum
                 jnp.array(0.0),  # actor_loss_sum
                 jnp.array(0.0),  # alpha_loss_sum
@@ -620,7 +620,7 @@ class RSACAgent:
                 return (ag_state_n,
                         cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha_n, key_update_out, edac_sum)
 
-            (updated_agent_state,
+            (agent_state_new,
              critic_loss_sum, actor_loss_sum, alpha_loss_sum, entropy_sum, qf1_mean_sum, qf2_mean_sum, curr_alpha, _, edac_penalty_sum) = \
                 jax.lax.fori_loop(0, num_updates, body_fun, init_carry)
 
@@ -636,11 +636,10 @@ class RSACAgent:
                 'edac_penalty': edac_penalty_sum / kf,
             }
         else:
-            updated_agent_state = agent_state.replace(rsnorm_state=updated_rsnorm_state)
-            curr_alpha = jnp.exp(agent_state.log_alpha_state.params['log_alpha']) if self.algo_config.autotune and agent_state.log_alpha_state else jnp.array(self.algo_config.alpha)
+            curr_alpha = jnp.exp(agent_state_new.log_alpha_state.params['log_alpha']) if self.algo_config.autotune and agent_state_new.log_alpha_state else jnp.array(self.algo_config.alpha)
             metrics = {}
         
         # 2. Then perform action selection using potentially updated states
-        actions, new_hidden_state = self.select_action(updated_agent_state.actor_state, updated_agent_state.encoder_state.params, norm_obs_for_action, hidden_state, key_action, deterministic=deterministic)
+        actions, new_hidden_state = self.select_action(agent_state_new.actor_state, agent_state_new.encoder_state.params, norm_obs_for_action, hidden_state, key_action, deterministic=deterministic)
         
-        return actions, new_hidden_state, updated_agent_state, metrics, new_key
+        return actions, new_hidden_state, agent_state_new, metrics, new_key
