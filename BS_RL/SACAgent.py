@@ -249,7 +249,7 @@ class RSACAgent:
         return scale * penalty_avg
 
     @partial(jax_jit, static_argnames=('self', 'deterministic'))
-    def select_action(self, actor_state: TrainState, encoder_params: flax.core.FrozenDict, obs: jnp.ndarray, hidden_state: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]], key: jax.Array, deterministic: bool = False):
+    def select_action(self, actor_state: TrainState, critic_params: flax.core.FrozenDict, encoder_params: flax.core.FrozenDict, obs: jnp.ndarray, hidden_state: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]], key: jax.Array, deterministic: bool = False):
         key, dropout_key = jax.random.split(key)
         # 若obs的shape为(B,)，需增加一个轴。也就是把标量视为1d数组
         if len(obs.shape) == 1: obs = obs[:, None]
@@ -273,11 +273,23 @@ class RSACAgent:
 
         if self.is_discrete:
             logits = self.actor_model.apply({'params': actor_state.params}, x, deterministic=True)
-            def take_argmax(k):
-                return jnp.argmax(logits, axis=-1)
-            def take_sample(k):
-                return jax.random.categorical(k, logits, axis=-1)
-            actions = jax.lax.cond(det_flag, take_argmax, take_sample, key)
+
+            def ucb_policy(k):
+                q_all = self.critic_model.apply({'params': critic_params}, x, deterministic=True)
+                q_std = jnp.std(q_all, axis=0)
+                ucb_logits = logits + self.algo_config.sunrise_ucb_lambda * q_std
+                return jax.random.categorical(k, ucb_logits, axis=-1)
+
+            def standard_policy(k):
+                def take_argmax(_):
+                    return jnp.argmax(logits, axis=-1)
+                def take_sample(kk):
+                    return jax.random.categorical(kk, logits, axis=-1)
+                return jax.lax.cond(det_flag, take_argmax, take_sample, k)
+
+            # UCB exploration is only active during training/exploration (non-deterministic)
+            use_ucb_flag = self.algo_config.use_sunrise_ucb & jnp.logical_not(det_flag)
+            actions = jax.lax.cond(use_ucb_flag, ucb_policy, standard_policy, key)
             return actions, new_hidden_state
         else:
             mean, log_std = self.actor_model.apply({'params': actor_state.params}, x, deterministic=True)
@@ -304,6 +316,7 @@ class RSACAgent:
 
         actions, new_hidden_state = self.select_action(
             actor_state,
+            self.agent_state.critic_state.params,
             encoder_params,
             norm_obs,
             hidden_state,
@@ -351,6 +364,7 @@ class RSACAgent:
                 next_log_probs = nn.log_softmax(next_logits, axis=-1)
 
                 q_next_all = self.critic_model.apply({'params': critic_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True).reshape(self.algo_config.n_critics, B, T, -1)
+                # Target for SAC-discrete uses median by default
                 q_next = jnp.median(q_next_all, axis=0)
                 v_next = jnp.sum(next_probs * (q_next - curr_alpha * next_log_probs), axis=-1)
                 target = r + (1.0 - term) * self.algo_config.gamma * v_next
@@ -361,9 +375,22 @@ class RSACAgent:
                 a_idx_expanded = a_idx[None, ...] # (1, B, T, 1)
                 q_taken = jnp.take_along_axis(q_all, a_idx_expanded, axis=-1).squeeze(-1)
 
+                # SUNRISE Weighted Bellman Backups
+                def compute_wbb_weights():
+                    # Compute per-critic soft value targets then std across critics
+                    v_next_c = jnp.sum(next_probs[None, ...] * (q_next_all - curr_alpha * next_log_probs[None, ...]), axis=-1)  # (nC, B, T)
+                    std_bt = jnp.std(v_next_c, axis=0)  # (B, T)
+                    w = jax.nn.sigmoid(-std_bt * self.algo_config.sunrise_wbb_temperature) + 0.5
+                    return w
+                w_bt = jax.lax.cond(self.algo_config.use_sunrise_weighted_backup,
+                                     lambda _: compute_wbb_weights(),
+                                     lambda _: jnp.ones_like(loss_calc_m),
+                                     operand=None)
+
                 target_expanded = target[None, ...]
                 mse = (q_taken - target_expanded)**2
-                mse = (mse * loss_calc_m[None, ...]).sum(axis=(1,2)) / (loss_calc_m.sum() + 1e-8)
+                denom = (loss_calc_m * w_bt).sum() + 1e-8
+                mse = (mse * (loss_calc_m[None, ...] * w_bt[None, ...])).sum(axis=(1,2)) / denom
                 loss = mse.mean()
                 qf1_value_mean = (q_taken[0] * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
                 qf2_value_mean = (q_taken[1] * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
@@ -395,9 +422,20 @@ class RSACAgent:
                 q_cur = self.critic_model.apply({'params': critic_params}, x_t.reshape(-1, x_t.shape[-1]), action=a.reshape(-1, a.shape[-1]), deterministic=False)
                 q_cur = q_cur.reshape(self.algo_config.n_critics, B, T)
 
+                # SUNRISE Weighted Bellman Backups
+                def compute_wbb_weights():
+                    std_bt = jnp.std(q_next_all, axis=0)  # (B, T)
+                    w = jax.nn.sigmoid(-std_bt * self.algo_config.sunrise_wbb_temperature) + 0.5
+                    return w
+                w_bt = jax.lax.cond(self.algo_config.use_sunrise_weighted_backup,
+                                     lambda _: compute_wbb_weights(),
+                                     lambda _: jnp.ones_like(loss_calc_m),
+                                     operand=None)
+
                 target_expanded = target[None, ...]
                 mse = (q_cur - target_expanded)**2
-                mse = (mse * loss_calc_m[None, ...]).sum(axis=(1,2)) / (loss_calc_m.sum() + 1e-8)
+                denom = (loss_calc_m * w_bt).sum() + 1e-8
+                mse = (mse * (loss_calc_m[None, ...] * w_bt[None, ...])).sum(axis=(1,2)) / denom
                 loss = mse.mean()
                 qf1_value_mean = (q_cur[0] * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
                 qf2_value_mean = (q_cur[1] * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
@@ -640,6 +678,14 @@ class RSACAgent:
             metrics = {}
         
         # 2. Then perform action selection using potentially updated states
-        actions, new_hidden_state = self.select_action(agent_state_new.actor_state, agent_state_new.encoder_state.params, norm_obs_for_action, hidden_state, key_action, deterministic=deterministic)
+        actions, new_hidden_state = self.select_action(
+            agent_state_new.actor_state,
+            agent_state_new.critic_state.params,
+            agent_state_new.encoder_state.params,
+            norm_obs_for_action,
+            hidden_state,
+            key_action,
+            deterministic=deterministic
+        )
         
         return actions, new_hidden_state, agent_state_new, metrics, new_key

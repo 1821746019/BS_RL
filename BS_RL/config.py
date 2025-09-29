@@ -78,10 +78,19 @@ class AlgoConfig:
     n_critics: int = 20
     """number of critics"""
     # EDAC (Ensemble Diversification Actor-Critic)
-    use_edac: bool = True
+    use_edac: bool = False
     """Enable EDAC gradient diversification regularization for critics (continuous control)."""
     edac_coef: float = 1.0
     """EDAC regularization coefficient (eta). Scales ||mean_grad_a Q||^2 penalty."""
+    # SUNRISE components
+    use_sunrise_weighted_backup: bool = False
+    """Enable SUNRISE Weighted Bellman Backups (weights by target std across critics)."""
+    sunrise_wbb_temperature: float = 10.0
+    """Temperature T in w(s,a)=sigmoid(-std*T)+0.5; larger T sharpens down-weighting."""
+    use_sunrise_ucb: bool = True
+    """Enable SUNRISE UCB exploration for discrete actions at interaction time."""
+    sunrise_ucb_lambda: float = 1.0
+    """UCB bonus scale lambda for Q_mean + lambda * Q_std action selection (discrete)."""
     # RSAC-share specific
     rb_seg_len: int = int(1440*7)
     """Segment length for replay buffer."""
