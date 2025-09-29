@@ -210,11 +210,11 @@ class Trainer:
         critic_p_count = count_params(self.agent_state.critic_state.params) / 1e6
         encoder_p_count = count_params(self.agent_state.encoder_state.params) / 1e6
         print(f"Actor params: {actor_p_count:.2f}M")
-        print(f"Critic params: {critic_p_count / 2:.2f}M (x2 networks)")
+        print(f"Critic params: {critic_p_count / self.args.algo.n_critics:.2f}M (x{self.args.algo.n_critics} networks)")
         print(f"Shared Encoder params: {encoder_p_count:.2f}M")
         if self.args.wandb.track:
             wandb.summary['actor_params_m'] = actor_p_count
-            wandb.summary['critic_params_m'] = critic_p_count / 2
+            wandb.summary['critic_params_m'] = critic_p_count / self.args.algo.n_critics
             wandb.summary['encoder_params_m'] = encoder_p_count
 
     def _initialize_or_restore_agent_states(self):

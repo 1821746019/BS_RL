@@ -37,7 +37,8 @@ class AgentState:
     log_alpha_state: Optional[TrainState]
     def replace(self, **kwargs) -> 'AgentState':...
 
-CarryType = tuple[AgentState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
+# Add edac_penalty sum slot
+CarryType = tuple[AgentState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
 class RSACAgent:
     def __init__(self,
                  action_dim: int,
@@ -177,6 +178,76 @@ class RSACAgent:
 
         return _update() if update_stats else _no_update()
 
+    def _compute_edac_penalty_continuous(self,
+                                         critic_params: flax.core.FrozenDict,
+                                         actor_params: flax.core.FrozenDict,
+                                         x_t: jnp.ndarray,
+                                         loss_calc_m: jnp.ndarray,
+                                         key: jax.Array) -> jnp.ndarray:
+        """EDAC penalty for continuous actions using action-gradients of critics.
+        Computes mean of unit gradients across critics and penalizes its squared norm.
+        """
+        if not self.algo_config.use_edac:
+            return jnp.array(0.0)
+
+        B, T = loss_calc_m.shape
+        # Sample actions from current policy at s_t
+        mean_t, log_std_t = self.actor_model.apply({'params': actor_params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True)
+        mean_t = mean_t.reshape(B, T, -1)
+        log_std_t = log_std_t.reshape(B, T, -1)
+        dist_t = tfd.MultivariateNormalDiag(loc=mean_t, scale_diag=jnp.exp(log_std_t))
+        u_t = dist_t.sample(seed=key)
+        a_hat = jnp.tanh(u_t)  # (B, T, A)
+
+        # Flatten for per-sample jacobian
+        BT = B * T
+        x_flat = x_t.reshape(BT, -1)
+        a_flat = a_hat.reshape(BT, -1)
+        mask_flat = loss_calc_m.reshape(BT)
+
+        def q_fn_single(a_single, x_single):
+            # returns (n_critics,)
+            return self.critic_model.apply({'params': critic_params}, x_single[None, :], action=a_single[None, :], deterministic=True).squeeze(1)
+
+        jacobian_fn = jax.jacrev(q_fn_single, argnums=0)
+        grads = jax.vmap(jacobian_fn, in_axes=(0, 0))(a_flat, x_flat)  # (BT, n_critics, A)
+
+        grad_norm = jnp.linalg.norm(grads, axis=-1, keepdims=True) + 1e-8
+        grads_unit = grads / grad_norm
+        mean_grad = jnp.mean(grads_unit, axis=1)  # (BT, A)
+        penalty_per_sample = jnp.sum(mean_grad ** 2, axis=-1)  # (BT,)
+
+        denom = mask_flat.sum() + 1e-8
+        penalty_avg = (penalty_per_sample * mask_flat).sum() / denom
+        scale = self.algo_config.edac_coef / jnp.maximum(1, self.algo_config.n_critics - 1)
+        return scale * penalty_avg
+
+    def _compute_edac_penalty_discrete(self,
+                                       critic_params: flax.core.FrozenDict,
+                                       x_t: jnp.ndarray,
+                                       loss_calc_m: jnp.ndarray) -> jnp.ndarray:
+        """EDAC-like penalty for discrete actions by diversifying Q-vectors across actions.
+        Uses unit-normalized Q-vectors per critic and penalizes squared norm of their mean.
+        """
+        if not self.algo_config.use_edac:
+            return jnp.array(0.0)
+
+        B, T = loss_calc_m.shape
+        BT = B * T
+        q_all = self.critic_model.apply({'params': critic_params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True)  # (nC, BT, A)
+        nC = q_all.shape[0]
+        q_all = q_all.reshape(nC, B, T, -1)  # (nC, B, T, A)
+        # Move critic axis to end for normalization convenience
+        q_perm = jnp.transpose(q_all, (1, 2, 0, 3))  # (B, T, nC, A)
+        q_norm = jnp.linalg.norm(q_perm, axis=-1, keepdims=True) + 1e-8  # (B, T, nC, 1)
+        q_unit = q_perm / q_norm  # (B, T, nC, A)
+        mean_vec = jnp.mean(q_unit, axis=2)  # (B, T, A)
+        penalty_bt = jnp.sum(mean_vec ** 2, axis=-1)  # (B, T)
+        denom = loss_calc_m.sum() + 1e-8
+        penalty_avg = (penalty_bt * loss_calc_m).sum() / denom
+        scale = self.algo_config.edac_coef / jnp.maximum(1, self.algo_config.n_critics - 1)
+        return scale * penalty_avg
+
     @partial(jax_jit, static_argnames=('self', 'deterministic'))
     def select_action(self, actor_state: TrainState, encoder_params: flax.core.FrozenDict, obs: jnp.ndarray, hidden_state: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]], key: jax.Array, deterministic: bool = False):
         key, dropout_key = jax.random.split(key)
@@ -279,13 +350,13 @@ class RSACAgent:
                 next_probs = nn.softmax(next_logits, axis=-1)
                 next_log_probs = nn.log_softmax(next_logits, axis=-1)
 
-                q_next_all = self.critic_model.apply({'params': critic_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True).reshape(2, B, T, -1)
-                min_q_next = jnp.min(q_next_all, axis=0)
-                v_next = jnp.sum(next_probs * (min_q_next - curr_alpha * next_log_probs), axis=-1)
+                q_next_all = self.critic_model.apply({'params': critic_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), deterministic=True).reshape(self.algo_config.n_critics, B, T, -1)
+                q_next = jnp.median(q_next_all, axis=0)
+                v_next = jnp.sum(next_probs * (q_next - curr_alpha * next_log_probs), axis=-1)
                 target = r + (1.0 - term) * self.algo_config.gamma * v_next
 
                 q_all = self.critic_model.apply({'params': critic_params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=False)
-                q_all = q_all.reshape(2, B, T, -1)
+                q_all = q_all.reshape(self.algo_config.n_critics, B, T, -1)
                 a_idx = a[..., None]
                 a_idx_expanded = a_idx[None, ...] # (1, B, T, 1)
                 q_taken = jnp.take_along_axis(q_all, a_idx_expanded, axis=-1).squeeze(-1)
@@ -293,10 +364,13 @@ class RSACAgent:
                 target_expanded = target[None, ...]
                 mse = (q_taken - target_expanded)**2
                 mse = (mse * loss_calc_m[None, ...]).sum(axis=(1,2)) / (loss_calc_m.sum() + 1e-8)
-                loss = 0.5 * mse.sum()
+                loss = mse.mean()
                 qf1_value_mean = (q_taken[0] * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
                 qf2_value_mean = (q_taken[1] * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
-                return loss, (qf1_value_mean, qf2_value_mean, x_t)
+                # Discrete EDAC-like penalty based on Q-vector alignment across critics
+                edac_penalty = self._compute_edac_penalty_discrete(critic_params, x_t, loss_calc_m) if self.algo_config.use_edac else jnp.array(0.0)
+                loss = loss + edac_penalty
+                return loss, (qf1_value_mean, qf2_value_mean, x_t, edac_penalty)
         else: # continuous
             def critic_loss_fn(critic_params, encoder_params):
                 encoder_params = maybe_freeze_encoder(encoder_params)
@@ -314,26 +388,29 @@ class RSACAgent:
                 log_prob = dist_tp1.log_prob(u)
                 log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(u) ** 2 + 1e-6), axis=-1)
 
-                q_next = self.critic_model.apply({'params': critic_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), action=squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(2, B, T)
-                min_q_next = jnp.min(q_next, axis=0)
-                target = r + (1.0 - term) * self.algo_config.gamma * (min_q_next - curr_alpha * log_prob)
+                q_next_all = self.critic_model.apply({'params': critic_state.target_params}, x_tp1.reshape(-1, x_tp1.shape[-1]), action=squashed_tp1.reshape(-1, squashed_tp1.shape[-1]), deterministic=True).reshape(self.algo_config.n_critics, B, T)
+                q_next = jnp.median(q_next_all, axis=0)
+                target = r + (1.0 - term) * self.algo_config.gamma * (q_next - curr_alpha * log_prob)
 
                 q_cur = self.critic_model.apply({'params': critic_params}, x_t.reshape(-1, x_t.shape[-1]), action=a.reshape(-1, a.shape[-1]), deterministic=False)
-                q_cur = q_cur.reshape(2, B, T)
+                q_cur = q_cur.reshape(self.algo_config.n_critics, B, T)
 
                 target_expanded = target[None, ...]
                 mse = (q_cur - target_expanded)**2
                 mse = (mse * loss_calc_m[None, ...]).sum(axis=(1,2)) / (loss_calc_m.sum() + 1e-8)
-                loss = 0.5 * mse.sum()
+                loss = mse.mean()
                 qf1_value_mean = (q_cur[0] * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
                 qf2_value_mean = (q_cur[1] * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
-                return loss, (qf1_value_mean, qf2_value_mean, x_t)
+                # EDAC penalty (continuous): compute via helper
+                edac_penalty = self._compute_edac_penalty_continuous(critic_params, actor_state.params, x_t, loss_calc_m, key) if self.algo_config.use_edac else jnp.array(0.0)
+                loss = loss + edac_penalty
+                return loss, (qf1_value_mean, qf2_value_mean, x_t, edac_penalty)
 
-        (critic_loss_val, (qf1_value_mean, qf2_value_mean, x_t)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1))(critic_state.params, encoder_state.params)
+        (critic_loss_val, (qf1_value_mean, qf2_value_mean, x_t, edac_penalty_val)), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True, argnums=(0,1))(critic_state.params, encoder_state.params)
         g_critic_params, g_enc_params = critic_grads
         critic_state_new = critic_state.apply_gradients(grads=g_critic_params)
         encoder_state_new = encoder_state.apply_gradients(grads=g_enc_params)
-        return critic_state_new, encoder_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t)
+        return critic_state_new, encoder_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t, edac_penalty_val)
     def _update_actor_and_alpha(self, actor_state: TrainState, critic_state: CriticTrainState, log_alpha_state: Optional[TrainState], curr_alpha: Array, x_t: Array, loss_calc_m: Array, key: Array):
         B, T = loss_calc_m.shape
         if self.is_discrete:
@@ -345,7 +422,7 @@ class RSACAgent:
                 ).reshape(B, T, -1)
                 probs = nn.softmax(logits, axis=-1)
                 log_probs = nn.log_softmax(logits, axis=-1)
-                q_all = self.critic_model.apply({'params': critic_state.params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True).reshape(2, B, T, -1)
+                q_all = self.critic_model.apply({'params': critic_state.params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True).reshape(self.algo_config.n_critics, B, T, -1)
                 min_q = jnp.min(q_all, axis=0)
                 actor_loss_t = jnp.sum(probs * (curr_alpha * log_probs - min_q), axis=-1)
                 actor_loss = (actor_loss_t * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
@@ -366,7 +443,7 @@ class RSACAgent:
                 log_prob = dist.log_prob(u)
                 log_prob -= jnp.sum(jnp.log(1 - jnp.tanh(u) ** 2 + 1e-6), axis=-1)
 
-                q_pi = self.critic_model.apply({'params': critic_state.params}, x_t.reshape(-1, x_t.shape[-1]), action=squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(2, B, T)
+                q_pi = self.critic_model.apply({'params': critic_state.params}, x_t.reshape(-1, x_t.shape[-1]), action=squashed.reshape(-1, squashed.shape[-1]), deterministic=True).reshape(self.algo_config.n_critics, B, T)
                 min_q = jnp.min(q_pi, axis=0)
                 loss_t = (curr_alpha * log_prob - min_q)
                 loss = (loss_t * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
@@ -430,7 +507,7 @@ class RSACAgent:
         else:
             curr_alpha = self.curr_alpha
 
-        critic_state_new, encoder_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t) = self._update_critic(agent_state.actor_state, agent_state.critic_state, agent_state.encoder_state, curr_alpha, obs_cnn, obs_mem, obs_instant, a, r, term, loss_calc_m, key)
+        critic_state_new, encoder_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t, edac_penalty_val) = self._update_critic(agent_state.actor_state, agent_state.critic_state, agent_state.encoder_state, curr_alpha, obs_cnn, obs_mem, obs_instant, a, r, term, loss_calc_m, key)
         # 首次update不更新actor和alpha
         update_actor_and_alpha = agent_state.critic_state.step != 0
         def no_update_aa(actor_state, critic_state, log_alpha_state, curr_alpha, x_t, loss_calc_m, key):
@@ -461,6 +538,7 @@ class RSACAgent:
             'entropy': entropy_val,
             'qf1_value_mean': qf1_value_mean,
             'qf2_value_mean': qf2_value_mean,
+            'edac_penalty': edac_penalty_val,
         }
         return agent_state_new, curr_alpha_new, metrics
 
@@ -491,12 +569,13 @@ class RSACAgent:
                 jnp.array(0.0),  # qf2_mean_sum
                 jnp.array(0.0),  # current_alpha placeholder
                 key_update,
+                jnp.array(0.0),  # edac_penalty_sum
             )
 
             def body_fun(i, carry: CarryType):
                 # 每次更新应使用不同的key
                 (ag_state,
-                 cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha, key_update_in) = carry
+                 cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha, key_update_in, edac_sum) = carry
                 key_update_i, key_update_out = jax.random.split(key_update_in)
                 b = {
                     'o': batches['o'][i],
@@ -537,11 +616,12 @@ class RSACAgent:
                 ent_sum = ent_sum + metric_i['entropy']
                 qf1m_sum = qf1m_sum + metric_i['qf1_value_mean']
                 qf2m_sum = qf2m_sum + metric_i['qf2_value_mean']
+                edac_sum = edac_sum + metric_i.get('edac_penalty', jnp.array(0.0))
                 return (ag_state_n,
-                        cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha_n, key_update_out)
+                        cl_sum, al_sum, aloss_sum, ent_sum, qf1m_sum, qf2m_sum, cur_alpha_n, key_update_out, edac_sum)
 
             (updated_agent_state,
-             critic_loss_sum, actor_loss_sum, alpha_loss_sum, entropy_sum, qf1_mean_sum, qf2_mean_sum, curr_alpha, _) = \
+             critic_loss_sum, actor_loss_sum, alpha_loss_sum, entropy_sum, qf1_mean_sum, qf2_mean_sum, curr_alpha, _, edac_penalty_sum) = \
                 jax.lax.fori_loop(0, num_updates, body_fun, init_carry)
 
             kf = jnp.maximum(1, num_updates)
@@ -553,6 +633,7 @@ class RSACAgent:
                 'entropy': entropy_sum / kf,
                 'qf1_value_mean': qf1_mean_sum / kf,
                 'qf2_value_mean': qf2_mean_sum / kf,
+                'edac_penalty': edac_penalty_sum / kf,
             }
         else:
             updated_agent_state = agent_state.replace(rsnorm_state=updated_rsnorm_state)

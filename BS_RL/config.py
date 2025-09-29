@@ -75,8 +75,13 @@ class AlgoConfig:
     adam_eps: float = 1e-4 # CleanRL used 1e-4 for PyTorch Adam, default optax Adam is 1e-8.
     use_SGD: bool = False
     """whether to use SGD instead of AdamW"""
-    n_critics: int = 2
+    n_critics: int = 20
     """number of critics"""
+    # EDAC (Ensemble Diversification Actor-Critic)
+    use_edac: bool = True
+    """Enable EDAC gradient diversification regularization for critics (continuous control)."""
+    edac_coef: float = 1.0
+    """EDAC regularization coefficient (eta). Scales ||mean_grad_a Q||^2 penalty."""
     # RSAC-share specific
     rb_seg_len: int = int(1440*7)
     """Segment length for replay buffer."""
