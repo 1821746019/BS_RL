@@ -3,7 +3,8 @@ import os
 import copy
 from dataclasses import dataclass
 from typing import Optional
-from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
+from gymnasium.vector import AsyncVectorEnv
+from .common import BS_SyncVectorEnv as SyncVectorEnv
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -16,6 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
 from .SACAgent import AgentState
+from TradingEnv.wrappers import ObsWrapper
 @dataclass
 class Evaluator:
     agent: RSACAgent
@@ -126,6 +128,10 @@ class Evaluator:
         self.eval_envs.close()
         
 def eval(args: Args, ckpt_dir: Path):
+    args.eval.env_num = 8
+    args.eval.eval_episodes = 8
+    args.env.trading_env_config.mode = "test"
+    args.env.trading_env_config.test_episode_days = 360
     vec_env_cls = AsyncVectorEnv if args.eval.async_vector_env else SyncVectorEnv
     envs = vec_env_cls(
         [env_maker(
@@ -136,6 +142,8 @@ def eval(args: Args, ckpt_dir: Path):
             tickers_per_env=args.env.tickers_per_env
         ) for i in range(args.env.env_num)]
     )
+    env: ObsWrapper = envs.envs[0]
+    args.env.obs_split_fn = env.obs_split_fn
     agent = RSACAgent(
             obs_space=envs.single_observation_space,
             action_space=envs.single_action_space,
@@ -143,14 +151,18 @@ def eval(args: Args, ckpt_dir: Path):
             algo_config=args.algo,
             obs_split_fn=args.env.obs_split_fn,
         )
-    logger = MetricLogger()
-    restore_target = {'agent_state': None}
-    loaded_contents = checkpoints.restore_checkpoint(
-                    ckpt_dir=ckpt_dir,
-                    target=restore_target,
-                    prefix="ckpt_step_"
+    logger = MetricLogger(False)
+    # The template for the checkpoint to restore.
+    # This is a pytree of the same structure as the checkpoint.
+    restore_template = {'agent_state': agent.agent_state}
+    restored_data = checkpoints.restore_checkpoint(
+        ckpt_dir=ckpt_dir,
+        target=restore_template,
+        prefix="ckpt_step_"
     )
-    agent_state = cast(AgentState, loaded_contents['agent_state'])
+    if restored_data is None:
+        raise FileNotFoundError(f"No checkpoint found at {ckpt_dir}")
+    agent_state = cast(AgentState, restored_data['agent_state'])
     print(f"Agent states restored from {ckpt_dir}.")
     
     evaluator = Evaluator(agent, args.env, args.eval, logger)

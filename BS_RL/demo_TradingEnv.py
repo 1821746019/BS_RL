@@ -5,6 +5,7 @@ import gymnasium as gym
 from BS_RL.config import Args, EnvConfig, AlgoConfig, WandbConfig, TrainConfig, EvalConfig, NetworkConfig
 from BS_RL.nn.ResMLP import ResMLPConfig, ResidualStrategy
 from BS_RL.train import train
+from BS_RL.eval import eval
 from TradingEnv import TradingEnvConfig
 from TradingEnv.feature.norm_OHLCV import feat_getter_v2
 from TradingEnv.Config import ExtraStateFlag
@@ -172,4 +173,6 @@ if __name__ == "__main__":
     print(f"总步数: {args.algo.total_timesteps:,}")
     print(f"批次大小: {args.algo.batch_size}")
     print(f"学习开始步数: {args.algo.learning_starts:,}")
-    train(args)
+    ckpt_dir = r"/root/project/third_party/BS_RL/runs/SAC_TradingEnv/ckpts/ckpt_step_9999968"
+    eval(args, ckpt_dir)
+    # train(args)
