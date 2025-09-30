@@ -75,19 +75,19 @@ class AlgoConfig:
     adam_eps: float = 1e-4 # CleanRL used 1e-4 for PyTorch Adam, default optax Adam is 1e-8.
     use_SGD: bool = False
     """whether to use SGD instead of AdamW"""
-    n_critics: int = 20
+    n_critics: int = 8
     """number of critics"""
     # EDAC (Ensemble Diversification Actor-Critic)
-    use_edac: bool = False
+    use_edac: bool = True
     """Enable EDAC gradient diversification regularization for critics (continuous control)."""
     edac_coef: float = 1.0
     """EDAC regularization coefficient (eta). Scales ||mean_grad_a Q||^2 penalty."""
     # SUNRISE components
-    use_sunrise_weighted_backup: bool = False
+    use_sunrise_weighted_backup: bool = True
     """Enable SUNRISE Weighted Bellman Backups (weights by target std across critics)."""
     sunrise_wbb_temperature: float = 10.0
     """Temperature T in w(s,a)=sigmoid(-std*T)+0.5; larger T sharpens down-weighting."""
-    use_sunrise_ucb: bool = True
+    use_sunrise_ucb: bool = False
     """Enable SUNRISE UCB exploration for discrete actions at interaction time."""
     sunrise_ucb_lambda: float = 1.0
     """UCB bonus scale lambda for Q_mean + lambda * Q_std action selection (discrete)."""
