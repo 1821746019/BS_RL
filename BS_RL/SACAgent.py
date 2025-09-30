@@ -374,7 +374,7 @@ class RSACAgent:
                 v_next = jnp.sum(next_probs * (q_next - curr_alpha * next_log_probs), axis=-1)
                 target = r + (1.0 - term) * self.algo_config.gamma * v_next
 
-                q_all = self.critic_model.apply({'params': critic_params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=False)
+                q_all = self.critic_model.apply({'params': critic_params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=False, rngs={'dropout': dropout_key})
                 q_all = q_all.reshape(self.algo_config.n_critics, B, T, -1)
                 a_idx = a[..., None]
                 a_idx_expanded = a_idx[None, ...] # (1, B, T, 1)
@@ -424,7 +424,7 @@ class RSACAgent:
                 q_next = jnp.median(q_next_all, axis=0)
                 target = r + (1.0 - term) * self.algo_config.gamma * (q_next - curr_alpha * log_prob)
 
-                q_cur = self.critic_model.apply({'params': critic_params}, x_t.reshape(-1, x_t.shape[-1]), action=a.reshape(-1, a.shape[-1]), deterministic=False)
+                q_cur = self.critic_model.apply({'params': critic_params}, x_t.reshape(-1, x_t.shape[-1]), action=a.reshape(-1, a.shape[-1]), deterministic=False, rngs={'dropout': dropout_key})
                 q_cur = q_cur.reshape(self.algo_config.n_critics, B, T)
 
                 # SUNRISE Weighted Bellman Backups
@@ -456,12 +456,14 @@ class RSACAgent:
         return critic_state_new, encoder_state_new, (critic_loss_val, qf1_value_mean, qf2_value_mean, x_t, edac_penalty_val)
     def _update_actor_and_alpha(self, actor_state: TrainState, critic_state: CriticTrainState, log_alpha_state: Optional[TrainState], curr_alpha: Array, x_t: Array, loss_calc_m: Array, key: Array):
         B, T = loss_calc_m.shape
+        key, dropout_key = jax.random.split(key)
         if self.is_discrete:
             def actor_loss_fn(actor_params):
                 logits = self.actor_model.apply(
                     {'params': actor_params},
                     x_t.reshape(-1, x_t.shape[-1]),
                     deterministic=False,
+                    rngs={'dropout': dropout_key}
                 ).reshape(B, T, -1)
                 probs = nn.softmax(logits, axis=-1)
                 log_probs = nn.log_softmax(logits, axis=-1)
@@ -477,6 +479,7 @@ class RSACAgent:
                     {'params': actor_params},
                     x_t.reshape(-1, x_t.shape[-1]),
                     deterministic=False,
+                    rngs={'dropout': dropout_key}
                 )
                 mean = mean.reshape(B, T, -1)
                 log_std = log_std.reshape(B, T, -1)
