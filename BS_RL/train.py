@@ -29,7 +29,6 @@ from BS_RL.eval import Evaluator
 from TradingEnv import DataLoader, DataLoaderConfig, wrappers
 from BS_RL.replay_buffer import RecurrentReplayBuffer
 import wandb
-import optax
 from typing import Optional
 
 def count_params(params):
@@ -48,7 +47,6 @@ class Trainer:
         self.agent : RSACAgent
         self.rb: RecurrentReplayBuffer
         self.agent_state: AgentState
-        self.current_alpha: jnp.ndarray
         self.data_loader: DataLoader
         self.evaluator: Evaluator
         self.logger: MetricLogger
@@ -180,26 +178,14 @@ class Trainer:
         self.args.env.obs_split_fn = env.obs_split_fn
             
     def _setup_agent(self):
-        if self.is_discrete:
-            action_dim = self.envs.single_action_space.n # type: ignore
-            print(f"Discrete action space detected with action dim: {action_dim}")
-        else:
-            action_dim = self.envs.single_action_space.shape[0] # type: ignore
-
-        dummy_obs = np.zeros(self.obs_shape, dtype=self.envs.single_observation_space.dtype)
-        key_agent, self.jax_key = jax.random.split(self.jax_key)
         self.agent = RSACAgent(
-            action_dim=action_dim,
-            key=key_agent,
+            obs_space=self.envs.single_observation_space,
+            action_space=self.envs.single_action_space,
             network_config=self.args.network,
             algo_config=self.args.algo,
-            is_discrete=self.is_discrete,
             obs_split_fn=self.args.env.obs_split_fn,
-            dummy_obs=dummy_obs
         )
         self.agent_state = self.agent.agent_state
-        self.current_alpha = self.agent.curr_alpha
-
         # initialize per-env hidden states
         self.hidden_state = None
 
@@ -385,7 +371,7 @@ class Trainer:
             actor_state_eval=self.agent_state.actor_state,
             encoder_params_eval=self.agent_state.encoder_state.params,
             rsnorm_state_eval=self.agent_state.rsnorm_state,
-            current_train_step=current_step
+            curr_train_step=current_step
         )
         
         tqdm.write(f"Evaluation at step {current_step}: {eval_metrics}")

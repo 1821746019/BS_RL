@@ -1,3 +1,4 @@
+import gymnasium as gym
 import jax, jax.numpy as jnp
 from jax import Array
 import flax.core
@@ -41,21 +42,27 @@ class AgentState:
 CarryType = tuple[AgentState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
 class RSACAgent:
     def __init__(self,
-                 action_dim: int,
-                 key: jax.Array,
-                 network_config: NetworkConfig,
-                 algo_config: AlgoConfig,
-                 is_discrete: bool,
-                 obs_split_fn: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]],
-                 dummy_obs: np.ndarray,
-                 norm_limit: float = MAX_NORM):
+                obs_space: gym.Space,
+                action_space: gym.Space,
+                network_config: NetworkConfig,
+                algo_config: AlgoConfig,
+                obs_split_fn: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]],
+                norm_limit: float = MAX_NORM, 
+                key: jax.Array = jax.random.PRNGKey(0)
+                ):
+        dummy_obs = np.zeros(obs_space.shape, dtype=obs_space.dtype)
+        if isinstance(action_space, gym.spaces.Discrete):
+            self.action_dim = action_space.n
+        elif isinstance(action_space, gym.spaces.Box):
+            self.action_dim = int(np.prod(action_space.shape))
+        else:
+            raise NotImplementedError(f"Unsupported action space type: {type(action_space)}")
         self.actor_model: nn.Module
         self.critic_model: nn.Module
         self.algo_config = algo_config
-        self.action_dim = action_dim
         self.network_config = network_config
         self.norm_limit = norm_limit
-        self.is_discrete = is_discrete
+        self.is_discrete = isinstance(action_space, gym.spaces.Discrete)
         self.obs_split_fn = obs_split_fn
         key_actor, key_critic, key_encoder, key_rsnorm, key_log_alpha = jax.random.split(key, 5)
 
@@ -269,37 +276,34 @@ class RSACAgent:
         )
         summary_t = outputs[:, -1, :] if outputs is not None else None
         x = concat_valid([summary_t, obs_instant], axis=-1)
-        det_flag = jnp.asarray(deterministic)
-
         if self.is_discrete:
             logits = self.actor_model.apply({'params': actor_state.params}, x, deterministic=True)
 
-            def ucb_policy(k):
-                assert critic_params is not None
+            def ucb_policy():
                 q_all = self.critic_model.apply({'params': critic_params}, x, deterministic=True)
                 q_std = jnp.std(q_all, axis=0)
                 ucb_logits = logits + self.algo_config.sunrise_ucb_lambda * q_std
-                return jax.random.categorical(k, ucb_logits, axis=-1)
+                return jax.random.categorical(key, ucb_logits, axis=-1)
 
-            def standard_policy(k):
-                def take_argmax(_):
+            def standard_policy():
+                def take_argmax():
                     return jnp.argmax(logits, axis=-1)
-                def take_sample(kk):
-                    return jax.random.categorical(kk, logits, axis=-1)
-                return jax.lax.cond(det_flag, take_argmax, take_sample, k)
+                def take_sample():
+                    return jax.random.categorical(key, logits, axis=-1)
+                return jax.lax.cond(deterministic, take_argmax, take_sample)
 
             # UCB exploration is only active during training/exploration (non-deterministic)
-            use_ucb_flag = self.algo_config.use_sunrise_ucb & jnp.logical_not(det_flag)
-            actions = jax.lax.cond(use_ucb_flag, ucb_policy, standard_policy, key)
+            use_ucb_flag = self.algo_config.use_sunrise_ucb and not deterministic
+            actions = ucb_policy() if use_ucb_flag else standard_policy()
             return actions, new_hidden_state
         else:
             mean, log_std = self.actor_model.apply({'params': actor_state.params}, x, deterministic=True)
             dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
-            def take_mean(k):
+            def take_mean():
                 return dist.mean()
-            def take_sample(k):
-                return dist.sample(seed=k)
-            actions = jax.lax.cond(det_flag, take_mean, take_sample, key)
+            def take_sample():
+                return dist.sample(seed=key)
+            actions = jax.lax.cond(deterministic, take_mean, take_sample)
             squashed = jnp.tanh(actions)
             return squashed, new_hidden_state
 
