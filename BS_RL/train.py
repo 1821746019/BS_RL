@@ -259,7 +259,6 @@ class Trainer:
             agent=self.agent,
             env_config=self.args.env,
             eval_config=self.args.eval,
-            run_name_suffix=self.run_name_suffix,
             logger=self.logger,
             seed=self.args.train.seed + self.args.env.env_num + 1 # 训练VectorEnv中env的seed依次是arange(seed, seed + i)
         )
@@ -443,9 +442,6 @@ class Trainer:
 
 
 def train(args: Args):
-    if args.train.jax_platform_name:
-        jax.config.update('jax_platform_name', args.train.jax_platform_name)
-    
     trainer = Trainer(args)
     trainer.setup()
     trainer.train()

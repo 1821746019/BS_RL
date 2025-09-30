@@ -14,13 +14,11 @@ class Evaluator:
                  agent: RSACAgent,
                  env_config: EnvConfig,
                  eval_config: EvalConfig,
-                 run_name_suffix: str,
                  seed: int,
                  logger: MetricLogger):
         self.agent = agent
         self.env_config = env_config
         self.eval_config = eval_config
-        self.run_name_suffix = run_name_suffix
         self.seed = seed
         self.logger = logger
         self.env_config.trading_env_config = copy.deepcopy(self.env_config.trading_env_config)

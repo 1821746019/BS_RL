@@ -249,7 +249,7 @@ class RSACAgent:
         return scale * penalty_avg
 
     @partial(jax_jit, static_argnames=('self', 'deterministic'))
-    def select_action(self, actor_state: TrainState, critic_params: flax.core.FrozenDict, encoder_params: flax.core.FrozenDict, obs: jnp.ndarray, hidden_state: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]], key: jax.Array, deterministic: bool = False):
+    def select_action(self, actor_state: TrainState, critic_params: Optional[flax.core.FrozenDict], encoder_params: flax.core.FrozenDict, obs: jnp.ndarray, hidden_state: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]], key: jax.Array, deterministic: bool = False):
         key, dropout_key = jax.random.split(key)
         # 若obs的shape为(B,)，需增加一个轴。也就是把标量视为1d数组
         if len(obs.shape) == 1: obs = obs[:, None]
@@ -275,6 +275,7 @@ class RSACAgent:
             logits = self.actor_model.apply({'params': actor_state.params}, x, deterministic=True)
 
             def ucb_policy(k):
+                assert critic_params is not None
                 q_all = self.critic_model.apply({'params': critic_params}, x, deterministic=True)
                 q_std = jnp.std(q_all, axis=0)
                 ucb_logits = logits + self.algo_config.sunrise_ucb_lambda * q_std
@@ -316,7 +317,7 @@ class RSACAgent:
 
         actions, new_hidden_state = self.select_action(
             actor_state,
-            self.agent_state.critic_state.params,
+            None, 
             encoder_params,
             norm_obs,
             hidden_state,
