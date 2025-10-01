@@ -504,7 +504,7 @@ class RSACAgent:
         curr_alpha_new = curr_alpha # 没autotune时alpha值是固定的
         if self.algo_config.autotune:
             if self.is_discrete:
-                logits_det = self.actor_model.apply({'params': actor_state.params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True).reshape(B, T, -1)
+                logits_det = self.actor_model.apply({'params': actor_state_new.params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True).reshape(B, T, -1)
                 log_probs_det = nn.log_softmax(logits_det, axis=-1)
                 probs_det = nn.softmax(logits_det, axis=-1)
                 def alpha_loss_fn(log_alpha_params):
@@ -514,7 +514,7 @@ class RSACAgent:
                     loss = (jnp.sum(loss_t, axis=-1) * loss_calc_m).sum() / (loss_calc_m.sum() + 1e-8)
                     return loss
             else: # continuous
-                mean_det, log_std_det = self.actor_model.apply({'params': actor_state.params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True)
+                mean_det, log_std_det = self.actor_model.apply({'params': actor_state_new.params}, x_t.reshape(-1, x_t.shape[-1]), deterministic=True)
                 mean_det = mean_det.reshape(B, T, -1)
                 log_std_det = log_std_det.reshape(B, T, -1)
                 dist_det = tfd.MultivariateNormalDiag(loc=mean_det, scale_diag=jnp.exp(log_std_det))
