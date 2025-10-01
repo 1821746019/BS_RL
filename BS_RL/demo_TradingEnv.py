@@ -174,5 +174,5 @@ if __name__ == "__main__":
     print(f"批次大小: {args.algo.batch_size}")
     print(f"学习开始步数: {args.algo.learning_starts:,}")
     ckpt_dir = r"/root/project/third_party/BS_RL/runs/SAC_TradingEnv/ckpts/ckpt_step_9999968"
-    eval(args, ckpt_dir)
-    # train(args)
+    # eval(args, ckpt_dir)
+    train(args)

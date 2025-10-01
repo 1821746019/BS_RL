@@ -1,7 +1,7 @@
 from flax.training import checkpoints
 import os
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 from gymnasium.vector import AsyncVectorEnv
 from .common import BS_SyncVectorEnv as SyncVectorEnv
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import cast
 from .SACAgent import AgentState
 from TradingEnv.wrappers import ObsWrapper
+from TradingEnv import Ticker
 @dataclass
 class Evaluator:
     agent: RSACAgent
@@ -136,9 +137,9 @@ def eval(args: Args, ckpt_dir: Path):
     envs = vec_env_cls(
         [env_maker(
             config=args.env.trading_env_config,
-            data_loader_cfg=args.env.data_loader_cfg,
+            data_loader_cfg=replace(args.env.data_loader_cfg, tickers=list(Ticker)[i%len(list(Ticker))]),
             feat_getter=args.env.feat_getter,
-            random_choose_tickers= args.env.env_num > 1,
+            random_choose_tickers= False,
             tickers_per_env=args.env.tickers_per_env
         ) for i in range(args.env.env_num)]
     )
