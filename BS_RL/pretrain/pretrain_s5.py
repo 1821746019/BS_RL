@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import wandb
-from typing import Optional
+from typing import Optional, Callable
 from tqdm.auto import tqdm
 from BS_RL.nn.s5 import S5Summarizer
 from flax.training import checkpoints
@@ -19,10 +19,10 @@ from functools import partial
 class AutoencoderConfig:
     channel_dim: int = 5 # HLCV+Delta
     latent_dim: int = 36
-    encoder_hidden_dim: int = 1024
-    encoder_num_layers: int = 3
-    decoder_hidden_dim: int = 1536
-    decoder_num_layers: int = 4
+    encoder_hidden_dim: int = 768
+    encoder_num_layers: int = 2
+    decoder_hidden_dim: int = 1024
+    decoder_num_layers: int = 2
 @dataclass
 class PretrainConfig:
     autoencoder_cfg: AutoencoderConfig = field(default_factory=lambda: AutoencoderConfig())
@@ -98,19 +98,22 @@ def add_noise(batch:jnp.ndarray, noise_std: float, mask_prob: float, key:jnp.nda
         mask = jax.random.bernoulli(k1, p=mask_prob, shape=batch.shape)
         noisy = jnp.where(mask, 0.0, noisy)
     return noisy
+def autoencoder_forward(params:dict, apply_fn:Callable, batch:jnp.ndarray, seq_len: Optional[int]=None):
+    recon, latent = apply_fn({"params": params}, batch, seq_len)
+    # recon形状: [B, min(T, seq_len), C]，只和batch的最后几个时刻比较
+    recon_len = batch.shape[1] if seq_len is None else seq_len # 如果seq_len为None，则使用batch的实际长度
+    batch_truncated = batch[:, -recon_len:, :]
+    loss = jnp.mean(jnp.square(recon - batch_truncated))
+    return loss, (recon, latent)
 @partial(jax_jit, static_argnames=("seq_len",))
 def train_step(state:TrainState, batch:jnp.ndarray, seq_len: Optional[int]=None):
     def loss_fn(params):
-        recon, latent = state.apply_fn({"params": params}, batch, seq_len)
-        # recon形状: [B, min(T, seq_len), C]，只和batch的最后几个时刻比较
-        recon_len = recon.shape[1]
-        batch_truncated = batch[:, -recon_len:, :]
-        loss = jnp.mean(jnp.square(recon - batch_truncated))
+        loss, (recon, latent) = autoencoder_forward(params, state.apply_fn, batch, seq_len)
         return loss, (recon, latent)
     (loss, (recon, latent)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state_new = state.apply_gradients(grads=grads)
     return state_new, loss
-@partial(jax_jit, static_argnames=("seq_len", "noise_std", "mask_prob"))
+@partial(jax_jit, static_argnames=("seq_len", "mask_prob"))
 def train_step_denoise(state:TrainState, batch:jnp.ndarray, seq_len: Optional[int], key:jnp.ndarray, noise_std: float, mask_prob: float):
     key, key_new = jax.random.split(key)
     batch = add_noise(batch, noise_std=noise_std, mask_prob=mask_prob, key=key)
@@ -118,12 +121,9 @@ def train_step_denoise(state:TrainState, batch:jnp.ndarray, seq_len: Optional[in
     return state_new, loss, key_new
 @partial(jax_jit, static_argnames=("seq_len",))
 def eval_step(state:TrainState, batch:jnp.ndarray, seq_len: Optional[int]=None):
-    recon, latent = state.apply_fn({"params": state.params}, batch, seq_len)
-    # recon形状: [B, min(T, seq_len), C]，只和batch的最后几个时刻比较
-    recon_len = recon.shape[1]
-    batch_truncated = batch[:, -recon_len:, :]
-    loss = jnp.mean(jnp.square(recon - batch_truncated))
-    return loss, recon, latent
+    loss, (recon, latent) = autoencoder_forward(state.params, state.apply_fn, batch, seq_len)
+    return loss, (recon, latent)
+
 def pretrain_s5(args: PretrainConfig):
     model = Autoencoder(args.autoencoder_cfg)
     key = jax.random.PRNGKey(args.seed)
@@ -139,9 +139,9 @@ def pretrain_s5(args: PretrainConfig):
     for step in tqdm(range(args.steps)):
         batch = jax.random.normal(key, (args.batch_size, args.seq_len_m, args.autoencoder_cfg.channel_dim))
         state, loss, key = train_step_denoise(state, batch, seq_len=args.seq_len_m, key=key, noise_std=args.noise_std, mask_prob=args.mask_prob)
+        wandb.log({"loss": loss})
         if step % args.save_freq == 0:
             print(f"Step {step}, Loss: {loss}")
-            wandb.log({"loss": loss})
             checkpoints.save_checkpoint(os.path.abspath(args.save_dir), state, step=step, keep=10, overwrite=True)
     return state
 if __name__ == "__main__":
