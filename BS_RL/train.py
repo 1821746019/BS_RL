@@ -30,9 +30,7 @@ from TradingEnv import DataLoader, DataLoaderConfig, wrappers
 from BS_RL.replay_buffer import RecurrentReplayBuffer
 import wandb
 from typing import Optional
-
-def count_params(params):
-    return sum(x.size for x in jax.tree_util.tree_leaves(params))
+from BS_RL.jax_utils import count_params
 class Trainer:
     def __init__(self, args: Args):
         self.args = args

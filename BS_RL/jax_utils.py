@@ -4,3 +4,6 @@ import jax
 def concat_valid(arrays: list[None|jnp.ndarray], axis: int | None = 0,  dtype: jax.typing.DTypeLike | None = None):
     filtered = [ arr for arr in arrays if arr is not None and arr.size > 0 ]
     return jnp.concatenate(filtered, axis=axis, dtype=dtype)
+
+def count_params(params):
+    return sum(x.size for x in jax.tree_util.tree_leaves(params))
