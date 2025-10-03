@@ -163,29 +163,32 @@ def data_gen(batch_size: int, seq_len_upper: int, data_loader: DataLoader):
         batch = data_loader.tickers_features[time_idxs, ticker_idxs[:, None], :]
         
         yield batch
-def sim_data_gen(seq_len: int, data_loader: DataLoader):
-    """
-    输出batch.shape = (batch_size, seq_len, features_dim)
-    """
-    batch_size = data_loader.num_tickers
-    while True:
-        
+@dataclass
+class DataGen:
+    data_loader: DataLoader
+    max_seq_len: int
+    curr_idx: int = field(init=False)
+    def random_idx(self, size: int):
+        return np.random.randint(self.data_loader.min_idx, self.data_loader.max_idx - self.max_seq_len + 1, size=size)
+    def __post_init__(self):
+        self.curr_idx = self.random_idx(self.batch_size)
+    @property
+    def batch_size(self):
+        return self.data_loader.num_tickers
+    def __call__(self, seq_len: int):
+        reset = np.where(self.curr_idx > self.data_loader.max_idx - self.max_seq_len, True, False)
+        self.curr_idx[reset] = self.random_idx(reset.sum())
         # 向量化采样：一次性为所有batch样本生成索引
-        ticker_idxs = np.arange(batch_size)
-        start_idxs = np.random.randint(data_loader.min_idx, data_loader.max_idx - seq_len + 1, size=batch_size)
-        
+        ticker_idxs = np.arange(self.batch_size)
         # 使用高级索引提取所有序列
         # 构建索引数组：对每个样本生成 [start:start+seq_len] 的索引
-        time_idxs = start_idxs[:, None] + np.arange(seq_len)[None, :]  # [batch_size, seq_len]
+        time_idxs = self.curr_idx[:, None] + np.arange(seq_len)[None, :]  # [batch_size, seq_len]
         
         # 一次性提取所有样本: [batch_size, seq_len, features_dim]
-        batch = data_loader.tickers_features[time_idxs, ticker_idxs[:, None], :]
-        
-        yield batch
-def setup_data_gen(data_loader_cfg: DataLoaderConfig, timerange: tuple[str,str], seq_len: int):
-    data_loader = DataLoader(data_loader_cfg, feat_getter_with_norm)
-    data_loader.setup(timerange)
-    return sim_data_gen(seq_len=seq_len, data_loader=data_loader)
+        batch = self.data_loader.tickers_features[time_idxs, ticker_idxs[:, None], :]
+        self.curr_idx += seq_len
+        return batch, reset
+
 def test_compile(state:TrainState, key:jnp.ndarray, args: PretrainConfig):
     # 测试不同 seq_len 的编译时间
     print("Testing compilation time for different seq_len values...")
@@ -214,14 +217,19 @@ def pretrain_s5(args: PretrainConfig):
     print(f"编码器参数量: {encoder_p_count / 1e6:.2f}M")
     print(f"解码器参数量: {decoder_p_count / 1e6:.2f}M")
     print(f"总参数量: {total_p_count / 1e6:.2f}M")
-    data_gen = setup_data_gen(DataLoaderConfig(), TradingEnvConfig.train_timerange, args.seq_len_m)
+    data_loader = DataLoader(args.train_data_loader_cfg, feat_getter_with_norm)
+    data_loader.setup(TradingEnvConfig.train_timerange)
+    data_gen = DataGen(data_loader, args.seq_len_m)
     # test_compile(state, key, args)
     print("\nStarting normal training...")
-    hidden = None
+    hidden = None # 经过forward后变为(L, B, H)
     for epoch in tqdm(range(1, args.num_epochs + 1), desc="epoch"):
         num_batches = 4*365*1440//args.seq_len_m # 4年的数据，每个batch会用3天
-        for iter in tqdm(range(num_batches), desc=f"{epoch}, iter", leave=False): 
-            batch = next(data_gen)
+        for iter in tqdm(range(num_batches), desc=f"Epoch{epoch}-Iter", leave=False): 
+            batch, reset = data_gen(args.seq_len_m)
+            # 对于reset的样本，将其hidden状态清零。reset: (B,), hidden: (L, B, H)
+            if hidden is not None:
+                hidden = jnp.where(reset.reshape(1, -1, 1), 0.0, hidden)
             start_time = time.time()
             state, loss, key, hidden = train_step_denoise(state, batch, seq_len=args.seq_len_m, key=key, noise_std=args.noise_std, mask_prob=args.mask_prob, hidden=hidden)
             end_time = time.time()
@@ -230,7 +238,7 @@ def pretrain_s5(args: PretrainConfig):
             if epoch == 1 and iter == 0:
                 print(f"首次Compile+Run耗时: {end_time - start_time:.1f}s")
            
-        print(f"Epoch {epoch}, Loss: {loss_value:.6f}")
+        print(f"\nEpoch {epoch}, Loss: {loss_value:.6f}")
         checkpoints.save_checkpoint(os.path.abspath(args.save_dir), state, step=epoch, keep=50, overwrite=True)
     return state
 if __name__ == "__main__":
