@@ -72,14 +72,11 @@ class Decoder(nn.Module):
         last_latent: [B, latent_dim]
         recon: [B, seq_len, out_dim]
         """
-        # latent转为hidden
-        batch_size = last_latent.shape[0]
-        hidden = nn.Dense(self.num_layers * self.hidden_dim)(last_latent) # [B, H * L]
-        hidden = hidden.reshape(batch_size, self.num_layers, self.hidden_dim) # [B, L, H]
-        hidden = jnp.transpose(hidden, (1, 0, 2)) # [L, B, H]
-        # 用零输入展开seq_len步
-        zeros = jnp.zeros((batch_size, seq_len, self.hidden_dim))
-        outputs, _ = S5Summarizer(self.hidden_dim, self.num_layers)(zeros, hidden) # [B, seq_len, H]
+        # last_latent作为每个时间步的输入：将last_latent重复到每个时间步: [B, latent_dim] -> [B, seq_len, latent_dim]
+        last_latent = jnp.tile(last_latent[:, None, :], (1, seq_len, 1))
+   
+        hidden = None
+        outputs, _ = S5Summarizer(self.hidden_dim, self.num_layers)(last_latent, hidden) # [B, seq_len, H]
         recon = nn.Dense(self.out_dim)(outputs) # [B, seq_len, out_dim]
         return recon
 class Autoencoder(nn.Module):
@@ -221,9 +218,9 @@ def pretrain_s5(args: PretrainConfig):
     # test_compile(state, key, args)
     print("\nStarting normal training...")
     hidden = None
-    for epoch in tqdm(range(1, args.num_epochs + 1)):
+    for epoch in tqdm(range(1, args.num_epochs + 1), desc="epoch"):
         num_batches = 4*365*1440//args.seq_len_m # 4年的数据，每个batch会用3天
-        for iter in tqdm(range(num_batches)): 
+        for iter in tqdm(range(num_batches), desc=f"{epoch}, iter", leave=False): 
             batch = next(data_gen)
             start_time = time.time()
             state, loss, key, hidden = train_step_denoise(state, batch, seq_len=args.seq_len_m, key=key, noise_std=args.noise_std, mask_prob=args.mask_prob, hidden=hidden)
