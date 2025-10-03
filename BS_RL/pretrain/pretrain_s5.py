@@ -32,19 +32,19 @@ class PretrainConfig:
     autoencoder_cfg: AutoencoderConfig = field(default_factory=lambda: AutoencoderConfig())
     noise_std: float = 0.01
     mask_prob: float = 0.01
-    steps: int = 100000
+    num_epochs: int = 10
     batch_size: int = 8 # 128会耗187G内存，改用8，消耗的内存约为12G
     seq_len_m: int = 1440*3 # 3 days
     num_buckets: int = 5 # 不同的seq_len会触发重编译，需将batch填充到最近的bucket
     train_data_loader_cfg: DataLoaderConfig = field(default_factory=lambda: DataLoaderConfig())
     eval_data_loader_cfg: DataLoaderConfig = field(default_factory=lambda: DataLoaderConfig())
-    lr: float = 1e-3
+    lr: float = 1e-4
     save_freq_pct: float = 0.1
     run_name: str = "S5SDAE"
     seed: int = 996
     
     def __post_init__(self):
-        self.save_freq = int(self.steps * self.save_freq_pct)
+        self.save_freq = int(self.num_epochs * self.save_freq_pct)
         self.save_dir = f"runs/{self.run_name}"
 class Encoder(nn.Module):
     num_layers: int
@@ -115,14 +115,14 @@ def autoencoder_forward(params:dict, apply_fn:Callable, batch:jnp.ndarray, seq_l
     recon_len = min(batch.shape[1], seq_len)
     batch_truncated = batch[:, -recon_len:, :]
     recon_truncated = recon[:, -recon_len:, :]
-    loss = jnp.mean(jnp.square(recon_truncated - batch_truncated))
-    return loss, (recon, latent, hidden)
-
+    return recon, latent, hidden
+def mse_loss(batch:jnp.ndarray, recon:jnp.ndarray):
+    return jnp.mean(jnp.square(recon - batch))
 @partial(jax_jit, static_argnames=("seq_len",))
 def train_step(state:TrainState, batch:jnp.ndarray, seq_len: int, hidden:Optional[jnp.ndarray]=None):
     def loss_fn(params, hidden):
-        loss, (recon, latent, hidden) = autoencoder_forward(params, state.apply_fn, batch, seq_len, hidden)
-        return loss, (recon, latent, hidden)
+        recon, latent, hidden = autoencoder_forward(params, state.apply_fn, batch, seq_len, hidden)
+        return mse_loss(batch, recon), (recon, latent, hidden)
     (loss, (recon, latent, hidden)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, hidden)
     state_new = state.apply_gradients(grads=grads)
     return state_new, loss, hidden
@@ -130,14 +130,19 @@ def train_step(state:TrainState, batch:jnp.ndarray, seq_len: int, hidden:Optiona
 @partial(jax_jit, static_argnames=("seq_len", "mask_prob"))
 def train_step_denoise(state:TrainState, batch:jnp.ndarray, seq_len: int, key:jnp.ndarray, noise_std: float, mask_prob: float, hidden:Optional[jnp.ndarray]=None):
     key, key_new = jax.random.split(key)
-    batch = add_noise(batch, noise_std=noise_std, mask_prob=mask_prob, key=key)
-    state_new, loss, hidden = train_step(state, batch, seq_len, hidden)
+    batch_noisy = add_noise(batch, noise_std=noise_std, mask_prob=mask_prob, key=key)
+    def loss_fn(params, hidden):
+        # 传入batch_noisy
+        recon, latent, hidden = autoencoder_forward(params, state.apply_fn, batch_noisy, seq_len, hidden)
+        return mse_loss(batch, recon), (recon, latent, hidden) # recon应和干净batch计算mse
+    (loss, (recon, latent, hidden)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, hidden)
+    state_new = state.apply_gradients(grads=grads)
     return state_new, loss, key_new, hidden
 
 @partial(jax_jit, static_argnames=("seq_len",))
 def eval_step(state:TrainState, batch:jnp.ndarray, seq_len: int, hidden:Optional[jnp.ndarray]=None):
-    loss, (recon, latent, hidden) = autoencoder_forward(state.params, state.apply_fn, batch, seq_len, hidden)
-    return loss, (recon, latent, hidden)
+    recon, latent, hidden = autoencoder_forward(state.params, state.apply_fn, batch, seq_len, hidden)
+    return mse_loss(batch, recon), (recon, latent, hidden)
 
 def data_gen(batch_size: int, seq_len_upper: int, data_loader: DataLoader):
     """
@@ -151,7 +156,7 @@ def data_gen(batch_size: int, seq_len_upper: int, data_loader: DataLoader):
         
         # 向量化采样：一次性为所有batch样本生成索引
         ticker_idxs = np.random.randint(0, data_loader.num_tickers, size=batch_size)
-        start_idxs = np.random.randint(0, data_loader.max_idx - seq_len + 1, size=batch_size)
+        start_idxs = np.random.randint(data_loader.min_idx, data_loader.max_idx - seq_len + 1, size=batch_size)
         
         # 使用高级索引提取所有序列
         # 构建索引数组：对每个样本生成 [start:start+seq_len] 的索引
@@ -170,7 +175,7 @@ def sim_data_gen(seq_len: int, data_loader: DataLoader):
         
         # 向量化采样：一次性为所有batch样本生成索引
         ticker_idxs = np.arange(batch_size)
-        start_idxs = np.random.randint(0, data_loader.max_idx - seq_len + 1, size=batch_size)
+        start_idxs = np.random.randint(data_loader.min_idx, data_loader.max_idx - seq_len + 1, size=batch_size)
         
         # 使用高级索引提取所有序列
         # 构建索引数组：对每个样本生成 [start:start+seq_len] 的索引
@@ -216,15 +221,20 @@ def pretrain_s5(args: PretrainConfig):
     # test_compile(state, key, args)
     print("\nStarting normal training...")
     hidden = None
-    for step in tqdm(range(args.steps)):
-        batch = next(data_gen)
-        start_time = time.time()
-        state, loss, key, hidden = train_step_denoise(state, batch, seq_len=args.seq_len_m, key=key, noise_std=args.noise_std, mask_prob=args.mask_prob, hidden=hidden)
-        end_time = time.time()
-        wandb.log({"loss": loss})
-        if step % args.save_freq == 0:
-            print(f"Step {step}, Loss: {loss}, time: {end_time - start_time:.1f}s")
-            checkpoints.save_checkpoint(os.path.abspath(args.save_dir), state, step=step, keep=10, overwrite=True)
+    for epoch in tqdm(range(1, args.num_epochs + 1)):
+        num_batches = 4*365*1440//args.seq_len_m # 4年的数据，每个batch会用3天
+        for iter in tqdm(range(num_batches)): 
+            batch = next(data_gen)
+            start_time = time.time()
+            state, loss, key, hidden = train_step_denoise(state, batch, seq_len=args.seq_len_m, key=key, noise_std=args.noise_std, mask_prob=args.mask_prob, hidden=hidden)
+            end_time = time.time()
+            loss_value = float(loss)
+            wandb.log({"loss": loss_value})
+            if epoch == 1 and iter == 0:
+                print(f"首次Compile+Run耗时: {end_time - start_time:.1f}s")
+           
+        print(f"Epoch {epoch}, Loss: {loss_value:.6f}")
+        checkpoints.save_checkpoint(os.path.abspath(args.save_dir), state, step=epoch, keep=50, overwrite=True)
     return state
 if __name__ == "__main__":
     args = PretrainConfig()
