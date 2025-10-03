@@ -107,6 +107,9 @@ def add_noise(batch:jnp.ndarray, noise_std: float, mask_prob: float, key:jnp.nda
 
 def autoencoder_forward(params:dict, apply_fn:Callable, batch:jnp.ndarray, seq_len: int, hidden:Optional[jnp.ndarray]=None):
     recon, latent, hidden = apply_fn({"params": params}, batch, seq_len, hidden)
+    # 反转 recon：decoder 输出的是 t[-1] -> t[-2] -> ... -> t[0]
+    recon = recon[:, ::-1, :]  # 沿时间维度反转
+    
     # recon形状: [B, seq_len, C]，batch形状: [B, T, C]
     # 只比较最后min(T, seq_len)个时刻
     recon_len = min(batch.shape[1], seq_len)
