@@ -1,13 +1,13 @@
 import time
 from dataclasses import dataclass
-from TradingEnv.Config import TradingEnvConfig
+from TradingEnv.Config import Ticker, TradingEnvConfig
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import wandb
-from typing import Optional, Callable
+from typing import Optional, Callable, Literal
 from tqdm.auto import tqdm
 from BS_RL.nn.s5 import S5Summarizer
 from flax.training import checkpoints
@@ -27,6 +27,7 @@ class AutoencoderConfig:
     encoder_num_layers: int = 1
     decoder_hidden_dim: int = 1536
     decoder_num_layers: int = 1
+    decoder: Literal['s5', 'conv_trans'] = 'conv_trans'
 @dataclass
 class PretrainConfig:
     autoencoder_cfg: AutoencoderConfig = field(default_factory=lambda: AutoencoderConfig())
@@ -36,7 +37,7 @@ class PretrainConfig:
     batch_size: int = 8 # 128会耗187G内存，改用8，消耗的内存约为12G
     seq_len_m: int = 1440*3 # 3 days
     num_buckets: int = 5 # 不同的seq_len会触发重编译，需将batch填充到最近的bucket
-    train_data_loader_cfg: DataLoaderConfig = field(default_factory=lambda: DataLoaderConfig())
+    train_data_loader_cfg: DataLoaderConfig = field(default_factory=lambda: DataLoaderConfig(tickers=[Ticker.BTCUSDT_P]))
     eval_data_loader_cfg: DataLoaderConfig = field(default_factory=lambda: DataLoaderConfig())
     lr: float = 1e-4
     save_freq_pct: float = 0.1
@@ -81,12 +82,85 @@ class Decoder(nn.Module):
         hidden = jnp.zeros((self.num_layers, last_latent.shape[0], self.hidden_dim))
         outputs, _ = S5Summarizer(self.hidden_dim, self.num_layers)(last_latent, hidden) # [B, seq_len, H]
         recon = nn.Dense(self.out_dim)(outputs) # [B, seq_len, out_dim]
+        # 反转 recon，因为S5Summarizer由近到远重构，输出的是 t[-1] -> t[-2] -> ... -> t[0]，而我们需要的是 t[0] -> t[1] -> ... -> t[-1]
+        recon = recon[:, ::-1, :]  # 沿时间维度反转
+        return recon
+class ConvTransDecoder(nn.Module):
+    num_layers: int
+    hidden_dim: int
+    out_dim: int
+    @nn.compact
+    def __call__(self, last_latent:jnp.ndarray, seq_len:int):
+        """
+        last_latent: [B, latent_dim]
+        recon: [B, seq_len, out_dim]
+        """
+        init_seq_len = 24
+        init_channels = 256
+        stride = 2
+        
+        x = nn.Dense(features=init_seq_len * init_channels)(last_latent)
+        x = nn.gelu(x)
+        x = x.reshape((x.shape[0], init_seq_len, init_channels))
+
+        # Dynamically create ConvTranspose layers based on seq_len
+        # 以因子分解的方式精确放大到目标长度：先用 SAME 的转置卷积按 stride 序列放大
+        # 若仍有差值，再用一次 VALID、stride=1 的转置卷积用 kernel_size=diff+1 补齐
+        target_len = int(seq_len)
+        ratio = target_len // init_seq_len
+        remainder = target_len % init_seq_len
+
+        def factorize_stride(r: int):
+            factors = []
+            for p in (5, 4, 3, 2):
+                while r % p == 0 and r > 1:
+                    factors.append(p)
+                    r //= p
+            if r > 1:
+                factors.append(r)
+            return factors
+
+        stride_factors = factorize_stride(ratio) if ratio >= 1 else []
+
+        curr_channels = init_channels
+        for i, s in enumerate(stride_factors):
+            next_channels = curr_channels // 2 if i % 2 == 1 else curr_channels
+            next_channels = max(32, next_channels)
+            x = nn.ConvTranspose(
+                features=next_channels,
+                kernel_size=(4,),
+                strides=(s,),
+                padding='SAME'
+            )(x)
+            x = nn.gelu(x)
+            curr_channels = next_channels
+
+        # 计算当前长度（纯整数运算，与上面的 SAME 放大一致）
+        current_len = init_seq_len
+        for s in stride_factors:
+            current_len *= s
+
+        # 若不是整除或仍有差距，则用一次 VALID stride=1 精确补齐
+        if current_len < target_len:
+            diff = target_len - current_len
+            k_final = int(diff + 1)  # (L_in - 1) * 1 + k_final = target_len
+            x = nn.ConvTranspose(
+                features=curr_channels,
+                kernel_size=(k_final,),
+                strides=(1,),
+                padding='VALID'
+            )(x)
+            x = nn.gelu(x)
+
+        # 输出通道映射到原始维度
+        recon = nn.Conv(features=self.out_dim, kernel_size=(3,), padding='SAME')(x)
         return recon
 class Autoencoder(nn.Module):
     cfg: AutoencoderConfig
     def setup(self):
         self.encoder = Encoder(self.cfg.encoder_num_layers, self.cfg.encoder_hidden_dim, self.cfg.latent_dim)
-        self.decoder = Decoder(self.cfg.decoder_num_layers, self.cfg.decoder_hidden_dim, self.cfg.channel_dim)
+        self.decoder = {'s5': Decoder(self.cfg.decoder_num_layers, self.cfg.decoder_hidden_dim, self.cfg.channel_dim),
+                        'conv_trans': ConvTransDecoder(self.cfg.decoder_num_layers, self.cfg.decoder_hidden_dim, self.cfg.channel_dim)}[self.cfg.decoder]
     @nn.compact
     def __call__(self, x:jnp.ndarray, seq_len:int, hidden:jnp.ndarray):
         latent, hidden = self.encoder(x, hidden)  # encoder返回(latent, hidden)，只需要latent
@@ -106,15 +180,12 @@ def add_noise(batch:jnp.ndarray, noise_std: float, mask_prob: float, key:jnp.nda
 
 
 def autoencoder_forward(params:dict, apply_fn:Callable, batch:jnp.ndarray, seq_len: int, hidden:jnp.ndarray):
-    recon, latent, hidden = apply_fn({"params": params}, batch, seq_len, hidden)
-    # 反转 recon：decoder 输出的是 t[-1] -> t[-2] -> ... -> t[0]
-    recon = recon[:, ::-1, :]  # 沿时间维度反转
-    
+    recon, latent, hidden = apply_fn({"params": params}, batch, seq_len, hidden)    
     # recon形状: [B, seq_len, C]，batch形状: [B, T, C]
     # 只比较最后min(T, seq_len)个时刻
-    recon_len = min(batch.shape[1], seq_len)
-    batch_truncated = batch[:, -recon_len:, :]
-    recon_truncated = recon[:, -recon_len:, :]
+    # recon_len = min(batch.shape[1], seq_len)
+    # batch_truncated = batch[:, -recon_len:, :]
+    # recon_truncated = recon[:, -recon_len:, :]
     return recon, latent, hidden
 def mse_loss(batch:jnp.ndarray, recon:jnp.ndarray):
     return jnp.mean(jnp.square(recon - batch))
