@@ -208,7 +208,7 @@ def test_compile(state:TrainState, key:jnp.ndarray, args: PretrainConfig):
 def pretrain_s5(args: PretrainConfig):
     model = Autoencoder(args.autoencoder_cfg)
     key = jax.random.PRNGKey(args.seed)
-    variables = model.init(key, jnp.zeros((args.batch_size, args.seq_len_m, args.autoencoder_cfg.channel_dim)), 1)
+    variables = model.init(key, jnp.zeros((args.batch_size, args.seq_len_m, args.autoencoder_cfg.channel_dim)), args.seq_len_m)
     tx = optax.adamw(learning_rate=args.lr)
     state = TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
     encoder_p_count = count_params(state.params['encoder'])
