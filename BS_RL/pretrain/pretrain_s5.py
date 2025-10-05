@@ -46,12 +46,15 @@ class PretrainConfig:
     def __post_init__(self):
         self.save_freq = int(self.num_epochs * self.save_freq_pct)
         self.save_dir = f"runs/{self.run_name}"
+    @property
+    def initial_encoder_hidden(self):
+        return jnp.zeros((self.autoencoder_cfg.encoder_num_layers, self.batch_size, self.autoencoder_cfg.encoder_hidden_dim)) # (L, B, H)
 class Encoder(nn.Module):
     num_layers: int
     hidden_dim: int
     latent_dim: int
     @nn.compact
-    def __call__(self, x: jnp.ndarray, initial_hidden: Optional[jnp.ndarray]=None):
+    def __call__(self, x: jnp.ndarray, initial_hidden: jnp.ndarray):
         """
         outputs: [B, T, latent_dim]. T时刻的latent应能用于准确reconstruct过去min(T, seq_len)个时刻的输入
         hidden: [L, B, H]
@@ -75,7 +78,7 @@ class Decoder(nn.Module):
         # last_latent作为每个时间步的输入：将last_latent重复到每个时间步: [B, latent_dim] -> [B, seq_len, latent_dim]
         last_latent = jnp.tile(last_latent[:, None, :], (1, seq_len, 1))
    
-        hidden = None
+        hidden = jnp.zeros((self.num_layers, last_latent.shape[0], self.hidden_dim))
         outputs, _ = S5Summarizer(self.hidden_dim, self.num_layers)(last_latent, hidden) # [B, seq_len, H]
         recon = nn.Dense(self.out_dim)(outputs) # [B, seq_len, out_dim]
         return recon
@@ -85,7 +88,7 @@ class Autoencoder(nn.Module):
         self.encoder = Encoder(self.cfg.encoder_num_layers, self.cfg.encoder_hidden_dim, self.cfg.latent_dim)
         self.decoder = Decoder(self.cfg.decoder_num_layers, self.cfg.decoder_hidden_dim, self.cfg.channel_dim)
     @nn.compact
-    def __call__(self, x:jnp.ndarray, seq_len:int, hidden:Optional[jnp.ndarray]=None):
+    def __call__(self, x:jnp.ndarray, seq_len:int, hidden:jnp.ndarray):
         latent, hidden = self.encoder(x, hidden)  # encoder返回(latent, hidden)，只需要latent
         # 只用最后一个时刻的latent来reconstruct过去seq_len个时刻的输入
         last_latent = latent[:, -1, :]
@@ -102,7 +105,7 @@ def add_noise(batch:jnp.ndarray, noise_std: float, mask_prob: float, key:jnp.nda
     return noisy
 
 
-def autoencoder_forward(params:dict, apply_fn:Callable, batch:jnp.ndarray, seq_len: int, hidden:Optional[jnp.ndarray]=None):
+def autoencoder_forward(params:dict, apply_fn:Callable, batch:jnp.ndarray, seq_len: int, hidden:jnp.ndarray):
     recon, latent, hidden = apply_fn({"params": params}, batch, seq_len, hidden)
     # 反转 recon：decoder 输出的是 t[-1] -> t[-2] -> ... -> t[0]
     recon = recon[:, ::-1, :]  # 沿时间维度反转
@@ -116,7 +119,7 @@ def autoencoder_forward(params:dict, apply_fn:Callable, batch:jnp.ndarray, seq_l
 def mse_loss(batch:jnp.ndarray, recon:jnp.ndarray):
     return jnp.mean(jnp.square(recon - batch))
 @partial(jax_jit, static_argnames=("seq_len",))
-def train_step(state:TrainState, batch:jnp.ndarray, seq_len: int, hidden:Optional[jnp.ndarray]=None):
+def train_step(state:TrainState, batch:jnp.ndarray, seq_len: int, hidden:jnp.ndarray):
     def loss_fn(params, hidden):
         recon, latent, hidden = autoencoder_forward(params, state.apply_fn, batch, seq_len, hidden)
         return mse_loss(batch, recon), (recon, latent, hidden)
@@ -125,7 +128,7 @@ def train_step(state:TrainState, batch:jnp.ndarray, seq_len: int, hidden:Optiona
     return state_new, loss, hidden
 
 @partial(jax_jit, static_argnames=("seq_len", "mask_prob"))
-def train_step_denoise(state:TrainState, batch:jnp.ndarray, seq_len: int, key:jnp.ndarray, noise_std: float, mask_prob: float, hidden:Optional[jnp.ndarray]=None):
+def train_step_denoise(state:TrainState, batch:jnp.ndarray, seq_len: int, key:jnp.ndarray, noise_std: float, mask_prob: float, hidden:jnp.ndarray):
     key, key_new = jax.random.split(key)
     batch_noisy = add_noise(batch, noise_std=noise_std, mask_prob=mask_prob, key=key)
     def loss_fn(params, hidden):
@@ -137,7 +140,7 @@ def train_step_denoise(state:TrainState, batch:jnp.ndarray, seq_len: int, key:jn
     return state_new, loss, key_new, hidden
 
 @partial(jax_jit, static_argnames=("seq_len",))
-def eval_step(state:TrainState, batch:jnp.ndarray, seq_len: int, hidden:Optional[jnp.ndarray]=None):
+def eval_step(state:TrainState, batch:jnp.ndarray, seq_len: int, hidden:jnp.ndarray):
     recon, latent, hidden = autoencoder_forward(state.params, state.apply_fn, batch, seq_len, hidden)
     return mse_loss(batch, recon), (recon, latent, hidden)
 
@@ -167,25 +170,26 @@ def data_gen(batch_size: int, seq_len_upper: int, data_loader: DataLoader):
 class DataGen:
     data_loader: DataLoader
     max_seq_len: int
+    batch_size: int
     curr_idx: int = field(init=False)
     def random_idx(self, size: int):
         return np.random.randint(self.data_loader.min_idx, self.data_loader.max_idx - self.max_seq_len + 1, size=size)
+    def random_ticker_idx(self, size: int):
+        return np.random.randint(0, self.data_loader.num_tickers, size=size)
     def __post_init__(self):
         self.curr_idx = self.random_idx(self.batch_size)
-    @property
-    def batch_size(self):
-        return self.data_loader.num_tickers
+        self.ticker_idxs = self.random_ticker_idx(self.batch_size)
     def __call__(self, seq_len: int):
         reset = np.where(self.curr_idx > self.data_loader.max_idx - self.max_seq_len, True, False)
         self.curr_idx[reset] = self.random_idx(reset.sum())
+        self.ticker_idxs[reset] = self.random_ticker_idx(reset.sum())
         # 向量化采样：一次性为所有batch样本生成索引
-        ticker_idxs = np.arange(self.batch_size)
         # 使用高级索引提取所有序列
         # 构建索引数组：对每个样本生成 [start:start+seq_len] 的索引
         time_idxs = self.curr_idx[:, None] + np.arange(seq_len)[None, :]  # [batch_size, seq_len]
         
         # 一次性提取所有样本: [batch_size, seq_len, features_dim]
-        batch = self.data_loader.tickers_features[time_idxs, ticker_idxs[:, None], :]
+        batch = self.data_loader.tickers_features[time_idxs, self.ticker_idxs[:, None], :]
         self.curr_idx += seq_len
         return batch, reset
 
@@ -195,7 +199,7 @@ def test_compile(state:TrainState, key:jnp.ndarray, args: PretrainConfig):
     test_seq_lens = np.array([1, 2, 3 , 256, 257, 258, 512 ])  # 使用指数增长的测试点
     # test_seq_lens = [2]
     
-    hidden = None
+    hidden = args.initial_encoder_hidden
     for batch_seq_len in test_seq_lens:
         if batch_seq_len > 1024:
             break
@@ -208,7 +212,7 @@ def test_compile(state:TrainState, key:jnp.ndarray, args: PretrainConfig):
 def pretrain_s5(args: PretrainConfig):
     model = Autoencoder(args.autoencoder_cfg)
     key = jax.random.PRNGKey(args.seed)
-    variables = model.init(key, jnp.zeros((args.batch_size, args.seq_len_m, args.autoencoder_cfg.channel_dim)), args.seq_len_m)
+    variables = model.init(key, jnp.zeros((args.batch_size, args.seq_len_m, args.autoencoder_cfg.channel_dim)), args.seq_len_m, args.initial_encoder_hidden)
     tx = optax.adamw(learning_rate=args.lr)
     state = TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
     encoder_p_count = count_params(state.params['encoder'])
@@ -219,17 +223,16 @@ def pretrain_s5(args: PretrainConfig):
     print(f"总参数量: {total_p_count / 1e6:.2f}M")
     data_loader = DataLoader(args.train_data_loader_cfg, feat_getter_with_norm)
     data_loader.setup(TradingEnvConfig.train_timerange)
-    data_gen = DataGen(data_loader, args.seq_len_m)
+    data_gen = DataGen(data_loader, args.seq_len_m, args.batch_size)
     # test_compile(state, key, args)
     print("\nStarting normal training...")
-    hidden = None # 经过forward后变为(L, B, H)
+    hidden = args.initial_encoder_hidden 
     for epoch in tqdm(range(1, args.num_epochs + 1), desc="epoch"):
         num_batches = 4*365*1440//args.seq_len_m # 4年的数据，每个batch会用3天
         for iter in tqdm(range(num_batches), desc=f"Epoch{epoch}-Iter", leave=False): 
             batch, reset = data_gen(args.seq_len_m)
             # 对于reset的样本，将其hidden状态清零。reset: (B,), hidden: (L, B, H)
-            if hidden is not None:
-                hidden = jnp.where(reset.reshape(1, -1, 1), 0.0, hidden)
+            hidden = jnp.where(reset.reshape(1, -1, 1), 0.0, hidden)
             start_time = time.time()
             state, loss, key, hidden = train_step_denoise(state, batch, seq_len=args.seq_len_m, key=key, noise_std=args.noise_std, mask_prob=args.mask_prob, hidden=hidden)
             end_time = time.time()
